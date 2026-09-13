@@ -106,7 +106,7 @@ Every call needs `Authorization: Bearer $RELAY_ADMIN_TOKEN`.
 | `PUT` | `/api/channels/{name}/members/{id}` `{"from_start"}` | add a member |
 | `DELETE` | `/api/channels/{name}/members/{id}` | remove a member |
 | `GET` | `/api/channels/{name}/messages?limit=100` | newest messages; `before=<seq>` pages back, `after=<seq>` reads forward |
-| `POST` | `/api/channels/{name}/messages` `{"body"}` | post as `@server` |
+| `POST` | `/api/channels/{name}/messages` `{"body", "id"}` | post as `@server`; an `id` is remembered, so a retried post is stored once |
 | `GET` | `/api/stream` | server-sent events: `hello`, `worker` (online/offline), `message`, `changed`, `resync` |
 
 The CLI (`python -m relay worker|channel|join|leave`) writes to the database

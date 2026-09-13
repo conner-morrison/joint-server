@@ -286,6 +286,32 @@ class RelayTest(unittest.IsolatedAsyncioTestCase):
         status, workers = await self.api("GET", "/api/workers")
         self.assertTrue(next(w for w in workers if w["worker_id"] == "alice")["online"])
 
+    async def test_posting_with_the_same_id_is_stored_once(self) -> None:
+        """A sender that cannot tell whether its POST arrived retries with the
+        same id; the retry must not post the message a second time."""
+        alice, alice_q = await self.connect("alice")
+        first = await self.api("POST", "/api/channels/jobs/messages",
+                               {"id": "gmail-42:0", "body": {"job": "one"}})
+        self.assertEqual((first[0], first[1]["duplicate"]), (201, False))
+
+        retry = await self.api("POST", "/api/channels/jobs/messages",
+                               {"id": "gmail-42:0", "body": {"job": "one"}})
+        self.assertEqual((retry[0], retry[1]["duplicate"]), (201, True))
+        self.assertEqual(retry[1]["seq"], first[1]["seq"])
+
+        msg = await asyncio.wait_for(alice_q.get(), 5)
+        self.assertEqual(msg.body, {"job": "one"})
+        await self.nothing_arrives(alice_q)
+
+        _, history = await self.api("GET", "/api/channels/jobs/messages")
+        self.assertEqual([m["seq"] for m in history], [first[1]["seq"]])
+
+    async def test_posts_without_an_id_are_never_deduplicated(self) -> None:
+        a = await self.api("POST", "/api/channels/jobs/messages", {"body": {"n": 1}})
+        b = await self.api("POST", "/api/channels/jobs/messages", {"body": {"n": 1}})
+        self.assertNotEqual(a[1]["seq"], b[1]["seq"])
+        self.assertFalse(b[1]["duplicate"])
+
     async def test_removed_member_stops_receiving(self) -> None:
         alice, _ = await self.connect("alice")
         bob, bob_q = await self.connect("bob")

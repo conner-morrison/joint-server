@@ -46,6 +46,10 @@ class JoinIn(BaseModel):
 
 class PostIn(BaseModel):
     body: Any = None
+    # The publisher's own id for this message. A sender that retries an
+    # uncertain request reuses it, and the resend is dropped rather than
+    # posted twice. Websocket publishes carry the same thing as "id".
+    id: str | None = None
 
 
 def _bearer(value: str | None) -> str:
@@ -236,12 +240,12 @@ def create_app(store: Store, admin_token: str, *, retention_days: float = 7.0,
         return store.messages_before(name, before if before is not None else store.head() + 1, limit=limit)
 
     @api.post("/channels/{name}/messages", status_code=201)
-    async def post_as_server(name: str, body: PostIn) -> dict[str, int]:
+    async def post_as_server(name: str, body: PostIn) -> dict[str, Any]:
         try:
-            seq, _ = hub.publish(name, sender=SERVER_SENDER, body=body.body)
+            seq, duplicate = hub.publish(name, sender=SERVER_SENDER, body=body.body, client_id=body.id)
         except RelayError as exc:
             raise HTTPException(404 if exc.code == "no_channel" else 400, str(exc)) from None
-        return {"seq": seq}
+        return {"seq": seq, "duplicate": duplicate}
 
     app.include_router(api)
     return app
