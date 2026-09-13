@@ -113,6 +113,28 @@ The CLI (`python -m relay worker|channel|join|leave`) writes to the database
 directly and works with the server stopped. Through the API, a connected worker
 hears about changes immediately, and a removed worker is disconnected.
 
+## Publishing over HTTP
+
+Not every publisher can hold a websocket. A Google Apps Script, a cron job or
+someone else's webhook gets one HTTP request and no more. `POST /publish` gives
+them the worker protocol's authority without the admin token.
+
+```bash
+curl -X POST https://relay.example.com/publish \
+  -H "Authorization: Bearer <worker token>" -H "Content-Type: application/json" \
+  -d '{"channel": "jobs", "id": "gmail-18f2a1b:0", "body": {"url": "https://example.com/job/1"}}'
+```
+
+The message arrives from that worker, not from `@server`, and the worker must
+be a member of the channel. A channel it is not in and a channel that does not
+exist both answer `403`, so a token cannot be used to find out what exists.
+`id` is optional and works like the websocket's: send the same one again and
+the resend is dropped, with the original `seq` returned and `duplicate` true.
+
+Give a publisher like this its own worker (`worker add`) and put it only in the
+channels it should reach. Losing that token costs you one worker, replaceable
+with `worker token <id>`; losing the admin token costs you the server.
+
 ## Wire protocol
 
 Workers written in other languages only need a websocket and JSON. Connect to
@@ -192,10 +214,34 @@ RELAY_CORS_ORIGINS=http://127.0.0.1:5500 python -m relay serve --port 8700
 python3 -m http.server 5500 --directory ui     # open http://127.0.0.1:5500
 ```
 
-## Deploying
+## Deploying the relay
 
-- Put it behind a TLS reverse proxy (Caddy, nginx) so workers use `https://` and
-  `wss://`. Tokens travel in a header, so plain HTTP exposes them.
+The relay needs one always-on process, a disk that survives restarts, and
+HTTPS. Any host that offers those works; `Dockerfile` runs anywhere, and takes
+its port from `$PORT` where the host sets one.
+
+**Railway.** `railway.json` selects the Dockerfile and pins one replica. The
+rest is dashboard-only:
+
+- attach a **volume mounted at `/data`**, otherwise the database lives in the
+  container and every deploy starts empty
+- `RELAY_ADMIN_TOKEN`, and `RELAY_CORS_ORIGINS` if a browser console talks to it
+- `RELAY_RETENTION_DAYS=0` to keep messages for ever, if the relay is the place
+  the data lives rather than a channel workers are expected to keep up with
+- leave it at **one replica**: routing is in memory and the volume attaches to a
+  single instance, so a second one splits the workers between two servers that
+  cannot see each other
+
+**Render.** `render.yaml` says all of the above declaratively; import it as a
+Blueprint. A free instance will not do: it sleeps when idle, which drops every
+worker's websocket, and has no disk.
+
+**Your own server.** Put it behind a TLS reverse proxy (Caddy, nginx) so workers
+use `https://` and `wss://`. Tokens travel in a header, so plain HTTP exposes
+them.
+
+Wherever it runs:
+
 - Hold on to `RELAY_ADMIN_TOKEN`. Worker tokens are only stored as hashes, so a
   lost worker token can only be replaced (`worker token <id>`), not recovered.
 - Back up `relay.db` (`RELAY_DB` sets its path). The database is the whole

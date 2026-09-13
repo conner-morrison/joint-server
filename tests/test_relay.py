@@ -312,6 +312,58 @@ class RelayTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(a[1]["seq"], b[1]["seq"])
         self.assertFalse(b[1]["duplicate"])
 
+    async def test_http_publish_arrives_as_the_worker_not_the_server(self) -> None:
+        """A publisher that cannot hold a websocket still publishes with its own
+        identity, so a receiver can tell it apart from a console post."""
+        _, bob_q = await self.connect("bob")
+        status, body = await self.api("POST", "/publish",
+                                      {"channel": "jobs", "body": {"job": "scrape"}},
+                                      token=self.tokens["alice"])
+        self.assertEqual((status, body["worker_id"]), (201, "alice"))
+        msg = await asyncio.wait_for(bob_q.get(), 5)
+        self.assertEqual((msg.channel, msg.sender, msg.body), ("jobs", "alice", {"job": "scrape"}))
+
+    async def test_http_publish_obeys_membership(self) -> None:
+        """Carol is not in jobs, so her token cannot post there even though it
+        is a perfectly valid token."""
+        status, _ = await self.api("POST", "/publish", {"channel": "jobs", "body": 1},
+                                   token=self.tokens["carol"])
+        self.assertEqual(status, 403)
+
+    async def test_http_publish_needs_a_worker_token(self) -> None:
+        for token in (None, "nonsense", ADMIN):
+            status, _ = await self.api("POST", "/publish", {"channel": "jobs", "body": 1}, token=token)
+            self.assertEqual(status, 401, f"token {token!r} should not publish")
+
+    async def test_http_publish_does_not_reveal_unknown_channels(self) -> None:
+        """A channel a worker is not in and a channel that does not exist look
+        the same to it, so a valid token cannot be used to enumerate channels.
+        The websocket path answers the same way."""
+        missing, _ = await self.api("POST", "/publish", {"channel": "nope", "body": 1},
+                                    token=self.tokens["alice"])
+        not_a_member, _ = await self.api("POST", "/publish", {"channel": "jobs", "body": 1},
+                                         token=self.tokens["carol"])
+        self.assertEqual((missing, not_a_member), (403, 403))
+
+    async def test_http_publish_drops_a_retry_with_the_same_id(self) -> None:
+        _, bob_q = await self.connect("bob")
+        first = await self.api("POST", "/publish", {"channel": "jobs", "id": "mail-7:0", "body": {"n": 1}},
+                               token=self.tokens["alice"])
+        retry = await self.api("POST", "/publish", {"channel": "jobs", "id": "mail-7:0", "body": {"n": 1}},
+                               token=self.tokens["alice"])
+        self.assertFalse(first[1]["duplicate"])
+        self.assertTrue(retry[1]["duplicate"])
+        self.assertEqual(first[1]["seq"], retry[1]["seq"])
+        await asyncio.wait_for(bob_q.get(), 5)
+        await self.nothing_arrives(bob_q)
+
+    async def test_http_publish_marks_the_worker_seen(self) -> None:
+        _, before = await self.api("GET", "/api/workers")
+        self.assertIsNone(next(w for w in before if w["worker_id"] == "carol")["last_seen"])
+        await self.api("POST", "/publish", {"channel": "jobs", "body": 1}, token=self.tokens["alice"])
+        _, after = await self.api("GET", "/api/workers")
+        self.assertIsNotNone(next(w for w in after if w["worker_id"] == "alice")["last_seen"])
+
     async def test_removed_member_stops_receiving(self) -> None:
         alice, _ = await self.connect("alice")
         bob, bob_q = await self.connect("bob")

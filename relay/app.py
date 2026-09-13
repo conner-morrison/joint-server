@@ -44,6 +44,12 @@ class JoinIn(BaseModel):
     from_start: bool = False
 
 
+class PublishIn(BaseModel):
+    channel: str
+    body: Any = None
+    id: str | None = None
+
+
 class PostIn(BaseModel):
     body: Any = None
     # The publisher's own id for this message. A sender that retries an
@@ -128,6 +134,27 @@ def create_app(store: Store, admin_token: str, *, retention_days: float = 7.0,
             await ws.close(code=AUTH_CLOSE, reason="invalid token")
             return
         await hub.serve(worker_id, ws)
+
+    # Not every publisher can hold a websocket. A Google Apps Script, a cron
+    # job, a webhook from someone else's service: each can make one HTTP
+    # request and no more. This gives them the worker protocol's authority
+    # without the admin token, which would let them delete channels and
+    # rotate every worker's credentials.
+    @app.post("/publish", status_code=201)
+    async def publish_over_http(msg: PublishIn,
+                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        worker_id = store.worker_for_token(_bearer(authorization))
+        if worker_id is None:
+            raise HTTPException(401, "worker token required")
+        try:
+            # Publishing as the worker, not as @server, so membership decides
+            # what it may post to and the receiver can see where it came from.
+            seq, duplicate = hub.publish(msg.channel, sender=worker_id, body=msg.body, client_id=msg.id)
+        except RelayError as exc:
+            status = {"not_member": 403, "no_channel": 404, "too_large": 413}.get(exc.code, 400)
+            raise HTTPException(status, str(exc)) from None
+        store.touch_worker(worker_id)
+        return {"seq": seq, "duplicate": duplicate, "worker_id": worker_id}
 
     api = APIRouter(prefix="/api", dependencies=[Depends(require_admin)])
 
