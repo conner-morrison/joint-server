@@ -160,15 +160,18 @@ browser ── https://your-console.vercel.app   (static files from ui/)
    The `*` entry covers Vercel preview deployments. The console calls the API
    with the admin token in a header, so no cookies are involved.
 
-2. **Deploy `ui/`.** Either with the CLI:
+2. **Deploy.** Import the repository in the Vercel dashboard and keep the
+   default settings, or use the CLI from the repository root:
 
    ```bash
-   cd ui
    npx vercel deploy --prod
    ```
 
-   or by importing the repository in the Vercel dashboard with **Root Directory**
-   set to `ui`, **Framework Preset** set to *Other*, and no build command.
+   `vercel.json` at the repository root tells Vercel there is no framework and
+   no build, and to publish `ui/` as static files. Without it, Vercel sees
+   FastAPI in `pyproject.toml`, tries to build the relay as a Python function,
+   and fails with "No FastAPI entrypoint found". The settings in that file take
+   priority over whatever the Vercel project detected when it was imported.
 
 3. **Open the console**, enter the relay's `https://` URL and `RELAY_ADMIN_TOKEN`.
    To pre-fill the URL, set it in `ui/config.js` or open the console with
@@ -178,7 +181,7 @@ The relay must be served over HTTPS. Vercel serves the console over HTTPS, and
 browsers block calls from an HTTPS page to a plain `http://` server
 (`localhost` excepted).
 
-`ui/vercel.json` sets a Content-Security-Policy that only runs the console's
+`vercel.json` also sets a Content-Security-Policy that only runs the console's
 own scripts. That matters because the console displays message bodies written
 by workers, and it inserts them as text, never as HTML.
 
