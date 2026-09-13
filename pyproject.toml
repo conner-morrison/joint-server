@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay"
+version = "0.1.0"
+description = "Channel relay: local workers exchange messages through one internet server"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# The internet server.
+server = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+# Each worker. The client needs nothing else.
+client = ["websockets>=13"]
+
+[project.scripts]
+relay = "relay.main:main"
+
+[tool.setuptools.packages.find]
+include = ["relay*"]
