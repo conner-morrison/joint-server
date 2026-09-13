@@ -135,7 +135,7 @@ td { padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align:
 tr:last-child td { border-bottom: 0; }
 .who { display: flex; align-items: center; gap: 10px; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
-.chip { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--panel-2); color: var(--text); text-decoration: none; }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--panel-2); color: var(--text); text-decoration: none; }
 .chip:hover { background: var(--accent-soft); color: var(--accent); }
 .actions { text-align: right; white-space: nowrap; }
 .actions .btn + .btn { margin-left: 6px; }

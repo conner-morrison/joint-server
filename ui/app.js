@@ -16,7 +16,7 @@ const state = {
   workers: [],
   channels: [],
   online: new Set(),
-  view: { kind: "workers" },
+  view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
   stream: "down",
@@ -259,7 +259,6 @@ async function showApp() {
   renderStreamPill();
   startStream();
   await refreshAll();
-  if (!location.hash && state.channels.length) location.replace("#/channel/" + enc(state.channels[0].name));
   setView();
 }
 
@@ -272,6 +271,7 @@ async function refreshAll() {
     renderSidebar();
     renderOnlinePill();
     if (state.view.kind === "workers") renderWorkersTable();
+    else if (state.view.kind === "channels") renderChannelsList();
     else if (state.channels.some((c) => c.name === state.view.name)) { renderChannelHead(); renderMembers(); }
     else if ($("#feed")) renderMain();              // the open channel was deleted
   } catch (err) {
@@ -296,8 +296,10 @@ function setView() {
     const name = decodeURIComponent(m[1]);
     state.view = { kind: "channel", name };
     state.unread.delete(name);
-  } else {
+  } else if (location.hash === "#/workers") {
     state.view = { kind: "workers" };
+  } else {
+    state.view = { kind: "channels" };
   }
   renderSidebar();
   renderMain();
@@ -330,10 +332,10 @@ function renderSidebar() {
   if (!nav) return;
   const v = state.view;
   fill(nav,
-    h("button", { class: "nav-item" + (v.kind === "workers" ? " active" : ""), onclick: () => go("#/workers") },
-      "Workers", h("span", { class: "count" }, state.workers.length)),
     h("div", { class: "nav-title" }, "Channels",
       h("button", { class: "btn icon", title: "New channel", "aria-label": "New channel", onclick: openNewChannel }, "+")),
+    h("button", { class: "nav-item" + (v.kind === "channels" ? " active" : ""), onclick: () => go("#/channels") },
+      "All channels", h("span", { class: "count" }, state.channels.length)),
     state.channels.length
       ? state.channels.map((c) => {
         const unread = state.unread.get(c.name) || 0;
@@ -343,11 +345,58 @@ function renderSidebar() {
           unread ? h("span", { class: "badge", title: `${unread} new` }, unread > 99 ? "99+" : unread)
             : h("span", { class: "count", title: "messages retained" }, c.messages));
       })
-      : h("p", { class: "nav-empty" }, "No channels yet."));
+      : h("p", { class: "nav-empty" }, "No channels yet."),
+    h("div", { class: "nav-title" }, "Workers",
+      h("button", { class: "btn icon", title: "New worker", "aria-label": "New worker", onclick: openNewWorker }, "+")),
+    h("button", { class: "nav-item" + (v.kind === "workers" ? " active" : ""), onclick: () => go("#/workers") },
+      "All workers", h("span", { class: "count" }, state.workers.length)));
+}
+
+// --- channels --------------------------------------------------------------
+function renderChannelsView() {
+  $("#main").replaceChildren(
+    h("div", { class: "view-head" },
+      h("div", { class: "grow" },
+        h("h1", {}, "Channels"),
+        h("p", {}, "A channel is the unit of delivery. Create one, then give workers membership of it.")),
+      h("button", { class: "btn primary", onclick: openNewChannel }, "New channel")),
+    h("div", { class: "scroll pad", id: "channels-list" }));
+  renderChannelsList();
+}
+
+function renderChannelsList() {
+  const box = $("#channels-list");
+  if (!box) return;
+  if (!state.channels.length) {
+    // First run: a worker cannot do anything until a channel exists, so this
+    // is the one action worth offering.
+    box.replaceChildren(h("div", { class: "empty" },
+      h("strong", {}, "Start with a channel"),
+      h("p", {}, "Workers post to channels and receive from them. Nothing can be sent until one exists."),
+      h("button", { class: "btn primary", onclick: openNewChannel }, "Create a channel")));
+    return;
+  }
+  box.replaceChildren(h("div", { class: "table-wrap" }, h("table", {},
+    h("thead", {}, h("tr", {}, ["Channel", "Members", "Messages", ""].map((t) => h("th", {}, t)))),
+    h("tbody", {}, state.channels.map((c) => {
+      const online = c.members.filter((m) => state.online.has(m)).length;
+      return h("tr", {},
+        h("td", {}, h("div", {},
+          h("div", { class: "strong" }, h("span", { class: "hash" }, "#"), c.name),
+          c.description && h("div", { class: "muted small" }, c.description))),
+        h("td", {}, c.members.length
+          ? h("div", { class: "chips" }, c.members.map((m) => h("span", { class: "chip" }, dot(state.online.has(m)), m)))
+          : h("span", { class: "muted" }, "none")),
+        h("td", { class: "muted nowrap" }, `${c.messages} retained`,
+          c.members.length ? h("div", { class: "small" }, `${online}/${c.members.length} online`) : false),
+        h("td", { class: "actions" },
+          h("button", { class: "btn small", onclick: () => go("#/channel/" + enc(c.name)) }, "Open")));
+    })))));
 }
 
 function renderMain() {
   if (state.view.kind === "workers") renderWorkersView();
+  else if (state.view.kind === "channels") renderChannelsView();
   else renderChannelView(state.view.name);
 }
 
@@ -729,6 +778,7 @@ function resync() {
 function renderPresence() {
   renderOnlinePill();
   if (state.view.kind === "workers") renderWorkersTable();
+  else if (state.view.kind === "channels") renderChannelsList();
   else { renderChannelHead(); renderMemberList(); }
 }
 
