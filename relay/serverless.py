@@ -33,6 +33,7 @@ SERVER_SENDER = "@server"
 MAX_BODY_BYTES = int(os.environ.get("RELAY_MAX_BODY_BYTES", "256000"))
 POLL_MAX_WAIT = float(os.environ.get("RELAY_POLL_MAX_WAIT", "25"))
 POLL_INTERVAL = float(os.environ.get("RELAY_POLL_INTERVAL", "1.0"))
+HEALTH_TIMEOUT = float(os.environ.get("RELAY_HEALTH_TIMEOUT", "8"))
 
 
 class WorkspaceIn(BaseModel):
@@ -155,20 +156,41 @@ def create_app(store: PgStore | None) -> FastAPI:
                                   "message": "unknown token: POST a worker_id and token to the enrol path"})
 
     # --- the deployment --------------------------------------------------
+    async def database_state() -> dict[str, Any]:
+        if store is None:
+            return {"ok": False, "database": "unconfigured",
+                    "message": "DATABASE_URL is not set on this deployment."}
+        try:
+            # Bounded: a health check must answer quickly, and a database that
+            # takes half a minute to refuse is already an answer.
+            await asyncio.wait_for(store.ready(), timeout=HEALTH_TIMEOUT)
+        except TimeoutError:
+            return {"ok": False, "database": "unreachable",
+                    "error": "Timeout",
+                    "message": f"no answer from the database within {HEALTH_TIMEOUT:g}s"}
+        except Exception as exc:                       # noqa: BLE001 - reported, not handled
+            return {"ok": False, "database": "unreachable",
+                    "error": type(exc).__name__, "message": redact(str(exc))[:300]}
+        return {"ok": True, "database": "connected"}
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        """Says what is wrong, so a deployment can be diagnosed from outside
-        without reading the platform's logs."""
-        if store is None:
-            return JSONResponse({"ok": False, "database": "unconfigured",
-                                 "message": "DATABASE_URL is not set on this deployment."}, 503)
-        try:
-            await store.ready()
-        except Exception as exc:                       # noqa: BLE001 - reported, not handled
-            return JSONResponse({"ok": False, "database": "unreachable",
-                                 "error": type(exc).__name__,
-                                 "message": redact(str(exc))[:300]}, 503)
-        return JSONResponse({"ok": True, "database": "connected"})
+        """Is this process serving? Always 200 when it is.
+
+        A platform restarts or refuses to release a deployment whose health
+        check fails, so this must not fail for a missing setting: that would
+        take down the one page able to say which setting is missing, and leave
+        the deployment unreachable for the reason it was trying to report.
+        The database's state is in the body, where it informs without killing.
+        """
+        return JSONResponse(await database_state())
+
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        """Is this deployment able to do its work? 503 until the database
+        answers. Point a load balancer here, never at /healthz."""
+        state = await database_state()
+        return JSONResponse(state, 200 if state["ok"] else 503)
 
     @app.post("/api/workspaces", status_code=201)
     async def create_workspace(body: WorkspaceIn) -> dict[str, Any]:

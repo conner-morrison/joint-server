@@ -160,6 +160,11 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, body = await self.call("GET", "/api/workspaces/nosuch")
         self.assertEqual((status, body["exists"], body["name"]), (200, False, ""))
 
+    async def test_health_and_readiness_agree_when_connected(self) -> None:
+        for path in ("/healthz", "/readyz"):
+            status, body = await self.call("GET", path)
+            self.assertEqual((status, body["ok"], body["database"]), (200, True, "connected"), path)
+
     # --- enrolment --------------------------------------------------------
     async def test_an_unknown_worker_is_told_how_to_ask(self) -> None:
         ws = await self.workspace()
@@ -359,10 +364,19 @@ class UnconfiguredTest(unittest.IsolatedAsyncioTestCase):
     async def call(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
         return await ServerlessTest.call(self, method, path, body, token="anything")  # type: ignore[arg-type]
 
-    async def test_health_says_what_is_missing(self) -> None:
+    async def test_health_answers_200_even_with_no_database(self) -> None:
+        """A platform kills a deployment whose health check fails. Failing this
+        one over a missing setting takes down the page that would have named
+        the setting, so the deployment disappears for the reason it was trying
+        to report."""
         status, body = await self.call("GET", "/healthz")
-        self.assertEqual((status, body["database"]), (503, "unconfigured"))
+        self.assertEqual(status, 200)
+        self.assertEqual((body["ok"], body["database"]), (False, "unconfigured"))
         self.assertIn("DATABASE_URL", body["message"])
+
+    async def test_readiness_is_the_one_that_fails(self) -> None:
+        status, body = await self.call("GET", "/readyz")
+        self.assertEqual((status, body["ok"]), (503, False))
 
     async def test_every_endpoint_says_what_is_missing(self) -> None:
         for method, path, payload in (
