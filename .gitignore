@@ -7,3 +7,5 @@ relay.db-*
 .relay-admin-token
 relay-local.log
 mailer-state.json
+build/
+dist/
