@@ -7,19 +7,26 @@ name = "relay"
 version = "0.1.0"
 description = "Channel relay: local workers exchange messages through one internet server"
 requires-python = ">=3.11"
-# Vercel loads `app` from app.py; named here so it is not guessed.
 
-dependencies = []
+# What the deployed server needs. These are not optional: a host that installs
+# this project from pyproject.toml installs exactly this list, and anything
+# missing from it is a crash at import with no clue attached.
+dependencies = [
+    "fastapi>=0.115",
+    # Imported directly for the request models, so declared directly: relying
+    # on it arriving with FastAPI makes this a transitive dependency away from
+    # breaking.
+    "pydantic>=2",
+    "psycopg[binary,pool]>=3.2",
+]
 
 [project.optional-dependencies]
-# The internet server.
-server = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+# Running the process relay yourself, rather than on a serverless host.
+server = ["uvicorn[standard]>=0.30"]
 # Each worker. The client needs nothing else.
 client = ["websockets>=13"]
-# The serverless deployment, which keeps its state in Postgres rather than a
-# file on disk. pgserver is an embedded Postgres, used only by the tests.
-serverless = ["fastapi>=0.115", "psycopg[binary,pool]>=3.2"]
-dev = ["pgserver>=0.1.4"]
+# An embedded Postgres, so the tests need no database service.
+dev = ["pgserver>=0.1.4", "uvicorn[standard]>=0.30"]
 
 [project.scripts]
 relay = "relay.main:main"

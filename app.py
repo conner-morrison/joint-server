@@ -33,9 +33,11 @@ UI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 # to fix; the app starts, serves the console, and /healthz says what is wrong.
 app = create_app(PgStore(DSN) if DSN else None)
 
-# Files first, then the console for anything else: /acme is a workspace the
-# console opens, not a file, and only the browser needs to know the difference.
-app.mount("/static", StaticFiles(directory=UI), name="static")
+# StaticFiles raises when its directory is absent, which would be a crash at
+# import for a missing folder. The console being unavailable is worth saying
+# out loud, not worth taking the relay down for.
+if os.path.isdir(UI):
+    app.mount("/static", StaticFiles(directory=UI), name="static")
 
 
 # Anything the relay itself would have answered. Serving the console here
@@ -52,4 +54,7 @@ async def console(path: str = "") -> Response:
     candidate = os.path.normpath(os.path.join(UI, path))
     if path and candidate.startswith(UI + os.sep) and os.path.isfile(candidate):
         return FileResponse(candidate)
-    return FileResponse(os.path.join(UI, "index.html"))
+    index = os.path.join(UI, "index.html")
+    if not os.path.isfile(index):
+        return JSONResponse({"detail": "the console is not part of this deployment; the API is here"}, 404)
+    return FileResponse(index)
