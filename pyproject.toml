@@ -14,6 +14,10 @@ dependencies = []
 server = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
 # Each worker. The client needs nothing else.
 client = ["websockets>=13"]
+# The serverless deployment, which keeps its state in Postgres rather than a
+# file on disk. pgserver is an embedded Postgres, used only by the tests.
+serverless = ["fastapi>=0.115", "psycopg[binary,pool]>=3.2"]
+dev = ["pgserver>=0.1.4"]
 
 [project.scripts]
 relay = "relay.main:main"
