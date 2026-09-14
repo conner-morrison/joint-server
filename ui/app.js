@@ -983,6 +983,12 @@ function renderMembers() {
   const ch = currentChannel();
   if (!el || !ch) return;
   const others = state.workers.filter((w) => !ch.members.includes(w.worker_id));
+
+  // Rebuilding this while it is being used throws away a chosen worker and a
+  // ticked box, so when nothing about it has changed only the list is redrawn.
+  const shape = `${ch.name}|${others.map((w) => w.worker_id).join(",")}`;
+  if (el.dataset.shape === shape) return renderMemberList();
+  el.dataset.shape = shape;
   const select = h("select", { "aria-label": "Worker to add" }, others.map((w) => h("option", { value: w.worker_id }, w.worker_id)));
   const history = h("input", { type: "checkbox" });
 
@@ -1148,8 +1154,32 @@ function startPolling(every = 4000) {
   setStream("polling");
   state.pollTimer = setInterval(() => {
     refreshAll();
-    if (state.view.kind === "channel") renderChannelView(state.view.name);
+    pollFeed();
   }, every);
+}
+
+// Ask only for what is new and append it, the way an event would have
+// arrived. Re-rendering the channel instead replaces the whole view every few
+// seconds: the feed blinks through "Loading messages...", the scroll position
+// jumps, and anything half-typed in the composer is thrown away.
+async function pollFeed() {
+  if (state.view.kind !== "channel") return;
+  const name = state.view.name;
+  const last = state.feed.channel === name && state.feed.messages.length
+    ? state.feed.messages[state.feed.messages.length - 1].seq
+    : 0;
+  try {
+    const newer = await api("GET", `/api/channels/${enc(name)}/messages?after=${last}&limit=${PAGE}`);
+    // Moved on, or the feed was replaced while the request was in flight.
+    if (state.view.kind !== "channel" || state.view.name !== name || state.feed.channel !== name) return;
+    const seen = new Set(state.feed.messages.map((m) => m.seq));
+    const fresh = newer.filter((m) => !seen.has(m.seq));
+    if (!fresh.length) return;
+    mergeMessages(fresh);
+    renderFeed(false);
+  } catch {
+    /* the next tick tries again; refreshAll reports anything that matters */
+  }
 }
 
 const sleep = (ms, signal) => new Promise((resolve) => {
