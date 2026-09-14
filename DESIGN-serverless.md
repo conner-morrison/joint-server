@@ -69,3 +69,25 @@ Worker token:
 
 Admin token: `/api/*` exactly as before. The console is served from the same
 deployment, so it calls them on its own origin.
+
+## The database
+
+Any Postgres works: what the deployment needs is a connection string in
+`DATABASE_URL` (Vercel's own `POSTGRES_URL` is accepted too). Nothing here is
+tied to a particular provider.
+
+What differs between them is **connections**. A serverless host runs many
+copies of the application at once, each with its own pool, against one
+database with a finite limit.
+
+- **Neon, Supabase** publish a *pooled* connection string, which absorbs that.
+  Use it: on Neon the host contains `-pooler`.
+- **Railway, a VPS, anything plain** hand you a direct connection to Postgres,
+  whose `max_connections` defaults to about 100. Keep `RELAY_POOL_MAX` small
+  (3 is the default here) and it is fine at this scale.
+
+Two things catch people out on Railway. Its `DATABASE_URL` points at
+`postgres.railway.internal`, which only resolves **inside** Railway: from
+Vercel use the public one, `DATABASE_PUBLIC_URL`, whose host ends in
+`proxy.rlwy.net`. And a Railway database is always on, so unlike Neon's free
+tier nothing sleeps and no query pays to wake it.

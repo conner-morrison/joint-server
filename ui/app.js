@@ -208,12 +208,29 @@ async function enterWorkspace(slug) {
     /* offline, or not served by a relay */
   }
   if (found?.exists) return showWorkspaceSignIn(slug, found.name || slug);
-  showHome({
-    error: found
-      ? `There is no workspace at /${slug} on this server yet.`
-      : `No workspace called "${slug}" on this device.`,
-    prefill: slug,
-  });
+  // The server answered and said no: this address is empty, which is a
+  // different thing from a workspace this browser happens not to know.
+  if (found) return showNotFound(slug);
+  showHome({ error: `No workspace called "${slug}" on this device.`, prefill: slug });
+}
+
+// An address with nothing at it. Says so plainly, and offers the two things
+// worth doing next rather than dropping the visitor at the front door.
+function showNotFound(slug) {
+  stopStream();
+  state.workspace = "";
+  $("#root").replaceChildren(h("div", { class: "connect" },
+    h("div", { class: "connect-card" },
+      brand(),
+      h("p", { class: "notfound-code" }, "404"),
+      h("h1", {}, "No workspace here"),
+      h("p", {}, "This server has nothing at ", h("code", {}, "/" + slug), "."),
+      h("p", { class: "muted small" },
+        "Check the address, or make this one. Workspace names are chosen when "
+        + "they are created, and the address is a lowercase form of the name."),
+      h("button", { class: "btn primary block", onclick: () => openNewWorkspace(slug) },
+        `Create /${slug}`),
+      h("button", { class: "btn block", type: "button", onclick: () => goHome() }, "All workspaces"))));
 }
 
 // The front door of one workspace: its own page, asking only for its password.

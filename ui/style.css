@@ -230,3 +230,12 @@ tr:last-child td { border-bottom: 0; }
   padding: 10px 12px; font-size: 13px;
 }
 .notice code { font: 12px/1.5 var(--mono); word-break: break-word; opacity: .85; }
+
+/* --- an address with nothing at it --------------------------------------- */
+.notfound-code {
+  margin: 0; font: 700 13px/1 var(--mono); letter-spacing: .14em;
+  color: var(--muted); text-transform: uppercase;
+}
+.connect-card h1 + p code {
+  font: 13px/1.5 var(--mono); background: var(--code); padding: 1px 6px; border-radius: 4px;
+}

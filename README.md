@@ -232,6 +232,13 @@ rest is dashboard-only:
   single instance, so a second one splits the workers between two servers that
   cannot see each other
 
+**Serverless, with the console served from the same address.** `app.py` runs
+the relay on Vercel, holding many workspaces in one deployment and keeping its
+state in Postgres. Set `DATABASE_URL` to any Postgres connection string -
+Neon, Supabase, Railway, your own - and open the deployment: if it is not set,
+the first page says so rather than failing obscurely. `DESIGN-serverless.md`
+has the details, including which connection string to use from which provider.
+
 **Render.** `render.yaml` says all of the above declaratively; import it as a
 Blueprint. A free instance will not do: it sleeps when idle, which drops every
 worker's websocket, and has no disk.

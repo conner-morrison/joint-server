@@ -121,7 +121,7 @@ class PgStore:
     stall the event loop for the whole of it.
     """
 
-    def __init__(self, dsn: str, *, min_size: int = 0, max_size: int = 4):
+    def __init__(self, dsn: str, *, min_size: int = 0, max_size: int = 3):
         # Opened on first use, not at startup. An instance that only serves the
         # console should not pay for a connection, and a database that is
         # unreachable should fail the request that needed it with something

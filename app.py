@@ -31,7 +31,13 @@ UI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 # A missing database must not stop the app from starting. Raising here would
 # reach the browser as "this function crashed", which says nothing about what
 # to fix; the app starts, serves the console, and /healthz says what is wrong.
-app = create_app(PgStore(DSN) if DSN else None)
+# A serverless host runs many copies of this, each with its own pool, against
+# one database that has a finite connection limit. A managed pooler (Neon,
+# Supabase) absorbs that; a plain Postgres (Railway, a VPS) does not, so the
+# pool is kept small and can be tuned without a code change.
+POOL_MAX = int(os.environ.get("RELAY_POOL_MAX", "3"))
+
+app = create_app(PgStore(DSN, max_size=POOL_MAX) if DSN else None)
 
 # StaticFiles raises when its directory is absent, which would be a crash at
 # import for a missing folder. The console being unavailable is worth saying
