@@ -1,10 +1,12 @@
 .git
 .venv
-ui
 tests
 examples
 relay.db
 relay.db-*
+mailer-state.json
 **/__pycache__
 *.egg-info
 .env
+.relay-admin-token
+*.log

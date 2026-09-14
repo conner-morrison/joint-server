@@ -91,3 +91,23 @@ Two things catch people out on Railway. Its `DATABASE_URL` points at
 Vercel use the public one, `DATABASE_PUBLIC_URL`, whose host ends in
 `proxy.rlwy.net`. And a Railway database is always on, so unlike Neon's free
 tier nothing sleeps and no query pays to wake it.
+
+## Running it as a process instead
+
+Nothing here needs to be serverless. The same application runs as an ordinary
+process — `uvicorn app:app`, which is what the `Dockerfile` does — and that is
+the better arrangement when the database is next to it.
+
+On Railway, with Postgres in the same project, the two talk over private
+networking: `DATABASE_URL` is `${{Postgres.DATABASE_URL}}`, which resolves to
+`postgres.railway.internal`. Nothing about the database is reachable from
+outside, and no traffic between them leaves the network to be billed as
+egress. That is why exposing the database publicly, to be reached from a
+serverless host elsewhere, is the arrangement to avoid when you have a choice.
+
+What stays the same either way: state is entirely in Postgres, so the
+container keeps nothing and can be restarted or replaced freely. What a
+process buys, if it is ever wanted, is a connection the server can hold open,
+which would let the console be told about changes rather than asking for them.
+The polling it does now works in both places, which is why it is what is
+written.

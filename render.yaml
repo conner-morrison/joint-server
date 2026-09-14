@@ -1,9 +1,8 @@
-# Render Blueprint for the relay server.
+# Render Blueprint for the relay.
 #
-# The relay holds long-lived websockets and keeps all of its state in one
-# SQLite file, so it needs a paid instance with a disk. A free instance sleeps
-# when idle, which drops every worker's connection, and has no disk, which
-# loses the database on each restart.
+# State lives in Postgres, not on disk, so this needs no volume and can be
+# restarted freely. Point DATABASE_URL at any Postgres: Render's own, Neon,
+# Railway, your own.
 services:
   - type: web
     name: relay
@@ -11,22 +10,11 @@ services:
     plan: starter
     region: frankfurt
     healthCheckPath: /healthz
-    # Live routing is held in memory and the disk is attached to one instance.
-    # This must never be scaled up.
-    numInstances: 1
-    disk:
-      name: relay-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
-      # The database is the whole state of the server: keep it on the disk.
-      - key: RELAY_DB
-        value: /data/relay.db
-      # Render generates this once and shows it in the dashboard, under
-      # Environment. It is what you paste into the console's "Admin token".
-      - key: RELAY_ADMIN_TOKEN
-        generateValue: true
-      # The origin your Vercel console is served from, comma-separated.
-      # Set it in the dashboard; a browser cannot call the API without it.
-      - key: RELAY_CORS_ORIGINS
+      # Set in the dashboard. Until it is set the deployment still starts and
+      # its first page says what is missing.
+      - key: DATABASE_URL
         sync: false
+      # Small on purpose: several instances share one database's connections.
+      - key: RELAY_POOL_MAX
+        value: "3"
