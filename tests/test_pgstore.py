@@ -11,7 +11,7 @@ import os
 import tempfile
 import unittest
 
-from relay.pgstore import PgStore
+from relay.pgstore import PgStore, slugify
 
 try:
     import pgserver
@@ -41,22 +41,24 @@ class PgStoreTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         assert _server is not None
         _server.psql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        self.store = PgStore(_server.get_uri(), min_size=1, max_size=4)
-        await self.store.open()
-        await self.store.setup()
+        self.db = PgStore(_server.get_uri(), min_size=1, max_size=4)
+        await self.db.open()
+        await self.db.setup()
+        await self.db.create_workspace("acme", "hunter2", "Acme")
+        self.store = self.db.ws("acme")
         await self.store.add_channel("jobs", "work to be picked up")
         self.tokens = {w: await self.store.add_worker(w) for w in ("alice", "bob", "carol")}
         await self.store.join("jobs", "alice")
         await self.store.join("jobs", "bob")
 
     async def asyncTearDown(self) -> None:
-        await self.store.close()
+        await self.db.close()
 
     async def test_token_resolves_and_is_not_stored(self) -> None:
         self.assertEqual(await self.store.worker_for_token(self.tokens["alice"]), "alice")
         self.assertIsNone(await self.store.worker_for_token("nonsense"))
         self.assertIsNone(await self.store.worker_for_token(""))
-        row = await self.store._one("SELECT token_hash FROM workers WHERE worker_id = 'alice'")
+        row = await self.db._one("SELECT token_hash FROM workers WHERE worker_id = 'alice'")
         self.assertNotIn(self.tokens["alice"], row["token_hash"])
 
     async def test_names_are_validated(self) -> None:
@@ -115,7 +117,7 @@ class PgStoreTest(unittest.IsolatedAsyncioTestCase):
         messages that still exist and be handed old ones."""
         await self.store.append("jobs", "alice", {"n": 1}, ts=1.0)
         top, _ = await self.store.append("jobs", "alice", {"n": 2}, ts=1.0)
-        self.assertEqual(await self.store.prune(2.0), 2)
+        self.assertEqual(await self.db.prune(2.0), 2)
         self.assertEqual(await self.store.head(), top)
 
     async def test_bodies_keep_their_shape(self) -> None:
@@ -149,3 +151,122 @@ class PgStoreTest(unittest.IsolatedAsyncioTestCase):
             await self.store.join("nope", "alice")
         with self.assertRaises(LookupError):
             await self.store.join("jobs", "nobody")
+
+
+class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
+    """Two workspaces on one deployment must not be able to see each other."""
+
+    async def asyncSetUp(self) -> None:
+        assert _server is not None
+        _server.psql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        self.db = PgStore(_server.get_uri(), min_size=1, max_size=4)
+        await self.db.open()
+        await self.db.setup()
+        await self.db.create_workspace("acme", "acme-pass", "Acme")
+        await self.db.create_workspace("upwork", "upwork-pass", "Upwork")
+        self.acme, self.upwork = self.db.ws("acme"), self.db.ws("upwork")
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+
+    async def test_password_opens_only_its_own_workspace(self) -> None:
+        self.assertTrue(await self.db.check_password("acme", "acme-pass"))
+        self.assertFalse(await self.db.check_password("acme", "upwork-pass"))
+        self.assertFalse(await self.db.check_password("acme", ""))
+        self.assertFalse(await self.db.check_password("nosuch", "acme-pass"))
+
+    async def test_password_is_not_stored(self) -> None:
+        row = await self.db._one("SELECT password_hash FROM workspaces WHERE slug = 'acme'")
+        self.assertNotIn("acme-pass", row["password_hash"])
+
+    async def test_slugs_are_unique_and_validated(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.db.create_workspace("acme", "other")
+        for bad in ("", "has space", "-nope", "a" * 65):
+            with self.assertRaises(ValueError):
+                await self.db.create_workspace(bad, "pass")
+        with self.assertRaises(ValueError):
+            await self.db.create_workspace("fine", "")
+
+    async def test_the_same_names_can_exist_in_both(self) -> None:
+        """Two workspaces each with a 'jobs' channel and a 'scout' worker is
+        ordinary, not a conflict."""
+        for ws in (self.acme, self.upwork):
+            await ws.add_channel("jobs")
+            await ws.add_worker("scout")
+            await ws.join("jobs", "scout")
+        self.assertEqual(await self.acme.members_of("jobs"), ["scout"])
+        self.assertEqual(await self.upwork.members_of("jobs"), ["scout"])
+
+    async def test_messages_do_not_cross(self) -> None:
+        for ws in (self.acme, self.upwork):
+            await ws.add_channel("jobs")
+            await ws.add_worker("scout")
+            await ws.join("jobs", "scout", from_start=True)
+        await self.acme.append("jobs", "@server", {"secret": "acme only"})
+
+        self.assertEqual(len(await self.acme.messages_after("jobs", 0)), 1)
+        self.assertEqual(await self.upwork.messages_after("jobs", 0), [])
+        self.assertEqual(await self.upwork.waiting_for("scout"), [])
+        self.assertEqual(len(await self.acme.waiting_for("scout")), 1)
+
+    async def test_a_token_belongs_to_one_workspace(self) -> None:
+        await self.acme.add_channel("jobs")
+        token = await self.acme.add_worker("scout")
+        self.assertEqual(await self.db.workspace_for_token(token), ("acme", "scout"))
+        self.assertEqual(await self.acme.worker_for_token(token), "scout")
+        # The same token presented to another workspace is not a token at all.
+        self.assertIsNone(await self.upwork.worker_for_token(token))
+
+    async def test_the_same_dedupe_id_is_independent_per_workspace(self) -> None:
+        for ws in (self.acme, self.upwork):
+            await ws.add_channel("jobs")
+        a, dup_a = await self.acme.append("jobs", "@server", 1, "gmail-1:0")
+        b, dup_b = await self.upwork.append("jobs", "@server", 1, "gmail-1:0")
+        self.assertNotEqual(a, b)
+        self.assertFalse(dup_a or dup_b)
+        again, dup = await self.acme.append("jobs", "@server", 1, "gmail-1:0")
+        self.assertEqual((again, dup), (a, True))
+
+    async def test_deleting_a_workspace_takes_everything_in_it(self) -> None:
+        await self.acme.add_channel("jobs")
+        await self.acme.add_worker("scout")
+        await self.acme.join("jobs", "scout")
+        await self.acme.append("jobs", "@server", {"n": 1})
+        await self.upwork.add_channel("jobs")
+        await self.upwork.append("jobs", "@server", {"n": 2})
+
+        self.assertTrue(await self.db.remove_workspace("acme"))
+        self.assertEqual(await self.db._all("SELECT 1 FROM messages WHERE workspace = 'acme'"), [])
+        self.assertEqual(await self.db._all("SELECT 1 FROM workers WHERE workspace = 'acme'"), [])
+        self.assertEqual(await self.db._all("SELECT 1 FROM members WHERE workspace = 'acme'"), [])
+        # The other workspace is untouched.
+        self.assertEqual(len(await self.upwork.messages_after("jobs", 0)), 1)
+
+    async def test_waiting_for_spans_channels_in_order(self) -> None:
+        await self.acme.add_channel("jobs")
+        await self.acme.add_channel("results")
+        await self.acme.add_worker("scout")
+        await self.acme.join("jobs", "scout")
+        await self.acme.join("results", "scout")
+        await self.acme.append("jobs", "@server", {"n": 1})
+        await self.acme.append("results", "@server", {"n": 2})
+        await self.acme.append("jobs", "@server", {"n": 3})
+        waiting = await self.acme.waiting_for("scout")
+        self.assertEqual([m["body"]["n"] for m in waiting], [1, 2, 3])
+        self.assertEqual([m["seq"] for m in waiting], sorted(m["seq"] for m in waiting))
+
+    async def test_a_poll_does_not_return_what_was_acked(self) -> None:
+        await self.acme.add_channel("jobs")
+        await self.acme.add_worker("scout")
+        await self.acme.join("jobs", "scout")
+        seq, _ = await self.acme.append("jobs", "@server", {"n": 1})
+        self.assertEqual(len(await self.acme.waiting_for("scout")), 1)
+        await self.acme.ack("jobs", "scout", seq)
+        self.assertEqual(await self.acme.waiting_for("scout"), [])
+
+    async def test_slugify_matches_what_the_console_derives(self) -> None:
+        self.assertEqual(slugify("My Acme Jobs"), "myacmejobs")
+        self.assertEqual(slugify("  Upwork  "), "upwork")
+        self.assertEqual(slugify("a/b?c"), "abc")
+        self.assertEqual(slugify("Rele-vant_1.0"), "rele-vant_1.0")
