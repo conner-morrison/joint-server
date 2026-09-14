@@ -1136,9 +1136,67 @@ function httpUrl(value) {
 }
 
 const FACTS = [["Budget", "budget"], ["Published", "published"], ["Posted", "posted"],
-               ["Client", "client"], ["Country", "country"], ["Skills", "skills"]];
+               ["Skills", "skills"]];
+
+// What is worth knowing about whoever posted the job, in the order it is worth
+// reading. A field the publisher did not send is simply absent: none of this
+// is invented for a message that does not carry it.
+const CLIENT_FIELDS = [
+  ["Rank", "rank"],
+  ["Rating", "rating"],
+  ["Payment", "paymentVerified"],
+  ["Location", "location"],
+  ["Reviews", "reviews"],
+  ["Jobs posted", "jobsPosted"],
+  ["Hire rate", "hireRate"],
+  ["Spent", "spent"],
+  ["Registered", "registered"],
+];
+
 const SHOWN = new Set([...FACTS.map(([, key]) => key), "title", "url", "link", "upworkUrl",
-                       "type", "source", "index", "emailId", "emailSubject", "receivedAt"]);
+                       "type", "source", "index", "emailId", "emailSubject", "receivedAt",
+                       "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
+
+// Accepts either a nested object or flat clientRank-style keys, so a worker
+// can send whichever is natural to it.
+function clientOf(body) {
+  const nested = body.client && typeof body.client === "object" && !Array.isArray(body.client)
+    ? body.client : {};
+  const found = {};
+  for (const [, key] of CLIENT_FIELDS) {
+    const flat = body["client" + key[0].toUpperCase() + key.slice(1)];
+    const value = nested[key] !== undefined ? nested[key] : flat;
+    if (value !== undefined && value !== null && value !== "") found[key] = value;
+  }
+  // A plain string under `client` is a name, which is still worth showing.
+  if (typeof body.client === "string" && body.client.trim()) found.name = body.client.trim();
+  return found;
+}
+
+function clientValue(key, value) {
+  if (typeof value === "boolean") {
+    return h("span", { class: value ? "yes" : "no" }, value ? "Verified" : "Not verified");
+  }
+  if (key === "paymentVerified") {
+    const said = String(value).toLowerCase();
+    if (["true", "yes", "verified"].includes(said)) return h("span", { class: "yes" }, "Verified");
+    if (["false", "no", "unverified"].includes(said)) return h("span", { class: "no" }, "Not verified");
+  }
+  if (key === "rating" && typeof value === "number") return `${value.toFixed(2)} / 5`;
+  return String(Array.isArray(value) ? value.join(", ") : value);
+}
+
+function clientBlock(body) {
+  const client = clientOf(body);
+  const rows = CLIENT_FIELDS
+    .filter(([, key]) => client[key] !== undefined)
+    .map(([label, key]) => h("div", { class: "client-row" },
+      h("dt", {}, label), h("dd", {}, clientValue(key, client[key]))));
+  if (!rows.length && !client.name) return null;
+  return h("div", { class: "client" },
+    h("div", { class: "client-head" }, "Client", client.name ? h("span", { class: "client-name" }, client.name) : false),
+    rows.length ? h("dl", { class: "client-facts" }, rows) : false);
+}
 
 // A body with a title reads as something worth showing as itself rather than
 // as JSON. Everything else still falls through to the JSON it always was.
@@ -1164,6 +1222,7 @@ function jobCard(body) {
       ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, body.title)
       : h("div", { class: "job-title" }, body.title),
     facts.length ? h("div", { class: "job-facts" }, facts) : false,
+    clientBlock(body),
     body.emailSubject ? h("div", { class: "job-from muted small truncate" }, "from " + body.emailSubject) : false,
     Object.keys(rest).length
       ? h("details", { class: "job-more" }, h("summary", {}, "Everything else"),
