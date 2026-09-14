@@ -134,6 +134,22 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, _ = await self.call("GET", "/nosuch/api/channels", token="p")
         self.assertEqual(status, 404)
 
+    async def test_the_workspaces_here_are_listed_by_name(self) -> None:
+        await self.workspace("Acme", "acme-pass")
+        await self.workspace("Upwork", "upwork-pass")
+        status, listed = await self.call("GET", "/api/workspaces")
+        self.assertEqual(status, 200)
+        self.assertEqual([w["slug"] for w in listed], ["acme", "upwork"])
+        self.assertEqual([w["name"] for w in listed], ["Acme", "Upwork"])
+
+    async def test_the_listing_never_carries_a_password(self) -> None:
+        """Names are public here; what opens them is not."""
+        await self.workspace("Acme", "swordfish")
+        _, listed = await self.call("GET", "/api/workspaces")
+        blob = json.dumps(listed)
+        self.assertNotIn("swordfish", blob)
+        self.assertNotIn("password", blob)
+
     # --- enrolment --------------------------------------------------------
     async def test_an_unknown_worker_is_told_how_to_ask(self) -> None:
         ws = await self.workspace()

@@ -182,6 +182,12 @@ def create_app(store: PgStore | None) -> FastAPI:
             raise HTTPException(409 if "exists" in str(exc) else 400, str(exc)) from None
         return {"slug": slug, "name": body.name.strip()}
 
+    @app.get("/api/workspaces")
+    async def list_workspaces() -> list[dict[str, Any]]:
+        """The workspaces here, by name. Names only: what is inside one needs
+        that workspace's password, and this says nothing about it."""
+        return await db().list_workspaces()
+
     @app.get("/api/workspaces/{ws}")
     async def workspace_exists(ws: str) -> dict[str, Any]:
         """Whether a workspace is here. Says nothing else: no password, no

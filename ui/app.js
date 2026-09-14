@@ -280,31 +280,88 @@ function handleError(err) {
 function showHome({ error = "", prefill = "" } = {}) {
   stopStream();
   state.workspace = "";
-  const names = Object.keys(loadWorkspaces()).sort();
   const err = h("p", { class: "error", role: "alert", hidden: !error }, error);
+  const list = h("div", { class: "ws-list" });
 
   const card = h("div", { class: "connect-card" },
     brand(),
     h("h1", {}, "Workspaces"),
-    h("p", {}, names.length
-      ? "Open one, or add another relay."
-      : "A workspace is a relay you can open by name. Make one to begin."),
+    h("p", { class: "muted" }, "A workspace is a relay you can open by name."),
     err,
-    names.length ? h("div", { class: "ws-list" }, names.map((slug) => {
-      const ws = loadWorkspaces()[slug];
-      return h("div", { class: "ws-row" },
-        h("button", { class: "ws-open", onclick: () => goToWorkspace(slug) },
-          h("span", { class: "strong" }, ws.name || slug),
-          h("span", { class: "muted small truncate" }, "/" + slug)),
-        h("button", {
-          class: "btn small danger", title: `Forget ${ws.name || slug}`,
-          onclick: () => { removeWorkspace(slug); showHome(); },
-        }, "Forget"));
-    })) : false,
+    list,
     h("button", { class: "btn primary block", onclick: () => openNewWorkspace(prefill) }, "Create a workspace"));
 
   $("#root").replaceChildren(h("div", { class: "connect" }, card));
+  renderWorkspaceList(list);
   showDeploymentTrouble(card, err);
+}
+
+// What this device has a password for, and what the deployment says it holds.
+// The two overlap: a workspace can be on the server and remembered here, on
+// the server and not remembered, or remembered from a relay somewhere else.
+async function renderWorkspaceList(list) {
+  const saved = loadWorkspaces();
+  const draw = (onServer) => {
+    const slugs = [...new Set([...Object.keys(saved), ...onServer.map((w) => w.slug)])].sort();
+    if (!slugs.length) {
+      fill(list, h("p", { class: "muted small" }, "None yet. Make one to begin."));
+      return;
+    }
+    const names = new Map(onServer.map((w) => [w.slug, w.name]));
+    fill(list, slugs.map((slug) => {
+      const here = saved[slug];
+      const label = here?.name || names.get(slug) || slug;
+      return h("div", { class: "ws-row" },
+        h("button", {
+          class: "ws-open",
+          onclick: () => (here ? goToWorkspace(slug) : openExistingWorkspace(slug, names.get(slug) || slug)),
+        },
+          h("span", { class: "strong" }, label),
+          h("span", { class: "muted small truncate" },
+            "/" + slug, here ? "" : " · password needed on this device")),
+        here ? h("button", {
+          class: "btn small danger", title: `Forget ${label} on this device`,
+          onclick: () => { removeWorkspace(slug); showHome(); },
+        }, "Forget") : false);
+    }));
+  };
+
+  draw([]);                                   // what is known here, immediately
+  const base = (location.origin + basePath()).replace(/\/+$/, "");
+  try {
+    const res = await fetch(base + "/api/workspaces", { cache: "no-store" });
+    if (!(res.headers.get("content-type") || "").includes("json")) return;
+    const onServer = await res.json();
+    if (Array.isArray(onServer) && list.isConnected) draw(onServer);
+  } catch {
+    /* not a relay, or offline: what is saved here is the whole answer */
+  }
+}
+
+// A workspace this deployment has, that this browser has never opened.
+function openExistingWorkspace(slug, name) {
+  const pass = h("input", { type: "password", required: true, autocomplete: "current-password" });
+  const err = h("p", { class: "error", hidden: true });
+  openDialog(`Open ${name}`,
+    [h("p", { class: "muted small" }, `This workspace is on this server at /${slug}. `
+      + "Enter its password to open it on this device."),
+     field("Password", pass), err],
+    [cancel(), h("button", { class: "btn primary", type: "submit" }, "Open")],
+    async (dlg) => {
+      state.url = (location.origin + basePath()).replace(/\/+$/, "") + "/" + slug;
+      state.token = pass.value;
+      try {
+        await api("GET", "/api/channels");
+      } catch (ex) {
+        err.textContent = ex.status === 401 ? "That password does not open this workspace." : ex.message;
+        err.hidden = false;
+        return;
+      }
+      saveWorkspace(slug, { name, url: state.url, token: state.token });
+      dlg.close();
+      goToWorkspace(slug);
+    });
+  pass.focus();
 }
 
 // Whether the page you are looking at is itself a relay, and a working one.
