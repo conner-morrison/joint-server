@@ -30,7 +30,7 @@ UI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 
 # A missing database must not stop the app from starting. Raising here would
 # reach the browser as "this function crashed", which says nothing about what
-# to fix; the app starts, serves the console, and /healthz says what is wrong.
+# to fix; the app starts, serves the console, and the console says what is wrong.
 # A serverless host runs many copies of this, each with its own pool, against
 # one database that has a finite connection limit. A managed pooler (Neon,
 # Supabase) absorbs that; a plain Postgres (Railway, a VPS) does not, so the

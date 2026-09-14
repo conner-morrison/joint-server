@@ -118,10 +118,6 @@ def create_app(store: Store, admin_token: str, *, retention_days: float = 7.0,
         if not secrets.compare_digest(_bearer(authorization).encode(), admin_token.encode()):
             raise HTTPException(401, "admin token required")
 
-    @app.get("/healthz")
-    def healthz() -> dict[str, Any]:
-        return {"ok": True, "online": len(hub.sessions)}
-
     @app.websocket("/ws")
     async def worker_socket(ws: WebSocket) -> None:
         # Query string as a fallback for clients that cannot set headers (browsers).

@@ -9,7 +9,6 @@ services:
     runtime: docker
     plan: starter
     region: frankfurt
-    healthCheckPath: /healthz
     envVars:
       # Set in the dashboard. Until it is set the deployment still starts and
       # its first page says what is missing.

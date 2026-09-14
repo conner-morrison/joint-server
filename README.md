@@ -212,9 +212,6 @@ Wherever it runs:
   token hashes, and every message.
 - **Passwords and tokens are stored as hashes.** A workspace password that is
   lost cannot be read back, and a lost worker token can only be replaced.
-- **Point a load balancer at `/readyz`, not `/healthz`.** The first is 503
-  until the database answers; the second is 200 whenever the process is
-  serving, so that a deployment missing a setting can still say which one.
 - **`RELAY_POOL_MAX`** caps connections per instance. A managed pooler absorbs
   many instances; a plain Postgres has about a hundred connections to give out.
 

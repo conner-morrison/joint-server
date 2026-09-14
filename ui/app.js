@@ -384,14 +384,30 @@ function showHome({ error = "", prefill = "" } = {}) {
     h("button", { class: "btn primary block", onclick: () => openNewWorkspace(prefill) }, "Create a workspace"));
 
   $("#root").replaceChildren(h("div", { class: "connect" }, card));
-  renderWorkspaceList(list);
-  showDeploymentTrouble(card, err);
+  renderWorkspaceList(list, card, list);
 }
 
 // What this device has a password for, and what the deployment says it holds.
 // The two overlap: a workspace can be on the server and remembered here, on
 // the server and not remembered, or remembered from a relay somewhere else.
-async function renderWorkspaceList(list) {
+// What the deployment said when asked for its workspaces. A relay with no
+// database answers every request with the reason, so the list is where that
+// shows up: nothing has to ask separately.
+function troubleNotice(answer) {
+  if (!answer || answer.status !== "unconfigured" && answer.status !== "database_unreachable") return null;
+  const unset = answer.status === "unconfigured";
+  return h("div", { class: "notice", role: "alert" },
+    h("strong", {}, unset ? "This deployment has no database yet"
+      : "This deployment cannot reach its database"),
+    h("span", {}, unset
+      ? "Set DATABASE_URL to a Postgres connection string in this project's environment variables, then redeploy."
+      : "The database is configured but is not answering."),
+    // Only when it says something this does not: a driver's complaint is
+    // worth reading, a restatement of the sentence above is not.
+    !unset && answer.message ? h("code", {}, answer.message) : false);
+}
+
+async function renderWorkspaceList(list, card, errEl) {
   const saved = loadWorkspaces();
   const draw = (onServer) => {
     const slugs = [...new Set([...Object.keys(saved), ...onServer.map((w) => w.slug)])].sort();
@@ -423,8 +439,11 @@ async function renderWorkspaceList(list) {
   try {
     const res = await fetch(deploymentRoot() + "/api/workspaces", { cache: "no-store" });
     if (!(res.headers.get("content-type") || "").includes("json")) return;
-    const onServer = await res.json();
-    if (Array.isArray(onServer) && list.isConnected) draw(onServer);
+    const answer = await res.json();
+    if (!list.isConnected) return;
+    if (Array.isArray(answer)) return draw(answer);
+    const notice = troubleNotice(answer);
+    if (notice && card?.isConnected) card.insertBefore(notice, errEl);
   } catch {
     /* not a relay, or offline: what is saved here is the whole answer */
   }
@@ -456,37 +475,6 @@ function openExistingWorkspace(slug, name) {
   pass.focus();
 }
 
-// Whether the page you are looking at is itself a relay, and a working one.
-// A console served from somewhere static is not: it has no health endpoint,
-// and there is nothing to report.
-async function deploymentHealth() {
-  try {
-    const res = await fetch(deploymentRoot() + "/healthz", { cache: "no-store" });
-    if (!(res.headers.get("content-type") || "").includes("json")) return null;
-    const health = await res.json();
-    return typeof health?.ok === "boolean" ? health : null;
-  } catch {
-    return null;                      // offline, or not a relay: say nothing
-  }
-}
-
-// Told at the door rather than after filling in a form: if this deployment is
-// its own relay and it cannot reach its database, nothing here will work, and
-// the reason is a setting rather than anything the person did.
-async function showDeploymentTrouble(card, errEl) {
-  const health = await deploymentHealth();
-  if (!health || health.ok || !card.isConnected) return;
-  const fix = health.database === "unconfigured"
-    ? "Set DATABASE_URL to a Postgres connection string in this project's environment variables, then redeploy."
-    : "The database is configured but cannot be reached right now.";
-  card.insertBefore(
-    h("div", { class: "notice", role: "alert" },
-      h("strong", {}, health.database === "unconfigured"
-        ? "This deployment has no database yet" : "This deployment cannot reach its database"),
-      h("span", {}, fix),
-      health.message ? h("code", {}, health.message) : false),
-    errEl);
-}
 
 function openNewWorkspace(prefill = "") {
   const name = h("input", {

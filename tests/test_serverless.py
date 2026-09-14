@@ -160,11 +160,6 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, body = await self.call("GET", "/api/workspaces/nosuch")
         self.assertEqual((status, body["exists"], body["name"]), (200, False, ""))
 
-    async def test_health_and_readiness_agree_when_connected(self) -> None:
-        for path in ("/healthz", "/readyz"):
-            status, body = await self.call("GET", path)
-            self.assertEqual((status, body["ok"], body["database"]), (200, True, "connected"), path)
-
     # --- enrolment --------------------------------------------------------
     async def test_an_unknown_worker_is_told_how_to_ask(self) -> None:
         ws = await self.workspace()
@@ -364,19 +359,12 @@ class UnconfiguredTest(unittest.IsolatedAsyncioTestCase):
     async def call(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
         return await ServerlessTest.call(self, method, path, body, token="anything")  # type: ignore[arg-type]
 
-    async def test_health_answers_200_even_with_no_database(self) -> None:
-        """A platform kills a deployment whose health check fails. Failing this
-        one over a missing setting takes down the page that would have named
-        the setting, so the deployment disappears for the reason it was trying
-        to report."""
-        status, body = await self.call("GET", "/healthz")
-        self.assertEqual(status, 200)
-        self.assertEqual((body["ok"], body["database"]), (False, "unconfigured"))
+    async def test_the_console_is_still_served(self) -> None:
+        """A deployment with no database still starts and still serves its
+        console, which is the only thing able to say what is missing."""
+        status, body = await self.call("GET", "/api/workspaces")
+        self.assertEqual((status, body["status"]), (503, "unconfigured"))
         self.assertIn("DATABASE_URL", body["message"])
-
-    async def test_readiness_is_the_one_that_fails(self) -> None:
-        status, body = await self.call("GET", "/readyz")
-        self.assertEqual((status, body["ok"]), (503, False))
 
     async def test_every_endpoint_says_what_is_missing(self) -> None:
         for method, path, payload in (
@@ -397,3 +385,46 @@ class RedactTest(unittest.TestCase):
         self.assertNotIn("sup3rsecret", said)
         self.assertNotIn("someone", said)
         self.assertIn("30s", said)
+
+
+class UnreachableDatabaseTest(unittest.IsolatedAsyncioTestCase):
+    """A database that is configured but not answering.
+
+    With no endpoint left to ask about the database's health, the ordinary
+    requests have to carry that news themselves. An unhandled driver error
+    would reach the caller as a bare 500, which says nothing about which part
+    is unwell, and would put the connection string in the server's logs.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = LiveApp.__new__(LiveApp)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.app.port = s.getsockname()[1]
+        cls.app.url = f"http://127.0.0.1:{cls.app.port}"
+        store = PgStore("postgresql://someone:sup3rsecret@127.0.0.1:1/nope", max_size=1)
+        store.pool.timeout = 2                       # fail fast rather than wait
+        config = uvicorn.Config(create_app(store), host="127.0.0.1", port=cls.app.port,
+                                log_level="critical", timeout_graceful_shutdown=2)
+        cls.app.server = uvicorn.Server(config)
+        cls.app.thread = threading.Thread(target=cls.app.server.run, daemon=True)
+        cls.app.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.app.stop()
+
+    async def call(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        return await ServerlessTest.call(self, method, path, body, token="anything")  # type: ignore[arg-type]
+
+    async def test_a_request_says_the_database_is_unreachable(self) -> None:
+        status, body = await self.call("GET", "/api/workspaces")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["status"], "database_unreachable")
+
+    async def test_the_connection_string_is_not_in_the_answer(self) -> None:
+        _, body = await self.call("GET", "/api/workspaces")
+        said = json.dumps(body)
+        self.assertNotIn("sup3rsecret", said)
+        self.assertNotIn("someone", said)
