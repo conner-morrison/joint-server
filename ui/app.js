@@ -304,6 +304,40 @@ function showHome({ error = "", prefill = "" } = {}) {
     h("button", { class: "btn primary block", onclick: () => openNewWorkspace(prefill) }, "Create a workspace"));
 
   $("#root").replaceChildren(h("div", { class: "connect" }, card));
+  showDeploymentTrouble(card, err);
+}
+
+// Whether the page you are looking at is itself a relay, and a working one.
+// A console served from somewhere static is not: it has no health endpoint,
+// and there is nothing to report.
+async function deploymentHealth() {
+  const base = (location.origin + basePath()).replace(/\/+$/, "");
+  try {
+    const res = await fetch(base + "/healthz", { cache: "no-store" });
+    if (!(res.headers.get("content-type") || "").includes("json")) return null;
+    const health = await res.json();
+    return typeof health?.ok === "boolean" ? health : null;
+  } catch {
+    return null;                      // offline, or not a relay: say nothing
+  }
+}
+
+// Told at the door rather than after filling in a form: if this deployment is
+// its own relay and it cannot reach its database, nothing here will work, and
+// the reason is a setting rather than anything the person did.
+async function showDeploymentTrouble(card, errEl) {
+  const health = await deploymentHealth();
+  if (!health || health.ok || !card.isConnected) return;
+  const fix = health.database === "unconfigured"
+    ? "Set DATABASE_URL to a Postgres connection string in this project's environment variables, then redeploy."
+    : "The database is configured but cannot be reached right now.";
+  card.insertBefore(
+    h("div", { class: "notice", role: "alert" },
+      h("strong", {}, health.database === "unconfigured"
+        ? "This deployment has no database yet" : "This deployment cannot reach its database"),
+      h("span", {}, fix),
+      health.message ? h("code", {}, health.message) : false),
+    errEl);
 }
 
 function openNewWorkspace(prefill = "") {

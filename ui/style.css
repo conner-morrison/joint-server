@@ -221,3 +221,12 @@ tr:last-child td { border-bottom: 0; }
 .pending-head { display: flex; flex-direction: column; gap: 2px; }
 .pending-row { display: flex; align-items: center; gap: 8px; }
 .pending-row code { font: 12px/1.5 var(--mono); background: var(--code); padding: 1px 5px; border-radius: 4px; }
+
+/* --- something is wrong with the deployment itself ----------------------- */
+.notice {
+  display: flex; flex-direction: column; gap: 4px;
+  border: 1px solid var(--warn, #d19a00); border-radius: 8px;
+  background: var(--warn-soft, #fdf0d5); color: #6b4600;
+  padding: 10px 12px; font-size: 13px;
+}
+.notice code { font: 12px/1.5 var(--mono); word-break: break-word; opacity: .85; }
