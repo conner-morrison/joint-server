@@ -143,11 +143,24 @@ function removeWorkspace(name) {
 
 // The path the console is served from, so it works at a domain root and under
 // a sub-path alike.
+function slugify(name) {
+  return name.trim().toLowerCase().replace(/\s+/g, "").replace(/[^a-z0-9_.-]/g, "");
+}
+
+// The relay a workspace talks to, derived from where the console is served
+// and the workspace's own slug.
+function derivedUrl(slug) {
+  const base = (location.origin + basePath()).replace(/\/+$/, "");
+  return slug ? `${base}/${slug}` : base;
+}
+
 function basePath() {
-  const path = location.pathname.replace(/\/+$/, "");
-  const known = loadWorkspaces();
-  for (const name of Object.keys(known)) {
-    if (path.endsWith("/" + name)) return path.slice(0, -(name.length + 1)) || "/";
+  let path = location.pathname.replace(/\/+$/, "");
+  // A trailing file name is not part of the base: /index.html is served at /.
+  const last = path.split("/").pop() || "";
+  if (last.includes(".")) path = path.slice(0, -(last.length + 1));
+  for (const slug of Object.keys(loadWorkspaces())) {
+    if (path.endsWith("/" + slug)) return path.slice(0, -(slug.length + 1)) || "/";
   }
   return path || "/";
 }
@@ -263,15 +276,15 @@ function showHome({ error = "", prefill = "" } = {}) {
       ? "Open one, or add another relay."
       : "A workspace is a relay you can open by name. Make one to begin."),
     err,
-    names.length ? h("div", { class: "ws-list" }, names.map((name) => {
-      const ws = loadWorkspaces()[name];
+    names.length ? h("div", { class: "ws-list" }, names.map((slug) => {
+      const ws = loadWorkspaces()[slug];
       return h("div", { class: "ws-row" },
-        h("button", { class: "ws-open", onclick: () => goToWorkspace(name) },
-          h("span", { class: "strong" }, name),
-          h("span", { class: "muted small truncate" }, ws.url.replace(/^https?:\/\//, ""))),
+        h("button", { class: "ws-open", onclick: () => goToWorkspace(slug) },
+          h("span", { class: "strong" }, ws.name || slug),
+          h("span", { class: "muted small truncate" }, "/" + slug)),
         h("button", {
-          class: "btn small danger", title: `Forget ${name}`,
-          onclick: () => { removeWorkspace(name); showHome(); },
+          class: "btn small danger", title: `Forget ${ws.name || slug}`,
+          onclick: () => { removeWorkspace(slug); showHome(); },
         }, "Forget"));
     })) : false,
     h("button", { class: "btn primary block", onclick: () => openNewWorkspace(prefill) }, "Create a workspace"));
@@ -281,49 +294,59 @@ function showHome({ error = "", prefill = "" } = {}) {
 
 function openNewWorkspace(prefill = "") {
   const name = h("input", {
-    type: "text", required: true, pattern: NAME_PATTERN, value: prefill,
-    placeholder: "acme", autocomplete: "off", spellcheck: "false",
+    type: "text", required: true, value: prefill,
+    placeholder: "Acme jobs", autocomplete: "off", spellcheck: "false",
   });
   const urlIn = h("input", {
-    type: "text", inputmode: "url", required: true, placeholder: "https://relay.example.com",
-    value: window.RELAY_DEFAULT_SERVER || "", autocomplete: "url", spellcheck: "false",
+    type: "text", inputmode: "url", required: true,
+    autocomplete: "url", spellcheck: "false", value: derivedUrl(slugify(prefill)),
   });
-  const tokenIn = h("input", { type: "password", required: true, placeholder: "RELAY_ADMIN_TOKEN" });
+  const pass = h("input", { type: "password", required: true, autocomplete: "new-password" });
+  const again = h("input", { type: "password", required: true, autocomplete: "new-password" });
   const err = h("p", { class: "error", hidden: true });
+  const urlHint = h("span", {});
+
+  // The address follows the name until the address is edited by hand, after
+  // which it is left alone: a typed URL should not be overwritten by typing.
+  let urlTouched = false;
+  urlIn.addEventListener("input", () => { urlTouched = true; });
+  const syncUrl = () => {
+    const slug = slugify(name.value);
+    if (!urlTouched) urlIn.value = derivedUrl(slug);
+    urlHint.textContent = slug ? `Opens at /${slug}` : "";
+  };
+  name.addEventListener("input", syncUrl);
+  syncUrl();
 
   openDialog("Create a workspace",
-    [field("Workspace name", name, "Opens at this name in the address bar. Letters, digits, _ . - "),
-     field("Relay URL", urlIn, "The relay server itself, not this page."),
-     field("Admin token", tokenIn), err],
+    [field("Workspace name", name, "Spaces are fine; the address uses a lowercase form of it."),
+     field("Relay URL", urlIn, urlHint),
+     field("Password", pass, "The relay's admin password."),
+     field("Confirm password", again),
+     err],
     [cancel(), h("button", { class: "btn primary", type: "submit" }, "Create")],
     async (dlg) => {
-      const ws = name.value.trim();
-      if (!new RegExp("^" + NAME_PATTERN + "$").test(ws)) {
-        err.textContent = "Use 1-64 letters, digits, '_', '.' or '-', starting with a letter or digit.";
-        err.hidden = false;
-        return;
-      }
-      if (loadWorkspaces()[ws]) {
-        err.textContent = `A workspace called "${ws}" already exists on this device.`;
-        err.hidden = false;
-        return;
-      }
+      const fail = (text, focus) => { err.textContent = text; err.hidden = false; focus?.focus(); };
+      const slug = slugify(name.value);
+      if (!slug) return fail("Give the workspace a name with at least one letter or digit.", name);
+      if (loadWorkspaces()[slug]) return fail(`A workspace at /${slug} already exists on this device.`, name);
+      if (pass.value !== again.value) return fail("The passwords do not match.", again);
+      if (!pass.value) return fail("Set a password.", pass);
+
       // Check the relay answers before saving, so a workspace in the list is
-      // always one that actually opens.
+      // always one that opens.
       state.url = normalizeUrl(urlIn.value);
-      state.token = tokenIn.value.trim();
+      state.token = pass.value;
       try {
         await api("GET", "/api/workers");
       } catch (ex) {
-        err.textContent = ex.message;
-        err.hidden = false;
-        return;
+        return fail(ex.status === 401 ? "That password was rejected by the relay." : ex.message, pass);
       }
-      saveWorkspace(ws, { url: state.url, token: state.token });
+      saveWorkspace(slug, { name: name.value.trim(), url: state.url, token: state.token });
       dlg.close();
-      goToWorkspace(ws);
+      goToWorkspace(slug);
     });
-  (prefill ? urlIn : name).focus();
+  name.focus();
 }
 
 // --- sign in ---------------------------------------------------------------
@@ -390,7 +413,8 @@ async function showApp() {
   $("#root").replaceChildren(
     h("header", { class: "topbar" },
       h("button", { class: "brand-home", title: "All workspaces", onclick: () => goHome() }, brand()),
-      state.workspace && h("span", { class: "ws-tag" }, state.workspace),
+      state.workspace && h("span", { class: "ws-tag" },
+        (loadWorkspaces()[state.workspace] || {}).name || state.workspace),
       h("span", { class: "server truncate", title: state.url }, state.url.replace(/^https?:\/\//, "")),
       h("span", { class: "spacer" }),
       h("span", { class: "pill", id: "online-pill" }),
@@ -980,7 +1004,7 @@ window.addEventListener("popstate", () => {
   if (saved && !Object.keys(loadWorkspaces()).length) {
     const guess = (saved.url.replace(/^https?:\/\//, "").split(/[:/]/)[0] || "relay")
       .replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 64);
-    saveWorkspace(guess, { url: saved.url, token: saved.token });
+    saveWorkspace(guess, { name: guess, url: saved.url, token: saved.token });
     forget();
     return goToWorkspace(guess);
   }
