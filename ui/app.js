@@ -246,11 +246,20 @@ async function api(method, path, body) {
     throw new ApiError(0, unreachable());
   }
   let data = null;
-  try { data = await res.json(); } catch { /* empty body */ }
+  try { data = await res.json(); } catch { /* not JSON, or an empty body */ }
+
+  // Every relay answer is JSON. Anything else means this address is not a
+  // relay: static hosting serves the console for unknown paths, or a 404 page.
+  // Reading it as data puts nulls into the app and breaks it far from here.
+  const isJson = (res.headers.get("content-type") || "").includes("json");
+  if (!isJson || data === null) {
+    throw new ApiError(res.status, `${state.url} answered with a page, not a relay. `
+      + "Check the URL points at the relay server itself.");
+  }
   if (!res.ok) {
     const detail = typeof data?.detail === "string" ? data.detail
       : Array.isArray(data?.detail) ? data.detail.map((d) => d.msg).join("; ") : "";
-    throw new ApiError(res.status, res.status === 401 ? "The admin token was rejected." : detail || `${res.status} ${res.statusText}`);
+    throw new ApiError(res.status, res.status === 401 ? "The password was rejected." : detail || `${res.status} ${res.statusText}`);
   }
   return data;
 }
@@ -424,12 +433,19 @@ async function showApp() {
       h("nav", { class: "sidebar", id: "sidebar", "aria-label": "Workers and channels" }),
       h("main", { id: "main" })));
   renderStreamPill();
+  // A first load that fails leaves nothing to show, so go back to the list
+  // with the reason rather than rendering an empty console.
+  try {
+    await refreshAll({ rethrow: true });
+  } catch (err) {
+    stopStream();
+    return showHome({ error: err?.message || String(err) });
+  }
   startStream();
-  await refreshAll();
   setView();
 }
 
-async function refreshAll() {
+async function refreshAll({ rethrow = false } = {}) {
   try {
     const [workers, channels] = await Promise.all([api("GET", "/api/workers"), api("GET", "/api/channels")]);
     state.workers = workers;
@@ -442,6 +458,7 @@ async function refreshAll() {
     else if (state.channels.some((c) => c.name === state.view.name)) { renderChannelHead(); renderMembers(); }
     else if ($("#feed")) renderMain();              // the open channel was deleted
   } catch (err) {
+    if (rethrow) throw err;
     handleError(err);
   }
 }
@@ -902,7 +919,7 @@ async function startStream() {
       const res = await fetch(state.url + "/api/stream", {
         headers: { Authorization: `Bearer ${state.token}` }, signal: attempt.signal, cache: "no-store",
       });
-      if (res.status === 401) { signOut("The admin token was rejected."); return; }
+      if (res.status === 401) { signOut("The password was rejected."); return; }
       if (!res.ok || !res.body) throw new Error(`stream answered ${res.status}`);
       setStream("live");
       backoff = 1000;
