@@ -1153,9 +1153,19 @@ const CLIENT_FIELDS = [
   ["Registered", "registered"],
 ];
 
-const SHOWN = new Set([...FACTS.map(([, key]) => key), "title", "url", "link", "upworkUrl",
-                       "type", "source", "index", "emailId", "emailSubject", "receivedAt",
+// Where a job description might be called home, most specific first.
+const JD_KEYS = ["description", "jobDescription", "jd", "snippet", "summary", "details", "text"];
+
+const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, "title", "url", "link", "upworkUrl",
+                       "type", "source", "index", "emailId", "receivedAt",
                        "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
+
+function jdOf(body) {
+  for (const key of JD_KEYS) {
+    if (typeof body[key] === "string" && body[key].trim()) return body[key].trim();
+  }
+  return null;
+}
 
 // Accepts either a nested object or flat clientRank-style keys, so a worker
 // can send whichever is natural to it.
@@ -1209,6 +1219,17 @@ function looksLikeJob(body) {
 
 function jobCard(body) {
   const link = httpUrl(body.upworkUrl || body.url || body.link);
+  // The description is the longest thing here and the least often wanted, so
+  // it is behind a button: a list of jobs should stay a list.
+  const jd = jdOf(body);
+  const jdBox = jd ? h("div", { class: "jd", hidden: true }, jd) : null;
+  const jdButton = jd ? h("button", {
+    class: "btn small jd-toggle", type: "button",
+    onclick: () => {
+      jdBox.hidden = !jdBox.hidden;
+      jdButton.textContent = jdBox.hidden ? "View JD" : "Hide JD";
+    },
+  }, "View JD") : false;
   const facts = FACTS
     .filter(([, key]) => body[key] !== undefined && body[key] !== null && body[key] !== "")
     .map(([label, key]) => h("span", { class: "fact" },
@@ -1222,8 +1243,9 @@ function jobCard(body) {
       ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, body.title)
       : h("div", { class: "job-title" }, body.title),
     facts.length ? h("div", { class: "job-facts" }, facts) : false,
+    jdButton ? h("div", { class: "job-actions" }, jdButton) : false,
+    jdBox || false,
     clientBlock(body),
-    body.emailSubject ? h("div", { class: "job-from muted small truncate" }, "from " + body.emailSubject) : false,
     Object.keys(rest).length
       ? h("details", { class: "job-more" }, h("summary", {}, "Everything else"),
           h("pre", {}, JSON.stringify(rest, null, 2)))
