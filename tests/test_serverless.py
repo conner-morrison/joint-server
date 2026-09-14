@@ -302,3 +302,58 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first["duplicate"])
         self.assertTrue(retry["duplicate"])
         self.assertEqual(first["seq"], retry["seq"])
+
+
+class UnconfiguredTest(unittest.IsolatedAsyncioTestCase):
+    """A deployment with no database must still start.
+
+    Refusing to start is the one failure a platform cannot explain: the
+    browser is told the function crashed, which says nothing about what to
+    fix. So the app comes up, serves its console, and every endpoint says
+    what is missing.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = LiveApp.__new__(LiveApp)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.app.port = s.getsockname()[1]
+        cls.app.url = f"http://127.0.0.1:{cls.app.port}"
+        config = uvicorn.Config(create_app(None), host="127.0.0.1", port=cls.app.port,
+                                log_level="warning", timeout_graceful_shutdown=2)
+        cls.app.server = uvicorn.Server(config)
+        cls.app.thread = threading.Thread(target=cls.app.server.run, daemon=True)
+        cls.app.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.app.stop()
+
+    async def call(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        return await ServerlessTest.call(self, method, path, body, token="anything")  # type: ignore[arg-type]
+
+    async def test_health_says_what_is_missing(self) -> None:
+        status, body = await self.call("GET", "/healthz")
+        self.assertEqual((status, body["database"]), (503, "unconfigured"))
+        self.assertIn("DATABASE_URL", body["message"])
+
+    async def test_every_endpoint_says_what_is_missing(self) -> None:
+        for method, path, payload in (
+            ("POST", "/api/workspaces", {"name": "Acme", "password": "p"}),
+            ("GET", "/acme/api/channels", None),
+            ("POST", "/acme/enrol", {"worker_id": "w", "token": "t"}),
+            ("GET", "/acme/messages", None),
+        ):
+            status, body = await self.call(method, path, payload)
+            self.assertEqual(status, 503, f"{method} {path}")
+            self.assertEqual(body["status"], "unconfigured", f"{method} {path}")
+
+
+class RedactTest(unittest.TestCase):
+    def test_a_connection_string_never_reaches_the_reader(self) -> None:
+        from relay.serverless import redact
+        said = redact('could not connect to "postgresql://someone:sup3rsecret@host/db" after 30s')
+        self.assertNotIn("sup3rsecret", said)
+        self.assertNotIn("someone", said)
+        self.assertIn("30s", said)

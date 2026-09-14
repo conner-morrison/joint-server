@@ -19,6 +19,7 @@ working credentials.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
@@ -121,15 +122,32 @@ class PgStore:
     """
 
     def __init__(self, dsn: str, *, min_size: int = 0, max_size: int = 4):
-        # Opened lazily: an instance that only serves a static file should not
-        # pay for a database connection.
+        # Opened on first use, not at startup. An instance that only serves the
+        # console should not pay for a connection, and a database that is
+        # unreachable should fail the request that needed it with something
+        # readable rather than killing the process before it can answer at all.
         self.pool = AsyncConnectionPool(dsn, min_size=min_size, max_size=max_size,
                                         open=False, kwargs={"row_factory": dict_row})
+        self._ready = False
+        self._opening = asyncio.Lock()
 
     async def open(self) -> None:
-        await self.pool.open()
+        await self.ready()
+
+    async def ready(self) -> None:
+        """Connect and make sure the schema is there, once per process."""
+        if self._ready:
+            return
+        async with self._opening:
+            if self._ready:
+                return
+            await self.pool.open(wait=True, timeout=15)
+            await self.setup()
+            self._ready = True
 
     async def close(self) -> None:
+        if self.pool.closed:
+            return
         await self.pool.close()
 
     async def setup(self) -> None:
@@ -143,16 +161,19 @@ class PgStore:
                 pass
 
     async def _all(self, sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        await self.ready()
         async with self.pool.connection() as conn:
             cur = await conn.execute(sql, args)
             return await cur.fetchall()
 
     async def _one(self, sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        await self.ready()
         async with self.pool.connection() as conn:
             cur = await conn.execute(sql, args)
             return await cur.fetchone()
 
     async def _run(self, sql: str, args: tuple[Any, ...] = ()) -> int:
+        await self.ready()
         async with self.pool.connection() as conn:
             cur = await conn.execute(sql, args)
             return cur.rowcount
@@ -428,6 +449,7 @@ class WorkspaceStore:
         A publisher that lost its connection before hearing back resends with
         the same client_id; that resend returns the original seq instead of
         storing the message twice."""
+        await self.store.ready()
         async with self.store.pool.connection() as conn:
             try:
                 cur = await conn.execute(

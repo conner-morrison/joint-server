@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import time
 from typing import Any, AsyncIterator
 
@@ -85,29 +86,49 @@ def too_large(body: Any) -> bool:
     return len(json.dumps(body, separators=(",", ":")).encode()) > MAX_BODY_BYTES
 
 
-def create_app(store: PgStore) -> FastAPI:
+def redact(text: str) -> str:
+    """Connection errors quote the connection string, which carries a
+    password. Keep the part that says what went wrong, drop the credentials."""
+    return re.sub(r"(?i)(postgres(?:ql)?://)[^\s\"\']*", r"\1...", text)
+
+
+def create_app(store: PgStore | None) -> FastAPI:
+    """`store` is None when the deployment has no database configured. The app
+    still starts: it serves the console and says what is missing, because a
+    process that refuses to start can only report a crash."""
+
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        await store.open()
-        await store.setup()
+        # Nothing is opened here. A database that is down should fail the
+        # request that needed it, not stop the console from loading.
         try:
             yield
         finally:
-            await store.close()
+            if store is not None:
+                await store.close()
 
     app = FastAPI(title="relay", lifespan=lifespan)
     app.state.store = store
 
+    def db() -> PgStore:
+        if store is None:
+            raise HTTPException(503, {
+                "status": "unconfigured",
+                "message": "This deployment has no database. Set DATABASE_URL to a Postgres "
+                           "connection string in the project's environment variables and redeploy.",
+            })
+        return store
+
     # --- who is asking ---------------------------------------------------
     async def workspace(ws: str = Path(..., description="workspace slug")) -> str:
-        if not await store.workspace_exists(ws):
+        if not await db().workspace_exists(ws):
             raise HTTPException(404, f"no workspace {ws!r}")
         return ws
 
     async def admin(ws: str = Depends(workspace),
                     authorization: str | None = Header(default=None)) -> WorkspaceStore:
         """The workspace's own password. It opens that workspace and no other."""
-        if not await store.check_password(ws, bearer(authorization)):
+        if not await db().check_password(ws, bearer(authorization)):
             raise HTTPException(401, "workspace password required")
         return store.ws(ws)
 
@@ -121,7 +142,7 @@ def create_app(store: PgStore) -> FastAPI:
         sort itself out.
         """
         token = bearer(authorization)
-        scoped = store.ws(ws)
+        scoped = db().ws(ws)
         worker_id = await scoped.worker_for_token(token)
         if worker_id is not None:
             return scoped, worker_id
@@ -135,8 +156,19 @@ def create_app(store: PgStore) -> FastAPI:
 
     # --- the deployment --------------------------------------------------
     @app.get("/healthz")
-    async def healthz() -> dict[str, Any]:
-        return {"ok": True}
+    async def healthz() -> JSONResponse:
+        """Says what is wrong, so a deployment can be diagnosed from outside
+        without reading the platform's logs."""
+        if store is None:
+            return JSONResponse({"ok": False, "database": "unconfigured",
+                                 "message": "DATABASE_URL is not set on this deployment."}, 503)
+        try:
+            await store.ready()
+        except Exception as exc:                       # noqa: BLE001 - reported, not handled
+            return JSONResponse({"ok": False, "database": "unreachable",
+                                 "error": type(exc).__name__,
+                                 "message": redact(str(exc))[:300]}, 503)
+        return JSONResponse({"ok": True, "database": "connected"})
 
     @app.post("/api/workspaces", status_code=201)
     async def create_workspace(body: WorkspaceIn) -> dict[str, Any]:
@@ -145,7 +177,7 @@ def create_app(store: PgStore) -> FastAPI:
         slug = slugify(body.name)
         try:
             check_name("workspace", slug)
-            await store.create_workspace(slug, body.password, body.name.strip())
+            await db().create_workspace(slug, body.password, body.name.strip())
         except ValueError as exc:
             raise HTTPException(409 if "exists" in str(exc) else 400, str(exc)) from None
         return {"slug": slug, "name": body.name.strip()}
@@ -154,12 +186,12 @@ def create_app(store: PgStore) -> FastAPI:
     async def workspace_exists(ws: str) -> dict[str, Any]:
         """Whether a workspace is here. Says nothing else: no password, no
         contents, and the same shape whoever asks."""
-        return {"slug": ws, "exists": await store.workspace_exists(ws)}
+        return {"slug": ws, "exists": await db().workspace_exists(ws)}
 
     # --- enrolment -------------------------------------------------------
     @app.post("/{ws}/enrol", status_code=202)
     async def enrol(body: EnrolIn, ws: str = Depends(workspace)) -> dict[str, Any]:
-        scoped = store.ws(ws)
+        scoped = db().ws(ws)
         # Already approved and using this very token: nothing to do, carry on.
         if await scoped.worker_for_token(body.token) == body.worker_id:
             return {"status": "registered", "worker_id": body.worker_id}

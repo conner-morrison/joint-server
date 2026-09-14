@@ -22,13 +22,16 @@ from fastapi.staticfiles import StaticFiles
 from relay.pgstore import PgStore
 from relay.serverless import create_app
 
+# Vercel's own POSTGRES_URL is accepted, so a database added through the
+# marketplace needs no second variable.
 DSN = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL", "")
-if not DSN:
-    raise RuntimeError("set DATABASE_URL to a Postgres connection string")
 
 UI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 
-app = create_app(PgStore(DSN))
+# A missing database must not stop the app from starting. Raising here would
+# reach the browser as "this function crashed", which says nothing about what
+# to fix; the app starts, serves the console, and /healthz says what is wrong.
+app = create_app(PgStore(DSN) if DSN else None)
 
 # Files first, then the console for anything else: /acme is a workspace the
 # console opens, not a file, and only the browser needs to know the difference.
