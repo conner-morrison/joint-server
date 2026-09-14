@@ -7,6 +7,8 @@ name = "relay"
 version = "0.1.0"
 description = "Channel relay: local workers exchange messages through one internet server"
 requires-python = ">=3.11"
+# Vercel loads `app` from app.py; named here so it is not guessed.
+
 dependencies = []
 
 [project.optional-dependencies]
@@ -21,6 +23,9 @@ dev = ["pgserver>=0.1.4"]
 
 [project.scripts]
 relay = "relay.main:main"
+
+[tool.vercel]
+entrypoint = "app:app"
 
 [tool.setuptools.packages.find]
 include = ["relay*"]

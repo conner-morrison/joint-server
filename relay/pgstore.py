@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS workers (
     PRIMARY KEY (workspace, worker_id)
 );
 
+-- A worker that turned up unannounced. It has chosen an id and a token and
+-- is waiting for a person to say yes; until then the token opens nothing.
+CREATE TABLE IF NOT EXISTS pending_workers (
+    workspace    TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
+    worker_id    TEXT NOT NULL,
+    token_hash   TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',
+    requested_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (workspace, worker_id)
+);
+CREATE INDEX IF NOT EXISTS pending_token ON pending_workers(token_hash);
+
 CREATE TABLE IF NOT EXISTS channels (
     workspace   TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
     name        TEXT NOT NULL,
@@ -256,6 +268,77 @@ class WorkspaceStore:
                 "SELECT worker_id, channel FROM members WHERE workspace = %s ORDER BY channel", (self.slug,)):
             channels.setdefault(m["worker_id"], []).append(m["channel"])
         return [{**r, "channels": channels.get(r["worker_id"], [])} for r in rows]
+
+    # --- enrolment -------------------------------------------------------
+    # A worker arrives with no credentials anyone recognises. Rather than a
+    # person going to the server to mint a token and carrying it back, the
+    # worker proposes an id and a token it made itself, and a person approves
+    # it here. Nothing it sent works until they do.
+    async def request_worker(self, worker_id: str, token: str, label: str = "") -> str:
+        """Ask to join. Returns "pending". Raises if the id is taken by a
+        registered worker, which stops a newcomer claiming an existing name."""
+        check_name("worker", worker_id)
+        if not token:
+            raise ValueError("a token is required")
+        if await self.worker_exists(worker_id):
+            raise ValueError(f"worker {worker_id!r} is already registered")
+        # A repeat from the same worker replaces its own request: one that lost
+        # its token can ask again rather than being stuck pending for ever.
+        await self.store._run("""
+            INSERT INTO pending_workers(workspace, worker_id, token_hash, label, requested_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (workspace, worker_id)
+            DO UPDATE SET token_hash = EXCLUDED.token_hash,
+                          label = EXCLUDED.label,
+                          requested_at = EXCLUDED.requested_at""",
+            (self.slug, worker_id, _hash(token), label, time.time()))
+        return "pending"
+
+    async def is_pending(self, token: str) -> str | None:
+        """The worker id this token is waiting as, if it is waiting."""
+        if not token:
+            return None
+        row = await self.store._one(
+            "SELECT worker_id FROM pending_workers WHERE workspace = %s AND token_hash = %s",
+            (self.slug, _hash(token)))
+        return row["worker_id"] if row else None
+
+    async def list_pending(self) -> list[dict[str, Any]]:
+        """What is waiting for a person. The fingerprint is the start of the
+        token's hash: the worker can print the same thing, so whoever approves
+        can check they are approving the machine in front of them."""
+        rows = await self.store._all(
+            "SELECT worker_id, token_hash, label, requested_at FROM pending_workers "
+            "WHERE workspace = %s ORDER BY requested_at", (self.slug,))
+        return [{"worker_id": r["worker_id"], "label": r["label"],
+                 "requested_at": r["requested_at"], "fingerprint": r["token_hash"][:12]}
+                for r in rows]
+
+    async def approve_worker(self, worker_id: str) -> bool:
+        """Turn a request into a worker, keeping the token it proposed, so the
+        work it was already trying to do simply starts succeeding."""
+        row = await self.store._one(
+            "SELECT token_hash, label FROM pending_workers WHERE workspace = %s AND worker_id = %s",
+            (self.slug, worker_id))
+        if row is None:
+            return False
+        try:
+            await self.store._run(
+                "INSERT INTO workers(workspace, worker_id, token_hash, label, created_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (self.slug, worker_id, row["token_hash"], row["label"], time.time()))
+        except errors.UniqueViolation:
+            # Approved twice, or the id was taken meanwhile. Either way the
+            # request is spent.
+            await self.reject_worker(worker_id)
+            return False
+        await self.reject_worker(worker_id)
+        return True
+
+    async def reject_worker(self, worker_id: str) -> bool:
+        return await self.store._run(
+            "DELETE FROM pending_workers WHERE workspace = %s AND worker_id = %s",
+            (self.slug, worker_id)) > 0
 
     # --- channels --------------------------------------------------------
     async def add_channel(self, name: str, description: str = "") -> None:
