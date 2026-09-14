@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import os
 
-from fastapi.responses import FileResponse
+from fastapi import Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from relay.pgstore import PgStore
@@ -34,8 +35,17 @@ app = create_app(PgStore(DSN))
 app.mount("/static", StaticFiles(directory=UI), name="static")
 
 
+# Anything the relay itself would have answered. Serving the console here
+# instead would turn "this endpoint does not exist" into a 200 carrying a web
+# page, which a caller can only discover by failing to parse it.
+API_PARTS = ("/api/", "/publish", "/messages", "/ack", "/enrol")
+
+
 @app.get("/{path:path}", include_in_schema=False)
-async def console(path: str = "") -> FileResponse:
+async def console(path: str = "") -> Response:
+    whole = "/" + path
+    if any(part in whole for part in API_PARTS) or whole.endswith(API_PARTS):
+        return JSONResponse({"detail": f"no such endpoint: {whole}"}, status_code=404)
     candidate = os.path.normpath(os.path.join(UI, path))
     if path and candidate.startswith(UI + os.sep) and os.path.isfile(candidate):
         return FileResponse(candidate)

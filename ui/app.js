@@ -18,11 +18,13 @@ const state = {
   channels: [],
   online: new Set(),
   workspace: "",
+  pending: [],
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
   stream: "down",
   streamCtrl: null,
+  pollTimer: 0,
 };
 
 // --- dom -------------------------------------------------------------------
@@ -234,12 +236,14 @@ function unreachable() {
   return `Could not reach ${state.url}. Check the URL, and that the server was started with RELAY_CORS_ORIGINS=${location.origin}`;
 }
 
-async function api(method, path, body) {
+const api = (method, path, body) => apiAt(state.url, method, path, body);
+
+async function apiAt(base, method, path, body) {
   const headers = { Authorization: `Bearer ${state.token}` };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   let res;
   try {
-    res = await fetch(state.url + path, {
+    res = await fetch(base + path, {
       method, headers, cache: "no-store", body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch {
@@ -253,11 +257,12 @@ async function api(method, path, body) {
   // Reading it as data puts nulls into the app and breaks it far from here.
   const isJson = (res.headers.get("content-type") || "").includes("json");
   if (!isJson || data === null) {
-    throw new ApiError(res.status, `${state.url} answered with a page, not a relay. `
+    throw new ApiError(res.status, `${base} answered with a page, not a relay. `
       + "Check the URL points at the relay server itself.");
   }
   if (!res.ok) {
-    const detail = typeof data?.detail === "string" ? data.detail
+    const detail = typeof data?.message === "string" ? data.message
+      : typeof data?.detail === "string" ? data.detail
       : Array.isArray(data?.detail) ? data.detail.map((d) => d.msg).join("; ") : "";
     throw new ApiError(res.status, res.status === 401 ? "The password was rejected." : detail || `${res.status} ${res.statusText}`);
   }
@@ -339,17 +344,26 @@ function openNewWorkspace(prefill = "") {
       const slug = slugify(name.value);
       if (!slug) return fail("Give the workspace a name with at least one letter or digit.", name);
       if (loadWorkspaces()[slug]) return fail(`A workspace at /${slug} already exists on this device.`, name);
-      if (pass.value !== again.value) return fail("The passwords do not match.", again);
       if (!pass.value) return fail("Set a password.", pass);
+      if (pass.value !== again.value) return fail("The passwords do not match.", again);
 
-      // Check the relay answers before saving, so a workspace in the list is
-      // always one that opens.
       state.url = normalizeUrl(urlIn.value);
       state.token = pass.value;
+      // The deployment is whatever the workspace address sits under.
+      const root = state.url.endsWith("/" + slug) ? state.url.slice(0, -(slug.length + 1)) : state.url;
       try {
-        await api("GET", "/api/workers");
+        await apiAt(root, "POST", "/api/workspaces", { name: name.value.trim(), password: pass.value });
       } catch (ex) {
-        return fail(ex.status === 401 ? "That password was rejected by the relay." : ex.message, pass);
+        if (ex.status !== 409) return fail(ex.message, urlIn);
+        // It is already there. If this password opens it, this is someone
+        // adding a workspace they already have to another device.
+        try {
+          await api("GET", "/api/channels");
+        } catch (inner) {
+          return fail(inner.status === 401
+            ? `A workspace at /${slug} already exists and that password does not open it.`
+            : inner.message, pass);
+        }
       }
       saveWorkspace(slug, { name: name.value.trim(), url: state.url, token: state.token });
       dlg.close();
@@ -447,9 +461,14 @@ async function showApp() {
 
 async function refreshAll({ rethrow = false } = {}) {
   try {
-    const [workers, channels] = await Promise.all([api("GET", "/api/workers"), api("GET", "/api/channels")]);
+    const [workers, channels, pending] = await Promise.all([
+      api("GET", "/api/workers"), api("GET", "/api/channels"),
+      // Older relays have no waiting list; an empty one is the right answer.
+      api("GET", "/api/pending").catch(() => []),
+    ]);
     state.workers = workers;
     state.channels = channels;
+    state.pending = Array.isArray(pending) ? pending : [];
     state.online = new Set(workers.filter((w) => w.online).map((w) => w.worker_id));
     renderSidebar();
     renderOnlinePill();
@@ -504,6 +523,7 @@ function renderStreamPill() {
   if (!el) return;
   const [cls, text, title] = {
     live: ["ok", "Live", "Receiving updates as they happen"],
+    polling: ["ok", "Polling", "This relay has no event stream, so the console checks every few seconds"],
     connecting: ["warn", "Connecting", "Opening the live event stream"],
     down: ["bad", "Reconnecting", "The live stream dropped; retrying"],
   }[state.stream];
@@ -516,6 +536,10 @@ function renderSidebar() {
   if (!nav) return;
   const v = state.view;
   fill(nav,
+    state.pending.length ? h("button", {
+      class: "nav-item waiting" + (v.kind === "workers" ? " active" : ""),
+      onclick: () => go("#/workers"),
+    }, `${state.pending.length} waiting to join`) : false,
     h("div", { class: "nav-title" }, "Channels",
       h("button", { class: "btn icon", title: "New channel", "aria-label": "New channel", onclick: openNewChannel }, "+")),
     h("button", { class: "nav-item" + (v.kind === "channels" ? " active" : ""), onclick: () => go("#/channels") },
@@ -599,11 +623,13 @@ function renderWorkersView() {
 function renderWorkersTable() {
   const box = $("#workers-table");
   if (!box) return;
+  const waiting = renderPending();
   if (!state.workers.length) {
-    box.replaceChildren(empty("No workers yet", "Register a worker to get the token it connects with."));
+    box.replaceChildren(waiting || empty("No workers yet",
+      "Register a worker here, or point one at this workspace and approve it when it asks."));
     return;
   }
-  box.replaceChildren(h("div", { class: "table-wrap" }, h("table", {},
+  box.replaceChildren(waiting || "", h("div", { class: "table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {}, ["Worker", "Channels", "Last seen", ""].map((t) => h("th", {}, t)))),
     h("tbody", {}, state.workers.map((w) => {
       const online = state.online.has(w.worker_id);
@@ -618,6 +644,44 @@ function renderWorkersTable() {
           h("button", { class: "btn small", onclick: () => rotateToken(w.worker_id) }, "New token"),
           h("button", { class: "btn small danger", onclick: () => removeWorker(w.worker_id) }, "Remove")));
     })))));
+}
+
+// Workers that turned up on their own and are waiting for a person. Approving
+// keeps the token the worker chose, so it carries on with what it was doing.
+function renderPending() {
+  if (!state.pending.length) return null;
+  return h("div", { class: "pending" },
+    h("div", { class: "pending-head" },
+      h("strong", {}, state.pending.length === 1 ? "A worker is asking to join"
+        : `${state.pending.length} workers are asking to join`),
+      h("span", { class: "muted small" },
+        "Approve only what you recognise: the code below is the start of the token's fingerprint, "
+        + "which the worker can print too.")),
+    state.pending.map((p) => h("div", { class: "pending-row" },
+      h("div", { class: "grow" },
+        h("div", { class: "mono strong" }, p.worker_id),
+        h("div", { class: "muted small" },
+          p.label ? p.label + " · " : "", "fingerprint ", h("code", {}, p.fingerprint),
+          " · asked ", ago(p.requested_at))),
+      h("button", { class: "btn small primary", onclick: () => approveWorker(p.worker_id) }, "Approve"),
+      h("button", { class: "btn small danger", onclick: () => rejectWorker(p.worker_id) }, "Reject"))));
+}
+
+async function approveWorker(workerId) {
+  try {
+    await api("POST", "/api/pending/" + enc(workerId));
+    toast(`${workerId} approved. Add it to the channels it should use.`);
+    await refreshAll();
+  } catch (err) { handleError(err); }
+}
+
+async function rejectWorker(workerId) {
+  if (!confirm(`Refuse ${workerId}?\n\nIts request is discarded and the token it chose stops working. `
+    + "It can ask again.")) return;
+  try {
+    await api("DELETE", "/api/pending/" + enc(workerId));
+    await refreshAll();
+  } catch (err) { handleError(err); }
 }
 
 function openNewWorker() {
@@ -892,6 +956,19 @@ function setStream(status) {
 function stopStream() {
   state.streamCtrl?.abort();
   state.streamCtrl = null;
+  clearInterval(state.pollTimer);
+  state.pollTimer = 0;
+}
+
+// Without a stream the console asks instead. Slower than being told, but the
+// difference only shows as a few seconds' delay on a count or a new message.
+function startPolling(every = 4000) {
+  clearInterval(state.pollTimer);
+  setStream("polling");
+  state.pollTimer = setInterval(() => {
+    refreshAll();
+    if (state.view.kind === "channel") renderChannelView(state.view.name);
+  }, every);
 }
 
 const sleep = (ms, signal) => new Promise((resolve) => {
@@ -920,6 +997,7 @@ async function startStream() {
         headers: { Authorization: `Bearer ${state.token}` }, signal: attempt.signal, cache: "no-store",
       });
       if (res.status === 401) { signOut("The password was rejected."); return; }
+      if (res.status === 404 || res.status === 405) { startPolling(); return; }
       if (!res.ok || !res.body) throw new Error(`stream answered ${res.status}`);
       setStream("live");
       backoff = 1000;
