@@ -239,3 +239,25 @@ tr:last-child td { border-bottom: 0; }
 .connect-card h1 + p code {
   font: 13px/1.5 var(--mono); background: var(--code); padding: 1px 6px; border-radius: 4px;
 }
+
+/* --- a message that describes a job -------------------------------------- */
+.job {
+  margin-top: 6px; padding: 10px 12px; border: 1px solid var(--border);
+  border-radius: 9px; background: var(--panel);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.job-title {
+  font-size: 15px; font-weight: 600; color: var(--text);
+  text-decoration: none; line-height: 1.35;
+}
+a.job-title:hover { color: var(--accent); text-decoration: underline; }
+a.job-title::after { content: " ↗"; font-size: 12px; color: var(--muted); text-decoration: none; }
+.job-facts { display: flex; flex-wrap: wrap; gap: 6px; }
+.job-facts .fact {
+  display: inline-flex; align-items: baseline; gap: 5px; font-size: 12px;
+  padding: 2px 9px; border-radius: 999px; background: var(--panel-2); color: var(--text);
+}
+.job-facts .fact b { font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.job-from { margin: 0; }
+.job-more summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.job-more pre { margin: 6px 0 0; }

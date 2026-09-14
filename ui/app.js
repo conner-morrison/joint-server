@@ -1122,16 +1122,74 @@ function renderFeed(stick) {
   if (stick || nearBottom) feed.scrollTop = feed.scrollHeight;
 }
 
+// Bodies are written by workers and the server never looks inside them, so a
+// link made from one is a link chosen by whoever published it. Only http and
+// https become links: anything else, `javascript:` above all, stays as text.
+function httpUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value, location.href);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+const FACTS = [["Budget", "budget"], ["Published", "published"], ["Posted", "posted"],
+               ["Client", "client"], ["Country", "country"], ["Skills", "skills"]];
+const SHOWN = new Set([...FACTS.map(([, key]) => key), "title", "url", "link", "upworkUrl",
+                       "type", "source", "index", "emailId", "emailSubject", "receivedAt"]);
+
+// A body with a title reads as something worth showing as itself rather than
+// as JSON. Everything else still falls through to the JSON it always was.
+function looksLikeJob(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  if (typeof body.title !== "string" || !body.title.trim()) return false;
+  return body.type === "job" || FACTS.some(([, key]) => body[key])
+    || Boolean(body.url || body.link || body.upworkUrl);
+}
+
+function jobCard(body) {
+  const link = httpUrl(body.upworkUrl || body.url || body.link);
+  const facts = FACTS
+    .filter(([, key]) => body[key] !== undefined && body[key] !== null && body[key] !== "")
+    .map(([label, key]) => h("span", { class: "fact" },
+      h("b", {}, label), String(Array.isArray(body[key]) ? body[key].join(", ") : body[key])));
+  // Whatever the publisher sent that this does not have a place for. Hidden,
+  // but never dropped: a body is the worker's, not the console's, to decide.
+  const rest = Object.fromEntries(Object.entries(body).filter(([key]) => !SHOWN.has(key)));
+
+  return h("div", { class: "job" },
+    link
+      ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, body.title)
+      : h("div", { class: "job-title" }, body.title),
+    facts.length ? h("div", { class: "job-facts" }, facts) : false,
+    body.emailSubject ? h("div", { class: "job-from muted small truncate" }, "from " + body.emailSubject) : false,
+    Object.keys(rest).length
+      ? h("details", { class: "job-more" }, h("summary", {}, "Everything else"),
+          h("pre", {}, JSON.stringify(rest, null, 2)))
+      : false);
+}
+
+function messageBody(body) {
+  if (looksLikeJob(body)) return jobCard(body);
+  const isPlain = body && typeof body === "object" && !Array.isArray(body)
+    && typeof body.text === "string";
+  if (isPlain) {
+    return h("div", {},
+      body.emailSubject ? h("div", { class: "job-title" }, body.emailSubject) : false,
+      h("p", { class: "msg-text" }, body.text));
+  }
+  return h("pre", {}, JSON.stringify(body, null, 2));
+}
+
 function messageRow(m) {
-  const body = m.body;
-  const plain = body && typeof body === "object" && !Array.isArray(body)
-    && Object.keys(body).length === 1 && typeof body.text === "string";
   return h("article", { class: "msg" },
     h("div", { class: "msg-meta" },
       h("span", { class: "msg-sender" + (m.sender === "@server" ? " server" : "") }, m.sender),
       h("span", {}, "#" + m.seq),
       h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts))),
-    plain ? h("p", { class: "msg-text" }, body.text) : h("pre", {}, JSON.stringify(body, null, 2)));
+    messageBody(m.body));
 }
 
 // --- live stream -----------------------------------------------------------
