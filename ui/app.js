@@ -4,6 +4,7 @@
 "use strict";
 
 const STORE_KEY = "relay.console";
+const WORKSPACES_KEY = "relay.workspaces";
 const PAGE = 100;
 const FEED_MAX = 500;
 const NAME_PATTERN = "[A-Za-z0-9][A-Za-z0-9_.\\-]{0,63}";
@@ -16,6 +17,7 @@ const state = {
   workers: [],
   channels: [],
   online: new Set(),
+  workspace: "",
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
@@ -117,6 +119,64 @@ function clock(ts) {
 }
 
 // --- storage ---------------------------------------------------------------
+// A workspace is a named relay: its address and admin token under a name you
+// choose, so the console can be opened straight at /<name> instead of being
+// told where to connect every time.
+function loadWorkspaces() {
+  try {
+    const all = JSON.parse(storage("local")?.getItem(WORKSPACES_KEY) || "{}");
+    return all && typeof all === "object" ? all : {};
+  } catch { return {}; }
+}
+
+function saveWorkspace(name, entry) {
+  const all = loadWorkspaces();
+  all[name] = entry;
+  try { storage("local")?.setItem(WORKSPACES_KEY, JSON.stringify(all)); } catch { /* private mode */ }
+}
+
+function removeWorkspace(name) {
+  const all = loadWorkspaces();
+  delete all[name];
+  try { storage("local")?.setItem(WORKSPACES_KEY, JSON.stringify(all)); } catch { /* private mode */ }
+}
+
+// The path the console is served from, so it works at a domain root and under
+// a sub-path alike.
+function basePath() {
+  const path = location.pathname.replace(/\/+$/, "");
+  const known = loadWorkspaces();
+  for (const name of Object.keys(known)) {
+    if (path.endsWith("/" + name)) return path.slice(0, -(name.length + 1)) || "/";
+  }
+  return path || "/";
+}
+
+function workspaceFromUrl() {
+  const seg = location.pathname.replace(/\/+$/, "").split("/").pop() || "";
+  return seg && seg !== "index.html" ? decodeURIComponent(seg) : "";
+}
+
+function goToWorkspace(name) {
+  const base = basePath().replace(/\/+$/, "");
+  history.pushState({}, "", `${base}/${encodeURIComponent(name)}${location.hash}`);
+  openWorkspace(name);
+}
+
+function goHome() {
+  history.pushState({}, "", basePath().replace(/\/+$/, "") || "/");
+  showHome();
+}
+
+function openWorkspace(name) {
+  const ws = loadWorkspaces()[name];
+  if (!ws) return showHome({ error: `No workspace called "${name}" on this device.`, prefill: name });
+  state.workspace = name;
+  state.url = ws.url;
+  state.token = ws.token;
+  showApp();
+}
+
 function storage(kind) {
   try { return kind === "local" ? window.localStorage : window.sessionStorage; } catch { return null; }
 }
@@ -187,6 +247,85 @@ function handleError(err) {
   toast(err?.message || String(err), true);
 }
 
+// --- home ------------------------------------------------------------------
+// The first page: the workspaces on this device, and the one button that
+// makes another.
+function showHome({ error = "", prefill = "" } = {}) {
+  stopStream();
+  state.workspace = "";
+  const names = Object.keys(loadWorkspaces()).sort();
+  const err = h("p", { class: "error", role: "alert", hidden: !error }, error);
+
+  const card = h("div", { class: "connect-card" },
+    brand(),
+    h("h1", {}, "Workspaces"),
+    h("p", {}, names.length
+      ? "Open one, or add another relay."
+      : "A workspace is a relay you can open by name. Make one to begin."),
+    err,
+    names.length ? h("div", { class: "ws-list" }, names.map((name) => {
+      const ws = loadWorkspaces()[name];
+      return h("div", { class: "ws-row" },
+        h("button", { class: "ws-open", onclick: () => goToWorkspace(name) },
+          h("span", { class: "strong" }, name),
+          h("span", { class: "muted small truncate" }, ws.url.replace(/^https?:\/\//, ""))),
+        h("button", {
+          class: "btn small danger", title: `Forget ${name}`,
+          onclick: () => { removeWorkspace(name); showHome(); },
+        }, "Forget"));
+    })) : false,
+    h("button", { class: "btn primary block", onclick: () => openNewWorkspace(prefill) }, "Create a workspace"));
+
+  $("#root").replaceChildren(h("div", { class: "connect" }, card));
+}
+
+function openNewWorkspace(prefill = "") {
+  const name = h("input", {
+    type: "text", required: true, pattern: NAME_PATTERN, value: prefill,
+    placeholder: "acme", autocomplete: "off", spellcheck: "false",
+  });
+  const urlIn = h("input", {
+    type: "text", inputmode: "url", required: true, placeholder: "https://relay.example.com",
+    value: window.RELAY_DEFAULT_SERVER || "", autocomplete: "url", spellcheck: "false",
+  });
+  const tokenIn = h("input", { type: "password", required: true, placeholder: "RELAY_ADMIN_TOKEN" });
+  const err = h("p", { class: "error", hidden: true });
+
+  openDialog("Create a workspace",
+    [field("Workspace name", name, "Opens at this name in the address bar. Letters, digits, _ . - "),
+     field("Relay URL", urlIn, "The relay server itself, not this page."),
+     field("Admin token", tokenIn), err],
+    [cancel(), h("button", { class: "btn primary", type: "submit" }, "Create")],
+    async (dlg) => {
+      const ws = name.value.trim();
+      if (!new RegExp("^" + NAME_PATTERN + "$").test(ws)) {
+        err.textContent = "Use 1-64 letters, digits, '_', '.' or '-', starting with a letter or digit.";
+        err.hidden = false;
+        return;
+      }
+      if (loadWorkspaces()[ws]) {
+        err.textContent = `A workspace called "${ws}" already exists on this device.`;
+        err.hidden = false;
+        return;
+      }
+      // Check the relay answers before saving, so a workspace in the list is
+      // always one that actually opens.
+      state.url = normalizeUrl(urlIn.value);
+      state.token = tokenIn.value.trim();
+      try {
+        await api("GET", "/api/workers");
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.hidden = false;
+        return;
+      }
+      saveWorkspace(ws, { url: state.url, token: state.token });
+      dlg.close();
+      goToWorkspace(ws);
+    });
+  (prefill ? urlIn : name).focus();
+}
+
 // --- sign in ---------------------------------------------------------------
 function showConnect({ url = "", error = "" } = {}) {
   stopStream();
@@ -235,19 +374,23 @@ function showConnect({ url = "", error = "" } = {}) {
 
 function signOut(message) {
   forget();
-  const url = state.url;
+  const name = state.workspace;
+  // A rejected token is worth forgetting: the saved one no longer opens it.
+  if (name && typeof message === "string" && message) removeWorkspace(name);
   state.token = "";
   state.workers = [];
   state.channels = [];
   state.unread.clear();
-  showConnect({ url, error: typeof message === "string" ? message : "" });
+  history.pushState({}, "", basePath().replace(/\/+$/, "") || "/");
+  showHome({ error: typeof message === "string" ? message : "" });
 }
 
 // --- app shell -------------------------------------------------------------
 async function showApp() {
   $("#root").replaceChildren(
     h("header", { class: "topbar" },
-      brand(),
+      h("button", { class: "brand-home", title: "All workspaces", onclick: () => goHome() }, brand()),
+      state.workspace && h("span", { class: "ws-tag" }, state.workspace),
       h("span", { class: "server truncate", title: state.url }, state.url.replace(/^https?:\/\//, "")),
       h("span", { class: "spacer" }),
       h("span", { class: "pill", id: "online-pill" }),
@@ -818,14 +961,28 @@ function onEvent(ev) {
 window.addEventListener("hashchange", () => { if ($("#main")) setView(); });
 setInterval(() => { if (state.view.kind === "workers") renderWorkersTable(); }, 30000);   // keep "last seen" honest
 
+// The workspace is in the path and the view is in the hash, so Back moves
+// between workspaces as well as between views.
+window.addEventListener("popstate", () => {
+  const name = workspaceFromUrl();
+  if (name) openWorkspace(name);
+  else showHome();
+});
+
 (function boot() {
+  const name = workspaceFromUrl();
+  if (name && loadWorkspaces()[name]) return openWorkspace(name);
+  if (name) return showHome({ error: `No workspace called "${name}" on this device.`, prefill: name });
+
+  // Anyone arriving with credentials from before workspaces existed keeps
+  // working; their relay becomes a workspace named after its host.
   const saved = loadSaved();
-  const server = new URLSearchParams(location.search).get("server");
-  if (saved && (!server || normalizeUrl(server) === saved.url)) {
-    state.url = saved.url;
-    state.token = saved.token;
-    showApp();
-  } else {
-    showConnect({ url: server || window.RELAY_DEFAULT_SERVER || "" });
+  if (saved && !Object.keys(loadWorkspaces()).length) {
+    const guess = (saved.url.replace(/^https?:\/\//, "").split(/[:/]/)[0] || "relay")
+      .replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 64);
+    saveWorkspace(guess, { url: saved.url, token: saved.token });
+    forget();
+    return goToWorkspace(guess);
   }
+  showHome();
 })();
