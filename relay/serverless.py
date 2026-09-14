@@ -190,9 +190,10 @@ def create_app(store: PgStore | None) -> FastAPI:
 
     @app.get("/api/workspaces/{ws}")
     async def workspace_exists(ws: str) -> dict[str, Any]:
-        """Whether a workspace is here. Says nothing else: no password, no
-        contents, and the same shape whoever asks."""
-        return {"slug": ws, "exists": await db().workspace_exists(ws)}
+        """Whether a workspace is here, and what it is called, so its address
+        can greet a visitor by name. Nothing about what is inside it."""
+        found = await db().find_workspace(ws)
+        return {"slug": ws, "exists": found is not None, "name": found["name"] if found else ""}
 
     # --- enrolment -------------------------------------------------------
     @app.post("/{ws}/enrol", status_code=202)

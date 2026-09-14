@@ -150,6 +150,16 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("swordfish", blob)
         self.assertNotIn("password", blob)
 
+    async def test_an_address_says_what_workspace_lives_there(self) -> None:
+        """A workspace URL opened on a new device has to be able to greet the
+        visitor by name before anyone has a password to offer."""
+        await self.workspace("Acme Jobs", "p")
+        status, body = await self.call("GET", "/api/workspaces/acmejobs")
+        self.assertEqual((status, body["exists"], body["name"]), (200, True, "Acme Jobs"))
+
+        status, body = await self.call("GET", "/api/workspaces/nosuch")
+        self.assertEqual((status, body["exists"], body["name"]), (200, False, ""))
+
     # --- enrolment --------------------------------------------------------
     async def test_an_unknown_worker_is_told_how_to_ask(self) -> None:
         ws = await self.workspace()

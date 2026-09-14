@@ -152,25 +152,35 @@ function slugify(name) {
 // The relay a workspace talks to, derived from where the console is served
 // and the workspace's own slug.
 function derivedUrl(slug) {
-  const base = (location.origin + basePath()).replace(/\/+$/, "");
+  const base = deploymentRoot();
   return slug ? `${base}/${slug}` : base;
 }
 
-function basePath() {
-  let path = location.pathname.replace(/\/+$/, "");
-  // A trailing file name is not part of the base: /index.html is served at /.
-  const last = path.split("/").pop() || "";
-  if (last.includes(".")) path = path.slice(0, -(last.length + 1));
-  for (const slug of Object.keys(loadWorkspaces())) {
-    if (path.endsWith("/" + slug)) return path.slice(0, -(slug.length + 1)) || "/";
-  }
-  return path || "/";
-}
+// Files the console is itself made of, so a path ending in one is not a
+// workspace. Everything else in the last segment is a workspace name, whether
+// or not this device has heard of it.
+const FILE_SUFFIX = /\.(html?|js|mjs|css|json|map|png|jpe?g|gif|svg|ico|webp|txt|xml|woff2?)$/i;
 
 function workspaceFromUrl() {
   const seg = location.pathname.replace(/\/+$/, "").split("/").pop() || "";
-  return seg && seg !== "index.html" ? decodeURIComponent(seg) : "";
+  if (!seg || FILE_SUFFIX.test(seg)) return "";
+  try { return decodeURIComponent(seg); } catch { return seg; }
 }
+
+// Where the deployment itself is served from, derived from the address alone.
+// Working it out from what is saved locally meant that a workspace this
+// browser had never opened sent the console looking for the deployment inside
+// that workspace, where it found nothing.
+function basePath() {
+  let path = location.pathname.replace(/\/+$/, "");
+  const last = path.split("/").pop() || "";
+  if (last && FILE_SUFFIX.test(last)) path = path.slice(0, -(last.length + 1));
+  const slug = workspaceFromUrl();
+  if (slug && path.endsWith("/" + slug)) path = path.slice(0, -(slug.length + 1));
+  return path || "/";
+}
+
+const deploymentRoot = () => (location.origin + basePath()).replace(/\/+$/, "");
 
 function goToWorkspace(name) {
   const base = basePath().replace(/\/+$/, "");
@@ -181,6 +191,68 @@ function goToWorkspace(name) {
 function goHome() {
   history.pushState({}, "", basePath().replace(/\/+$/, "") || "/");
   showHome();
+}
+
+// A workspace address is a place, not a request to be recognised. If this
+// device knows the password, open it; if the server has it, ask for the
+// password; only if it is nowhere does the question become whether to make it.
+async function enterWorkspace(slug) {
+  if (loadWorkspaces()[slug]) return openWorkspace(slug);
+  let found = null;
+  try {
+    const res = await fetch(`${deploymentRoot()}/api/workspaces/${enc(slug)}`, { cache: "no-store" });
+    if ((res.headers.get("content-type") || "").includes("json")) found = await res.json();
+  } catch {
+    /* offline, or not served by a relay */
+  }
+  if (found?.exists) return showWorkspaceSignIn(slug, found.name || slug);
+  showHome({
+    error: found
+      ? `There is no workspace at /${slug} on this server yet.`
+      : `No workspace called "${slug}" on this device.`,
+    prefill: slug,
+  });
+}
+
+// The front door of one workspace: its own page, asking only for its password.
+function showWorkspaceSignIn(slug, name) {
+  stopStream();
+  state.workspace = "";
+  const pass = h("input", { type: "password", required: true, autocomplete: "current-password" });
+  const err = h("p", { class: "error", role: "alert", hidden: true });
+  const btn = h("button", { class: "btn primary block", type: "submit" }, "Open");
+
+  const form = h("form", {
+    class: "connect-card",
+    onsubmit: async (e) => {
+      e.preventDefault();
+      state.url = `${deploymentRoot()}/${enc(slug)}`;
+      state.token = pass.value;
+      btn.disabled = true;
+      btn.textContent = "Opening…";
+      try {
+        await api("GET", "/api/channels");
+      } catch (ex) {
+        err.textContent = ex.status === 401 ? "That password does not open this workspace." : ex.message;
+        err.hidden = false;
+        btn.disabled = false;
+        btn.textContent = "Open";
+        return;
+      }
+      saveWorkspace(slug, { name, url: state.url, token: state.token });
+      openWorkspace(slug);
+    },
+  },
+    brand(),
+    h("h1", {}, name),
+    h("p", {}, "This workspace is on this server. Enter its password to open it here."),
+    field("Password", pass),
+    err,
+    btn,
+    h("button", { class: "btn block", type: "button", onclick: () => goHome() }, "All workspaces"));
+
+  $("#root").replaceChildren(h("div", { class: "connect" }, form));
+  pass.focus();
 }
 
 function openWorkspace(name) {
@@ -327,9 +399,8 @@ async function renderWorkspaceList(list) {
   };
 
   draw([]);                                   // what is known here, immediately
-  const base = (location.origin + basePath()).replace(/\/+$/, "");
   try {
-    const res = await fetch(base + "/api/workspaces", { cache: "no-store" });
+    const res = await fetch(deploymentRoot() + "/api/workspaces", { cache: "no-store" });
     if (!(res.headers.get("content-type") || "").includes("json")) return;
     const onServer = await res.json();
     if (Array.isArray(onServer) && list.isConnected) draw(onServer);
@@ -348,7 +419,7 @@ function openExistingWorkspace(slug, name) {
      field("Password", pass), err],
     [cancel(), h("button", { class: "btn primary", type: "submit" }, "Open")],
     async (dlg) => {
-      state.url = (location.origin + basePath()).replace(/\/+$/, "") + "/" + slug;
+      state.url = `${deploymentRoot()}/${enc(slug)}`;
       state.token = pass.value;
       try {
         await api("GET", "/api/channels");
@@ -368,9 +439,8 @@ function openExistingWorkspace(slug, name) {
 // A console served from somewhere static is not: it has no health endpoint,
 // and there is nothing to report.
 async function deploymentHealth() {
-  const base = (location.origin + basePath()).replace(/\/+$/, "");
   try {
-    const res = await fetch(base + "/healthz", { cache: "no-store" });
+    const res = await fetch(deploymentRoot() + "/healthz", { cache: "no-store" });
     if (!(res.headers.get("content-type") || "").includes("json")) return null;
     const health = await res.json();
     return typeof health?.ok === "boolean" ? health : null;
@@ -1175,14 +1245,13 @@ setInterval(() => { if (state.view.kind === "workers") renderWorkersTable(); }, 
 // between workspaces as well as between views.
 window.addEventListener("popstate", () => {
   const name = workspaceFromUrl();
-  if (name) openWorkspace(name);
+  if (name) enterWorkspace(name);
   else showHome();
 });
 
 (function boot() {
   const name = workspaceFromUrl();
-  if (name && loadWorkspaces()[name]) return openWorkspace(name);
-  if (name) return showHome({ error: `No workspace called "${name}" on this device.`, prefill: name });
+  if (name) return enterWorkspace(name);
 
   // Anyone arriving with credentials from before workspaces existed keeps
   // working; their relay becomes a workspace named after its host.

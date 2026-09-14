@@ -195,6 +195,11 @@ class PgStore:
         except errors.UniqueViolation:
             raise ValueError(f"workspace {slug!r} already exists") from None
 
+    async def find_workspace(self, slug: str) -> dict[str, Any] | None:
+        """Slug, name and when it was made. Never the password hash."""
+        return await self._one(
+            "SELECT slug, name, created_at FROM workspaces WHERE slug = %s", (slug,))
+
     async def workspace_exists(self, slug: str) -> bool:
         return await self._one("SELECT 1 FROM workspaces WHERE slug = %s", (slug,)) is not None
 
