@@ -197,7 +197,9 @@ function goHome() {
 // device knows the password, open it; if the server has it, ask for the
 // password; only if it is nowhere does the question become whether to make it.
 async function enterWorkspace(slug) {
-  if (loadWorkspaces()[slug]) return openWorkspace(slug);
+  const saved = loadWorkspaces()[slug];
+  if (saved?.token) return openWorkspace(slug);
+  if (saved) return showWorkspaceSignIn(slug, saved.name || slug);
   let found = null;
   try {
     const res = await fetch(`${deploymentRoot()}/api/workspaces/${enc(slug)}`, { cache: "no-store" });
@@ -215,11 +217,11 @@ async function enterWorkspace(slug) {
 }
 
 // The front door of one workspace: its own page, asking only for its password.
-function showWorkspaceSignIn(slug, name) {
+function showWorkspaceSignIn(slug, name, message = "") {
   stopStream();
   state.workspace = "";
   const pass = h("input", { type: "password", required: true, autocomplete: "current-password" });
-  const err = h("p", { class: "error", role: "alert", hidden: true });
+  const err = h("p", { class: "error", role: "alert", hidden: !message }, message);
   const btn = h("button", { class: "btn primary block", type: "submit" }, "Open");
 
   const form = h("form", {
@@ -258,6 +260,7 @@ function showWorkspaceSignIn(slug, name) {
 function openWorkspace(name) {
   const ws = loadWorkspaces()[name];
   if (!ws) return showHome({ error: `No workspace called "${name}" on this device.`, prefill: name });
+  if (!ws.token) return showWorkspaceSignIn(name, ws.name || name);
   state.workspace = name;
   state.url = ws.url;
   state.token = ws.token;
@@ -381,8 +384,9 @@ async function renderWorkspaceList(list) {
     }
     const names = new Map(onServer.map((w) => [w.slug, w.name]));
     fill(list, slugs.map((slug) => {
-      const here = saved[slug];
-      const label = here?.name || names.get(slug) || slug;
+      const known = saved[slug];
+      const here = known?.token ? known : null;        // known, but can we open it?
+      const label = known?.name || names.get(slug) || slug;
       return h("div", { class: "ws-row" },
         h("button", {
           class: "ws-open",
@@ -391,7 +395,7 @@ async function renderWorkspaceList(list) {
           h("span", { class: "strong" }, label),
           h("span", { class: "muted small truncate" },
             "/" + slug, here ? "" : " · password needed on this device")),
-        here ? h("button", {
+        known ? h("button", {
           class: "btn small danger", title: `Forget ${label} on this device`,
           onclick: () => { removeWorkspace(slug); showHome(); },
         }, "Forget") : false);
@@ -579,17 +583,28 @@ function showConnect({ url = "", error = "" } = {}) {
   (url ? tokenIn : urlIn).focus();
 }
 
+// Signing out, or being turned away, drops the password and keeps the
+// workspace. Only the Forget button removes one: a password that stopped
+// working is a reason to ask for it again, never to lose the address, and a
+// workspace that vanishes from the list looks like one that was never made.
 function signOut(message) {
+  const slug = state.workspace;
+  stopStream();
   forget();
-  const name = state.workspace;
-  // A rejected token is worth forgetting: the saved one no longer opens it.
-  if (name && typeof message === "string" && message) removeWorkspace(name);
+  const ws = slug ? loadWorkspaces()[slug] : null;
+  if (ws) saveWorkspace(slug, { ...ws, token: "" });
   state.token = "";
   state.workers = [];
   state.channels = [];
+  state.pending = [];
   state.unread.clear();
+  const said = typeof message === "string" ? message : "";
+  if (slug && ws) {
+    history.pushState({}, "", `${basePath().replace(/\/+$/, "")}/${enc(slug)}`);
+    return showWorkspaceSignIn(slug, ws.name || slug, said);
+  }
   history.pushState({}, "", basePath().replace(/\/+$/, "") || "/");
-  showHome({ error: typeof message === "string" ? message : "" });
+  showHome({ error: said });
 }
 
 // --- app shell -------------------------------------------------------------
