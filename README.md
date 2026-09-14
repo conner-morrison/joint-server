@@ -155,93 +155,52 @@ possible).
 Close code `4401` means the token is invalid or was revoked, so stop
 reconnecting. `4000` means the same worker connected again from somewhere else.
 
-## Web console on Vercel
+## Web console
 
-`ui/` is a static admin console: workers with live online status, channels,
-members, a live message feed per channel, and posting as `@server`. It is
-plain HTML, CSS and JS with no build step.
+`ui/` is the admin console: workspaces, workers with their waiting list,
+channels, members, a live message feed per channel, and posting as `@server`.
+Plain HTML, CSS and JS with no build step.
 
-**Vercel hosts the console only, not the relay.** Vercel runs short-lived
-serverless functions. The relay needs long-lived websockets and a database file
-on disk, so it runs on an ordinary server (any VPS) behind HTTPS. The console
-in the browser talks to that server directly.
+The server serves it, from the same address as the API. That is what makes
+`/acme` both a page and a relay: the console knows where its relay is because
+it is the same place it came from, and no CORS is involved. Opening the
+deployment's root lists the workspaces it holds.
 
-```
-browser ── https://your-console.vercel.app   (static files from ui/)
-   │
-   └── https://relay.example.com/api ...     (your relay server, CORS-allowed)
-```
-
-1. **Allow the console's origin on the relay**, then restart it:
-
-   ```bash
-   export RELAY_CORS_ORIGINS="https://your-console.vercel.app,https://your-console-*.vercel.app"
-   python -m relay serve --port 8700
-   ```
-
-   The `*` entry covers Vercel preview deployments. The console calls the API
-   with the admin token in a header, so no cookies are involved.
-
-2. **Deploy.** Import the repository in the Vercel dashboard and keep the
-   default settings, or use the CLI from the repository root:
-
-   ```bash
-   npx vercel deploy --prod
-   ```
-
-   `vercel.json` at the repository root tells Vercel there is no framework and
-   no build, and to publish `ui/` as static files. Without it, Vercel sees
-   FastAPI in `pyproject.toml`, tries to build the relay as a Python function,
-   and fails with "No FastAPI entrypoint found". The settings in that file take
-   priority over whatever the Vercel project detected when it was imported.
-
-3. **Open the console**, enter the relay's `https://` URL and `RELAY_ADMIN_TOKEN`.
-   To pre-fill the URL, set it in `ui/config.js` or open the console with
-   `?server=https://relay.example.com`.
-
-The relay must be served over HTTPS. Vercel serves the console over HTTPS, and
-browsers block calls from an HTTPS page to a plain `http://` server
-(`localhost` excepted).
-
-`vercel.json` also sets a Content-Security-Policy that only runs the console's
-own scripts. That matters because the console displays message bodies written
-by workers, and it inserts them as text, never as HTML.
-
-To try the console locally:
+To run the whole thing locally:
 
 ```bash
-RELAY_CORS_ORIGINS=http://127.0.0.1:5500 python -m relay serve --port 8700
-python3 -m http.server 5500 --directory ui     # open http://127.0.0.1:5500
+pip install -e ".[server,client,dev]"
+DATABASE_URL=postgresql://localhost/relay uvicorn app:app --port 8000
 ```
+
+Without `DATABASE_URL` it still starts, and the first page says what is
+missing rather than failing obscurely.
 
 ## Deploying the relay
 
-The relay needs one always-on process, a disk that survives restarts, and
-HTTPS. Any host that offers those works; `Dockerfile` runs anywhere, and takes
-its port from `$PORT` where the host sets one.
+The relay needs somewhere to run and a Postgres to talk to, reached through
+`DATABASE_URL`. It keeps nothing of its own, so the container can be restarted
+or replaced freely, and `Dockerfile` runs anywhere, taking its port from
+`$PORT` where the host sets one.
 
-**Railway.** `railway.json` selects the Dockerfile and pins one replica. The
-rest is dashboard-only:
+**Railway.** `railway.json` selects the Dockerfile. Put a Postgres in the
+**same project** and give the relay service one variable:
 
-- attach a **volume mounted at `/data`**, otherwise the database lives in the
-  container and every deploy starts empty
-- `RELAY_ADMIN_TOKEN`, and `RELAY_CORS_ORIGINS` if a browser console talks to it
-- `RELAY_RETENTION_DAYS=0` to keep messages for ever, if the relay is the place
-  the data lives rather than a channel workers are expected to keep up with
-- leave it at **one replica**: routing is in memory and the volume attaches to a
-  single instance, so a second one splits the workers between two servers that
-  cannot see each other
+```
+DATABASE_URL = ${{Postgres.DATABASE_URL}}
+```
 
-**Serverless, with the console served from the same address.** `app.py` runs
-the relay on Vercel, holding many workspaces in one deployment and keeping its
-state in Postgres. Set `DATABASE_URL` to any Postgres connection string -
-Neon, Supabase, Railway, your own - and open the deployment: if it is not set,
-the first page says so rather than failing obscurely. `DESIGN-serverless.md`
-has the details, including which connection string to use from which provider.
+That is a reference to the service called `Postgres`, and it only resolves
+within one project: a database in another project leaves it empty, which the
+deployment then reports as having no database at all. Keeping them together
+also keeps the database off the internet, and its traffic off the egress bill.
 
-**Render.** `render.yaml` says all of the above declaratively; import it as a
-Blueprint. A free instance will not do: it sleeps when idle, which drops every
-worker's websocket, and has no disk.
+Pushing to `main` rebuilds and redeploys, the console included, since the
+console is part of the image.
+
+**Render.** `render.yaml` describes the same service; import it as a Blueprint
+and set `DATABASE_URL` in the dashboard. A free instance sleeps when idle, so
+a worker's poll waits for it to wake.
 
 **Your own server.** Put it behind a TLS reverse proxy (Caddy, nginx) so workers
 use `https://` and `wss://`. Tokens travel in a header, so plain HTTP exposes
@@ -249,12 +208,15 @@ them.
 
 Wherever it runs:
 
-- Hold on to `RELAY_ADMIN_TOKEN`. Worker tokens are only stored as hashes, so a
-  lost worker token can only be replaced (`worker token <id>`), not recovered.
-- Back up `relay.db` (`RELAY_DB` sets its path). The database is the whole
-  state of the server.
-- One process only. Live routing is held in memory, so do not run several
-  workers of the server behind a load balancer.
+- **Back up the Postgres.** It is the whole state: workspaces, workers, their
+  token hashes, and every message.
+- **Passwords and tokens are stored as hashes.** A workspace password that is
+  lost cannot be read back, and a lost worker token can only be replaced.
+- **Point a load balancer at `/readyz`, not `/healthz`.** The first is 503
+  until the database answers; the second is 200 whenever the process is
+  serving, so that a deployment missing a setting can still say which one.
+- **`RELAY_POOL_MAX`** caps connections per instance. A managed pooler absorbs
+  many instances; a plain Postgres has about a hundred connections to give out.
 
 ## Tests
 

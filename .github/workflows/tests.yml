@@ -1,0 +1,39 @@
+# Railway deploys whatever lands on main. This is the half that says whether
+# what landed works: it runs the same suite as `python -m unittest discover
+# tests`, against a real Postgres the tests start for themselves.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A newer push makes an older run pointless.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[server,client,dev]"
+
+      - name: Test
+        run: python -m unittest discover tests -v
+
+      - name: Check the deployed image would start
+        # The entrypoint must import with no database configured: a host that
+        # cannot start cannot tell anyone why.
+        env:
+          DATABASE_URL: ""
+        run: python -c "import app; print('entrypoint imports with no database')"
