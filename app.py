@@ -52,6 +52,13 @@ if os.path.isdir(UI):
 API_PARTS = ("/api/", "/publish", "/messages", "/ack", "/enrol")
 
 
+# The console ships inside the image, so every deploy is a new version of it.
+# Without this a browser is free to decide for itself how long to keep the old
+# one, and a deployed fix can go unseen for as long as it likes. `no-cache`
+# still caches: it just requires asking first, which a 304 answers cheaply.
+CONSOLE_HEADERS = {"Cache-Control": "no-cache"}
+
+
 @app.get("/{path:path}", include_in_schema=False)
 async def console(path: str = "") -> Response:
     whole = "/" + path
@@ -59,8 +66,8 @@ async def console(path: str = "") -> Response:
         return JSONResponse({"detail": f"no such endpoint: {whole}"}, status_code=404)
     candidate = os.path.normpath(os.path.join(UI, path))
     if path and candidate.startswith(UI + os.sep) and os.path.isfile(candidate):
-        return FileResponse(candidate)
+        return FileResponse(candidate, headers=CONSOLE_HEADERS)
     index = os.path.join(UI, "index.html")
     if not os.path.isfile(index):
         return JSONResponse({"detail": "the console is not part of this deployment; the API is here"}, 404)
-    return FileResponse(index)
+    return FileResponse(index, headers=CONSOLE_HEADERS)
