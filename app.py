@@ -19,6 +19,7 @@ from fastapi import Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from relay.notify import Notifier
 from relay.pgstore import PgStore
 from relay.serverless import create_app
 
@@ -37,7 +38,8 @@ UI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 # pool is kept small and can be tuned without a code change.
 POOL_MAX = int(os.environ.get("RELAY_POOL_MAX", "3"))
 
-app = create_app(PgStore(DSN, max_size=POOL_MAX) if DSN else None)
+app = create_app(PgStore(DSN, max_size=POOL_MAX) if DSN else None,
+                 Notifier(DSN) if DSN else None)
 
 # StaticFiles raises when its directory is absent, which would be a crash at
 # import for a missing folder. The console being unavailable is worth saying

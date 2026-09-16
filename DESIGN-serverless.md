@@ -29,11 +29,20 @@ instance has its own memory, so the in-memory routing that makes push work has
 nowhere to live: a publish arriving at instance A cannot reach a socket held by
 instance B without going through the database anyway.
 
-A long poll holds one request open for up to `wait` seconds, checking the
-database as it goes, and returns as soon as anything is there. Hobby functions
-may run 300s, so a 30s hold is uncontroversial. A worker sees a message within
-about a second of it being stored, which is the same order as push for this
-workload, and the code is a loop instead of a connection lifecycle.
+A long poll holds one request open for up to `wait` seconds and returns as soon
+as anything is there. The worker makes one request per idle window and is
+otherwise asleep inside it.
+
+What ends the wait is the publish itself. `pg_notify` announces the workspace
+and channel, one `LISTEN` connection per process hears it, and the waiters for
+that channel wake. Measured locally, a worker is woken about **5ms** after the
+message is stored; before, it waited for the next check a second later.
+
+The timer that remains is a safety net, not the mechanism: a notification that
+never arrives - the listener reconnecting, an instance restarting - costs
+latency and nothing else, because a waiter reads the log before it waits and
+again after. That is why it can be five seconds rather than one, and why
+losing the listening connection is not worth failing a request over.
 
 ## Delivery guarantees, kept
 

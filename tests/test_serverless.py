@@ -20,6 +20,7 @@ from typing import Any
 
 import uvicorn
 
+from relay.notify import Notifier
 from relay.pgstore import PgStore
 from relay.serverless import create_app
 
@@ -53,7 +54,7 @@ class LiveApp:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
         self.url = f"http://127.0.0.1:{self.port}"
-        app = create_app(PgStore(dsn, min_size=1, max_size=8))
+        app = create_app(PgStore(dsn, min_size=1, max_size=8), Notifier(dsn))
         config = uvicorn.Config(app, host="127.0.0.1", port=self.port,
                                 log_level="warning", timeout_graceful_shutdown=2)
         self.server = uvicorn.Server(config)
@@ -296,7 +297,31 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         await poster
         self.assertEqual(status, 200)
         self.assertEqual([m["body"] for m in body["messages"]], ["late"])
-        self.assertLess(took, 10, "the poll should return when the message lands, not at the deadline")
+        # Published at t=1. The publish itself wakes the waiting request, so
+        # this returns just after that rather than on the next check.
+        self.assertLess(took, 1.6, f"woken {took - 1:.2f}s after the message was published")
+
+    async def test_a_publish_does_not_wake_another_workspace(self) -> None:
+        """Two workspaces can both have a channel called jobs. A worker waiting
+        in one must not be woken by the other, or a busy neighbour would keep
+        it querying for messages that are not its own."""
+        acme = await self.workspace("Acme", "acme-pass")
+        other = await self.workspace("Upwork", "upwork-pass")
+        for ws, password in ((acme, "acme-pass"), (other, "upwork-pass")):
+            await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token=password)
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout", "token": f"{ws}-token"})
+            await self.call("POST", f"/{ws}/api/pending/scout", token=password)
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/scout", {}, token=password)
+
+        async def post_elsewhere() -> None:
+            await asyncio.sleep(0.5)
+            await self.call("POST", f"/{other}/api/channels/jobs/messages",
+                            {"body": "not yours"}, token="upwork-pass")
+
+        poster = asyncio.create_task(post_elsewhere())
+        status, body = await self.call("GET", f"/{acme}/messages?wait=2", token=f"{acme}-token")
+        await poster
+        self.assertEqual((status, body["messages"]), (200, []))
 
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()

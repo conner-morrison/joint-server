@@ -28,12 +28,13 @@ from fastapi.responses import JSONResponse
 from psycopg import Error as PgError
 from pydantic import BaseModel
 
+from relay.notify import Notifier, key as notify_key
 from relay.pgstore import PgStore, WorkspaceStore, check_name, slugify
 
 SERVER_SENDER = "@server"
 MAX_BODY_BYTES = int(os.environ.get("RELAY_MAX_BODY_BYTES", "256000"))
 POLL_MAX_WAIT = float(os.environ.get("RELAY_POLL_MAX_WAIT", "25"))
-POLL_INTERVAL = float(os.environ.get("RELAY_POLL_INTERVAL", "1.0"))
+POLL_INTERVAL = float(os.environ.get("RELAY_POLL_INTERVAL", "5.0"))
 
 
 class WorkspaceIn(BaseModel):
@@ -93,7 +94,7 @@ def redact(text: str) -> str:
     return re.sub(r"(?i)(postgres(?:ql)?://)[^\s\"\']*", r"\1...", text)
 
 
-def create_app(store: PgStore | None) -> FastAPI:
+def create_app(store: PgStore | None, notifier: Notifier | None = None) -> FastAPI:
     """`store` is None when the deployment has no database configured. The app
     still starts: it serves the console and says what is missing, because a
     process that refuses to start can only report a crash."""
@@ -105,6 +106,8 @@ def create_app(store: PgStore | None) -> FastAPI:
         try:
             yield
         finally:
+            if notifier is not None:
+                await notifier.close()
             if store is not None:
                 await store.close()
 
@@ -217,11 +220,22 @@ def create_app(store: PgStore | None) -> FastAPI:
         scoped, worker_id = who
         await scoped.touch_worker(worker_id)
         deadline = time.monotonic() + min(max(wait, 0.0), POLL_MAX_WAIT)
+        # What this worker would be woken for: its own channels, in its own
+        # workspace. A publish elsewhere is not its business.
+        watching = [notify_key(scoped.slug, channel)
+                    for channel in await scoped.channels_of(worker_id)]
         while True:
             found = await scoped.waiting_for(worker_id, limit=min(max(limit, 1), 1000))
-            if found or time.monotonic() >= deadline:
+            left = deadline - time.monotonic()
+            if found or left <= 0:
                 return {"messages": found, "worker_id": worker_id}
-            await asyncio.sleep(POLL_INTERVAL)
+            # Woken by the publish itself. The timeout is a safety net for a
+            # notification that never arrives, not the thing doing the work,
+            # which is why it can afford to be long.
+            if notifier is not None:
+                await notifier.wait(watching, timeout=min(left, POLL_INTERVAL))
+            else:
+                await asyncio.sleep(min(left, POLL_INTERVAL))
 
     @app.post("/{ws}/ack")
     async def ack(body: AckIn, who: tuple[WorkspaceStore, str] = Depends(worker)) -> dict[str, Any]:

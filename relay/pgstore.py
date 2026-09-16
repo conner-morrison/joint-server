@@ -29,6 +29,7 @@ from psycopg import AsyncConnection, errors
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
 from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
 
 SCHEMA = """
@@ -463,6 +464,10 @@ class WorkspaceStore:
                     (self.slug, channel, sender, client_id, json.dumps(body),
                      time.time() if ts is None else ts))
                 row = await cur.fetchone()
+                # Announced in the same transaction as the insert, so nobody is
+                # ever told about a message that then fails to commit.
+                await conn.execute("SELECT pg_notify(%s, %s)",
+                                   (NOTIFY_CHANNEL, notify_key(self.slug, channel)))
                 return int(row["seq"]), False                    # type: ignore[index]
             except errors.UniqueViolation:
                 if client_id is None:
