@@ -62,7 +62,6 @@ class BotIn(BaseModel):
     name: str
     chat_id: str
     token: str
-    from_start: bool = False
 
 
 class PostIn(BaseModel):
@@ -301,6 +300,41 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(404, f"nothing waiting as {worker_id!r}")
         return {"worker_id": worker_id, "rejected": True}
 
+    @app.get("/{ws}/api/bots")
+    async def list_bots(scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
+        return await scoped.list_bots()
+
+    @app.post("/{ws}/api/bots", status_code=201)
+    async def add_bot(body: BotIn, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Proved before it is stored, by sending to it.
+
+        Asking Telegram whether the token is real would leave the chat id
+        untested, and a wrong chat id fails silently later, when nobody is
+        looking. Sending is the only check that covers both, and it arrives as
+        the message that says the bot is working.
+        """
+        try:
+            who = await telegram.check(body.token)
+            await telegram.send(body.token, body.chat_id, telegram.WELCOME)
+        except telegram.TelegramError as exc:
+            raise HTTPException(400, {
+                "status": "invalid_bot",
+                "message": f"Telegram would not send with that ID and token: {exc}",
+            }) from None
+        try:
+            await scoped.add_bot(body.name, body.chat_id, body.token,
+                                 label=who.get("username") or "")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return {"name": body.name, "chat_id": body.chat_id,
+                "label": who.get("username") or "", "channels": []}
+
+    @app.delete("/{ws}/api/bots/{bot}")
+    async def remove_bot(bot: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.remove_bot(bot):
+            raise HTTPException(404, f"no bot {bot!r}")
+        return {"removed": True}
+
     @app.get("/{ws}/api/channels")
     async def list_channels(scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
         return await scoped.list_channels()
@@ -334,35 +368,25 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         return {"left": await scoped.leave(name, worker_id)}
 
     @app.get("/{ws}/api/channels/{name}/bots")
-    async def list_bots(name: str, scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
-        return await scoped.list_bots(name)
+    async def channel_bots(name: str, scoped: WorkspaceStore = Depends(admin)
+                           ) -> list[dict[str, Any]]:
+        return await scoped.bots_of(name)
 
-    @app.post("/{ws}/api/channels/{name}/bots", status_code=201)
-    async def add_bot(name: str, body: BotIn,
-                      scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
-        """Checked against Telegram before it is stored, so a mistyped token is
-        a sentence on the form rather than silence and a line in a log."""
+    @app.put("/{ws}/api/channels/{name}/bots/{bot}")
+    async def add_bot_member(name: str, bot: str, body: JoinIn | None = None,
+                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
         try:
-            who = await telegram.check(body.token)
-        except telegram.TelegramError as exc:
-            raise HTTPException(400, f"Telegram rejected that token: {exc}") from None
-        try:
-            await scoped.add_bot(name, body.name, body.chat_id, body.token,
-                                 from_start=body.from_start)
+            joined = await scoped.join_bot(name, bot, from_start=bool(body and body.from_start))
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from None
-        except ValueError as exc:
-            raise HTTPException(409 if "already" in str(exc) else 400, str(exc)) from None
-        if sender is not None:
+        if joined and sender is not None:
             sender.nudge()
-        return {"name": body.name, "bot": who.get("username") or "", "added": True}
+        return {"joined": joined}
 
     @app.delete("/{ws}/api/channels/{name}/bots/{bot}")
-    async def remove_bot(name: str, bot: str,
-                         scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
-        if not await scoped.remove_bot(name, bot):
-            raise HTTPException(404, f"no bot {bot!r} on channel {name!r}")
-        return {"removed": True}
+    async def remove_bot_member(name: str, bot: str,
+                                scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        return {"left": await scoped.leave_bot(name, bot)}
 
     @app.get("/{ws}/api/channels/{name}/messages")
     async def history(name: str, after: int | None = None, before: int | None = None, limit: int = 100,

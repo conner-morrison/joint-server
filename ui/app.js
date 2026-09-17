@@ -643,14 +643,17 @@ async function showApp() {
 
 async function refreshAll({ rethrow = false } = {}) {
   try {
-    const [workers, channels, pending] = await Promise.all([
+    const [workers, channels, pending, bots] = await Promise.all([
       api("GET", "/api/workers"), api("GET", "/api/channels"),
-      // Older relays have no waiting list; an empty one is the right answer.
+      // Older relays have neither a waiting list nor bots; empty is the right
+      // answer for both.
       api("GET", "/api/pending").catch(() => []),
+      api("GET", "/api/bots").catch(() => []),
     ]);
     state.workers = workers;
     state.channels = channels;
     state.pending = Array.isArray(pending) ? pending : [];
+    state.bots = Array.isArray(bots) ? bots : [];
     state.online = new Set(workers.filter((w) => w.online).map((w) => w.worker_id));
     renderSidebar();
     renderOnlinePill();
@@ -737,7 +740,7 @@ function renderSidebar() {
       })
       : h("p", { class: "nav-empty" }, "No channels yet."),
     h("div", { class: "nav-title" }, "Workers",
-      h("button", { class: "btn icon", title: "New worker", "aria-label": "New worker", onclick: openNewWorker }, "+")),
+      h("button", { class: "btn icon", title: "Add a Telegram bot", "aria-label": "Add a Telegram bot", onclick: openNewBot }, "+")),
     h("button", { class: "nav-item" + (v.kind === "workers" ? " active" : ""), onclick: () => go("#/workers") },
       "All workers", h("span", { class: "count" }, state.workers.length)));
 }
@@ -797,7 +800,7 @@ function renderWorkersView() {
       h("div", { class: "grow" },
         h("h1", {}, "Workers"),
         h("p", {}, "Each worker signs in with its own token and can only use the channels it belongs to.")),
-      h("button", { class: "btn primary", onclick: openNewWorker }, "New worker")),
+      h("button", { class: "btn primary", onclick: openNewBot }, "+ Telegram bot")),
     h("div", { class: "scroll pad", id: "workers-table" }));
   renderWorkersTable();
 }
@@ -806,14 +809,29 @@ function renderWorkersTable() {
   const box = $("#workers-table");
   if (!box) return;
   const waiting = renderPending();
-  if (!state.workers.length) {
-    box.replaceChildren(waiting || empty("No workers yet",
-      "Register a worker here, or point one at this workspace and approve it when it asks."));
+  if (!state.workers.length && !state.bots.length) {
+    box.replaceChildren(waiting || empty("Nothing here yet",
+      "Add a Telegram bot to be sent alerts, or point a worker at this workspace "
+      + "and approve it when it asks to join."));
     return;
   }
   box.replaceChildren(waiting || "", h("div", { class: "table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {}, ["Worker", "Channels", "Last seen", ""].map((t) => h("th", {}, t)))),
-    h("tbody", {}, state.workers.map((w) => {
+    h("tbody", {},
+      // Bots first: nothing about them changes minute to minute, and they are
+      // the thing a person here adds by hand.
+      state.bots.map((b) => h("tr", {},
+        h("td", {}, h("div", { class: "who" }, h("span", { class: "bot-dot" }),
+          h("div", {}, h("div", { class: "mono strong" }, b.name),
+            h("div", { class: "muted small" }, "Telegram"
+              + (b.label ? " \u00b7 @" + b.label : "") + " \u00b7 chat " + b.chat_id)))),
+        h("td", {}, (b.channels || []).length
+          ? h("div", { class: "chips" }, b.channels.map((c) => h("a", { class: "chip", href: "#/channel/" + enc(c) }, "#" + c)))
+          : h("span", { class: "muted" }, "none")),
+        h("td", { class: "muted nowrap" }, "sent to by the server"),
+        h("td", { class: "actions" },
+          h("button", { class: "btn small danger", onclick: () => removeBot(b.name) }, "Remove")))),
+      state.workers.map((w) => {
       const online = state.online.has(w.worker_id);
       return h("tr", {},
         h("td", {}, h("div", { class: "who" }, dot(online),
@@ -867,81 +885,72 @@ async function rejectWorker(workerId) {
 }
 
 // A bot is somewhere the server sends to, not something that connects. It is
-// listed beside the members because that is what it behaves like from here:
-// added to a channel, removed from it, receiving what is posted.
-function botsSection(channel) {
-  const bot = h("input", { type: "text", required: true, pattern: NAME_PATTERN, placeholder: "my-phone", autocomplete: "off", spellcheck: "false" });
+// registered here with the workers because that is what it is: a recipient the
+// workspace knows, added to whichever channels should reach it.
+function openNewBot() {
+  const name = h("input", { type: "text", required: true, pattern: NAME_PATTERN, placeholder: "my-phone", autocomplete: "off", spellcheck: "false" });
   const chat = h("input", { type: "text", required: true, placeholder: "8401438560", autocomplete: "off", spellcheck: "false" });
   const token = h("input", { type: "password", required: true, placeholder: "123456:AA...", autocomplete: "off" });
-  const history = h("input", { type: "checkbox" });
   const err = h("p", { class: "error", hidden: true });
-  const add = h("button", { class: "btn", type: "submit" }, "Add bot");
+  const create = h("button", { class: "btn primary", type: "submit" }, "Create");
 
-  return h("div", {},
-    h("h2", {}, "Telegram bots"),
-    state.bots.length
-      ? h("div", { id: "bot-list" }, state.bots.map((b) => h("div", { class: "member" },
-        h("span", { class: "bot-dot", title: "Delivered to by the server" }),
-        h("div", { class: "grow" },
-          h("div", { class: "strong truncate" }, b.name),
-          h("div", { class: "muted small truncate" }, "chat " + b.chat_id)),
-        h("button", {
-          class: "btn icon", title: `Remove ${b.name}`, "aria-label": `Remove ${b.name}`,
-          onclick: () => removeBot(channel, b.name),
-        }, "\u00d7"))))
-      : h("p", { class: "muted small" }, "None. The server sends to a bot itself, so there is nothing to approve."),
-    h("form", {
-      class: "stack",
-      onsubmit: async (e) => {
-        e.preventDefault();
-        err.hidden = true;
-        add.disabled = true;
-        add.textContent = "Checking\u2026";
-        try {
-          await api("POST", `/api/channels/${enc(channel)}/bots`, {
-            name: bot.value.trim(), chat_id: chat.value.trim(),
-            token: token.value.trim(), from_start: history.checked,
-          });
-          bot.value = chat.value = token.value = "";
-          history.checked = false;
-          toast("Bot added. What is posted here goes to that chat.");
-          await loadBots(channel);
-        } catch (ex) {
-          if (ex.status === 401) return handleError(ex);
-          err.textContent = ex.message;
-          err.hidden = false;
-        } finally {
-          add.disabled = false;
-          add.textContent = "Add bot";
-        }
-      },
-    },
-      field("Name", bot, "What to call it here."),
-      field("Chat ID", chat, "Where the message goes."),
-      field("Bot token", token, "From @BotFather. Kept by the server to send with."),
-      h("label", { class: "check small" }, history, "Also send retained history"),
-      err,
-      add));
+  openDialog("Add a Telegram bot",
+    [h("p", { class: "muted small" },
+      "A welcome message is sent to prove the ID and token work. The bot is only "
+      + "created if it arrives."),
+     field("Name", name, "What to call it here."),
+     field("Bot ID", chat, "The chat the message goes to."),
+     field("Bot token", token, "From @BotFather."),
+     err],
+    [cancel(), create],
+    async (dlg) => {
+      err.hidden = true;
+      create.disabled = true;
+      create.textContent = "Sending a test\u2026";
+      try {
+        const made = await api("POST", "/api/bots", {
+          name: name.value.trim(), chat_id: chat.value.trim(), token: token.value.trim(),
+        });
+        dlg.close();
+        toast(`${made.name} is connected. Add it to a channel to start receiving.`);
+        await refreshAll();
+        go("#/workers");
+      } catch (ex) {
+        if (ex.status === 401) return handleError(ex);
+        err.textContent = ex.status === 400
+          ? "Invalid ID and token: Telegram would not deliver a message with them."
+          : ex.message;
+        err.hidden = false;
+      } finally {
+        create.disabled = false;
+        create.textContent = "Create";
+      }
+    });
+  name.focus();
 }
 
-async function loadBots(channel) {
+async function removeBot(name) {
+  if (!confirm(`Remove ${name}?\n\nIt stops receiving from every channel it is in.`)) return;
   try {
-    const bots = await api("GET", `/api/channels/${enc(channel)}/bots`);
-    state.bots = Array.isArray(bots) ? bots : [];
-  } catch {
-    state.bots = [];           // an older relay has no bots; an empty list is the truth
-  }
-  const el = $("#members");
-  if (el) el.dataset.shape = "";          // the panel must be rebuilt, not skipped
-  renderMembers();
-}
-
-async function removeBot(channel, name) {
-  if (!confirm(`Remove ${name} from #${channel}?\n\nIt stops receiving what is posted here.`)) return;
-  try {
-    await api("DELETE", `/api/channels/${enc(channel)}/bots/${enc(name)}`);
+    await api("DELETE", "/api/bots/" + enc(name));
     toast(`Removed ${name}`);
-    await loadBots(channel);
+    await refreshAll();
+  } catch (err) { handleError(err); }
+}
+
+async function addBotMember(channel, bot, fromStart) {
+  try {
+    await api("PUT", `/api/channels/${enc(channel)}/bots/${enc(bot)}`, { from_start: fromStart });
+    await refreshAll();
+    renderMembers();
+  } catch (err) { handleError(err); }
+}
+
+async function removeBotMember(channel, bot) {
+  try {
+    await api("DELETE", `/api/channels/${enc(channel)}/bots/${enc(bot)}`);
+    await refreshAll();
+    renderMembers();
   } catch (err) { handleError(err); }
 }
 
@@ -1034,8 +1043,6 @@ async function renderChannelView(name) {
   renderMembers();
 
   state.feed = { channel: name, messages: [], hasOlder: false };
-  state.bots = [];
-  loadBots(name);
   try {
     const page = await api("GET", `/api/channels/${enc(name)}/messages?limit=${PAGE}`);
     if (state.feed.channel !== name) return;             // navigated away meanwhile
@@ -1065,11 +1072,13 @@ function renderMembers() {
   const ch = currentChannel();
   if (!el || !ch) return;
   const others = state.workers.filter((w) => !ch.members.includes(w.worker_id));
+  const inChannel = state.bots.filter((b) => (b.channels || []).includes(ch.name));
+  const freeBots = state.bots.filter((b) => !(b.channels || []).includes(ch.name));
 
   // Rebuilding this while it is being used throws away a chosen worker and a
   // ticked box, so when nothing about it has changed only the list is redrawn.
   const shape = `${ch.name}|${others.map((w) => w.worker_id).join(",")}`
-    + `|${state.bots.map((b) => b.name).join(",")}`;
+    + `|${state.bots.map((b) => b.name + ":" + (b.channels || []).join("+")).join(",")}`;
   if (el.dataset.shape === shape) return renderMemberList();
   el.dataset.shape = shape;
   const select = h("select", { "aria-label": "Worker to add" }, others.map((w) => h("option", { value: w.worker_id }, w.worker_id)));
@@ -1078,14 +1087,37 @@ function renderMembers() {
   el.replaceChildren(
     h("h2", {}, "Members"),
     h("div", { id: "member-list" }),
-    botsSection(ch.name),
+
+    // A bot in a channel is a member of it, so it is listed as one.
+    inChannel.length ? h("h2", {}, "Telegram bots") : false,
+    inChannel.length
+      ? h("div", { id: "bot-list" }, inChannel.map((b) => h("div", { class: "member" },
+        h("span", { class: "bot-dot", title: "The server sends to this chat" }),
+        h("div", { class: "grow" },
+          h("div", { class: "strong truncate" }, b.name),
+          h("div", { class: "muted small truncate" }, "chat " + b.chat_id)),
+        h("button", {
+          class: "btn icon", title: `Remove ${b.name} from this channel`,
+          "aria-label": `Remove ${b.name} from this channel`,
+          onclick: () => removeBotMember(ch.name, b.name),
+        }, "\u00d7"))))
+      : false,
+    freeBots.length ? h("h2", {}, "Add a bot") : false,
+    freeBots.length
+      ? h("div", { class: "stack" }, freeBots.map((b) => h("button", {
+        class: "btn small", onclick: () => addBotMember(ch.name, b.name, false),
+      }, `Add ${b.name}`)))
+      : false,
+
     h("h2", {}, "Add member"),
     others.length
       ? h("form", { class: "stack", onsubmit: (e) => { e.preventDefault(); addMember(ch.name, select.value, history.checked); } },
         select,
         h("label", { class: "check small" }, history, "Also deliver retained history"),
         h("button", { class: "btn", type: "submit" }, "Add to channel"))
-      : h("p", { class: "muted small" }, state.workers.length ? "Every worker is already a member." : h("a", { href: "#/workers" }, "Register a worker first.")));
+      : h("p", { class: "muted small" }, state.workers.length
+        ? "Every worker is already a member."
+        : h("a", { href: "#/workers" }, "Point a worker at this workspace, or add a bot.")));
   renderMemberList();
 }
 

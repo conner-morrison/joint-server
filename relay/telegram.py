@@ -33,6 +33,13 @@ LINK_KEYS = ("upworkUrl", "inviteUrl", "url", "link")
 JD_KEYS = ("description", "jobDescription", "jd", "snippet", "summary", "details", "text")
 INVITATION_WORDS = ("invit", "interview", "asked you to apply", "wants to interview")
 
+# Sent when a bot is registered. It is the test as well as the greeting: if
+# this arrives, the token and the chat id are both right, which is more than
+# asking Telegram whether the token exists would have proved.
+WELCOME = ("\u2705 <b>Connected</b>\n"
+           "This chat is now registered with your relay. "
+           "Add this bot to a channel and what arrives there will be sent here.")
+
 
 def esc(value: Any) -> str:
     """Telegram's HTML mode is real markup: an ampersand in a job title would

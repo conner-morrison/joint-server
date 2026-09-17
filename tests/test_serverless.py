@@ -556,6 +556,20 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         await self.call("POST", "/acme/api/channels", {"name": "jobs"}, token="p")
         return "acme"
 
+    async def register(self, name: str, chat_id: str, token: str = "1:abc",
+                       channel: str = "jobs", join: bool = True) -> None:
+        """Register a bot and put it in a channel. Creating it sends a welcome,
+        which is cleared so a test counts only what it published."""
+        status, body = await self.call("POST", "/acme/api/bots",
+                                       {"name": name, "chat_id": chat_id, "token": token},
+                                       token="p")
+        assert status == 201, body
+        if join:
+            status, _ = await self.call("PUT", f"/acme/api/channels/{channel}/bots/{name}",
+                                        {"from_start": False}, token="p")
+            assert status == 200
+        self.telegram.sent.clear()
+
     async def eventually(self, count: int, within: float = 8.0) -> None:
         deadline = time.monotonic() + within
         while time.monotonic() < deadline:
@@ -566,18 +580,20 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_bot_is_registered_without_anyone_approving_it(self) -> None:
         await self.ready()
-        status, body = await self.call("POST", "/acme/api/channels/jobs/bots",
+        status, body = await self.call("POST", "/acme/api/bots",
                                        {"name": "phone", "chat_id": "555", "token": "1:abc"},
                                        token="p")
-        self.assertEqual((status, body["added"]), (201, True))
+        self.assertEqual((status, body["name"]), (201, "phone"))
+        # Creating it proved it, by sending to it.
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn("Connected", self.telegram.sent[0]["text"])
         # Nothing is waiting: a bot is not a worker.
         _, pending = await self.call("GET", "/acme/api/pending", token="p")
         self.assertEqual(pending, [])
 
     async def test_the_server_sends_what_arrives(self) -> None:
         await self.ready()
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.register("phone", "555", "1:abc")
         await self.call("POST", "/acme/api/channels/jobs/messages",
                         {"body": {"type": "job", "title": "Build a scraper", "budget": "$500"}},
                         token="p")
@@ -589,8 +605,7 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_nothing_is_sent_twice(self) -> None:
         await self.ready()
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.register("phone", "555", "1:abc")
         for n in range(3):
             await self.call("POST", "/acme/api/channels/jobs/messages", {"body": {"n": n}},
                             token="p")
@@ -603,8 +618,7 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         everything it ever carried."""
         await self.ready()
         await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "old"}, token="p")
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.register("phone", "555", "1:abc")
         await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "new"}, token="p")
         await self.eventually(1)
         await asyncio.sleep(0.6)
@@ -613,8 +627,7 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_removed_bot_stops_receiving(self) -> None:
         await self.ready()
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.register("phone", "555", "1:abc")
         status, _ = await self.call("DELETE", "/acme/api/channels/jobs/bots/phone", token="p")
         self.assertEqual(status, 200)
         await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "after"}, token="p")
@@ -625,8 +638,7 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_listing_never_carries_the_token(self) -> None:
         await self.ready()
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "phone", "chat_id": "555", "token": "sup3rsecret"}, token="p")
+        await self.register("phone", "555", "sup3rsecret")
         _, bots = await self.call("GET", "/acme/api/channels/jobs/bots", token="p")
         self.assertEqual(bots[0]["name"], "phone")
         self.assertNotIn("sup3rsecret", json.dumps(bots))
@@ -635,29 +647,43 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         """A chat that refuses a message refuses it for ever. Retrying would
         stop every later alert behind one that can never go."""
         await self.ready()
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "gone", "chat_id": "404", "token": "1:abc"}, token="p")
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.register("gone", "404", "1:abc")
+        await self.register("phone", "555", "1:abc")
         self.telegram.reject.add("404")
         await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "one"}, token="p")
         await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "two"}, token="p")
         await self.eventually(2)
         self.assertEqual({s["chat_id"] for s in self.telegram.sent}, {"555"})
 
-    async def test_a_bad_token_is_refused_while_the_form_is_open(self) -> None:
+    async def test_a_bad_pair_is_refused_and_nothing_is_created(self) -> None:
         await self.ready()
         status, body = await self.call(
-            "POST", "/acme/api/channels/jobs/bots",
+            "POST", "/acme/api/bots",
             {"name": "phone", "chat_id": "555", "token": "bad"}, token="p")
-        self.assertEqual(status, 400)
-        self.assertIn("Telegram", body["detail"])
+        self.assertEqual((status, body["status"]), (400, "invalid_bot"))
+        self.assertIn("Telegram", body["message"])
+        # Nothing was stored, so a bad pair leaves no half-made bot behind.
+        _, bots = await self.call("GET", "/acme/api/bots", token="p")
+        self.assertEqual(bots, [])
+
+    async def test_a_good_token_with_a_wrong_chat_is_refused(self) -> None:
+        """The failure worth catching. A bad token is obvious; a chat id that
+        is one digit out looks fine and then silently delivers to nobody, so
+        creating a bot sends to it rather than only asking whether the token
+        is real."""
+        await self.ready()
+        self.telegram.reject.add("999")
+        status, body = await self.call("POST", "/acme/api/bots",
+                                       {"name": "typo", "chat_id": "999", "token": "1:abc"},
+                                       token="p")
+        self.assertEqual((status, body["status"]), (400, "invalid_bot"))
+        _, bots = await self.call("GET", "/acme/api/bots", token="p")
+        self.assertEqual(bots, [])
 
     async def test_bots_belong_to_their_channel(self) -> None:
         await self.ready()
         await self.call("POST", "/acme/api/channels", {"name": "quiet"}, token="p")
-        await self.call("POST", "/acme/api/channels/jobs/bots",
-                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.register("phone", "555", "1:abc")
         await self.call("POST", "/acme/api/channels/quiet/messages", {"body": "elsewhere"},
                         token="p")
         await asyncio.sleep(1.2)

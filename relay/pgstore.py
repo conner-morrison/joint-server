@@ -83,25 +83,36 @@ CREATE TABLE IF NOT EXISTS members (
 CREATE INDEX IF NOT EXISTS members_worker ON members(workspace, worker_id);
 
 -- Somewhere the server itself delivers to. Not a worker: nothing connects, so
--- there is nobody to approve and no token to hand out. Registering one is an
--- act of administration, like adding a member, and it is removed the same way.
+-- there is nobody to approve and no token to hand out. A bot is registered
+-- once for the workspace and then added to channels, exactly as a worker is.
 --
--- The bot's own token is kept as it is, because sending requires it in full.
--- It is a credential belonging to a service, not to a person, and whoever can
--- read this table can already read every message it would forward.
-CREATE TABLE IF NOT EXISTS channel_bots (
-    workspace   TEXT NOT NULL,
-    channel     TEXT NOT NULL,
-    name        TEXT NOT NULL,              -- what it is called in the members list
+-- Its token is kept as it is, because sending requires it in full. It is a
+-- credential belonging to a service, not to a person, and whoever can read
+-- this table can already read every message it would forward.
+CREATE TABLE IF NOT EXISTS bots (
+    workspace   TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
     kind        TEXT NOT NULL DEFAULT 'telegram',
     chat_id     TEXT NOT NULL,
     bot_token   TEXT NOT NULL,
-    cursor      BIGINT NOT NULL,            -- delivered up to here, as for a worker
+    label       TEXT NOT NULL DEFAULT '',     -- what Telegram calls the bot
     created_at  DOUBLE PRECISION NOT NULL,
-    PRIMARY KEY (workspace, channel, name),
-    FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE
+    PRIMARY KEY (workspace, name)
 );
-CREATE INDEX IF NOT EXISTS channel_bots_pending ON channel_bots(workspace, channel, cursor);
+
+-- Which channels a bot is in, and how far it has been sent. The same shape as
+-- a worker's membership, because it means the same thing.
+CREATE TABLE IF NOT EXISTS bot_members (
+    workspace   TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    bot         TEXT NOT NULL,
+    cursor      BIGINT NOT NULL,
+    joined_at   DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (workspace, channel, bot),
+    FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE,
+    FOREIGN KEY (workspace, bot) REFERENCES bots(workspace, name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS bot_members_pending ON bot_members(workspace, channel, cursor);
 
 CREATE TABLE IF NOT EXISTS messages (
     seq         BIGSERIAL PRIMARY KEY,
@@ -258,24 +269,26 @@ class PgStore:
 
     # --- bot delivery, across every workspace ----------------------------
     async def bots_with_work(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Registered bots that have something waiting. Asked deployment-wide
-        because the sender is one loop for the whole server, not one per
-        workspace."""
+        """Bot memberships that have something waiting. Asked deployment-wide,
+        because the sender is one loop for the whole server rather than one
+        per workspace."""
         return await self._all("""
-            SELECT b.workspace, b.channel, b.name, b.kind, b.chat_id, b.bot_token, b.cursor
-              FROM channel_bots b
-             WHERE EXISTS (SELECT 1 FROM messages m
-                            WHERE m.workspace = b.workspace AND m.channel = b.channel
-                              AND m.seq > b.cursor)
-             ORDER BY b.cursor
+            SELECT m.workspace, m.channel, m.bot AS name, m.cursor,
+                   b.kind, b.chat_id, b.bot_token
+              FROM bot_members m JOIN bots b
+                ON b.workspace = m.workspace AND b.name = m.bot
+             WHERE EXISTS (SELECT 1 FROM messages g
+                            WHERE g.workspace = m.workspace AND g.channel = m.channel
+                              AND g.seq > m.cursor)
+             ORDER BY m.cursor
              LIMIT %s""", (limit,))
 
     async def bot_ack(self, workspace: str, channel: str, name: str, seq: int) -> None:
-        """Advance a bot's cursor. Never backwards, so a redelivery cannot undo
-        what was already sent."""
+        """Advance a bot's cursor on one channel. Never backwards, so a
+        redelivery cannot undo what was already sent."""
         await self._run("""
-            UPDATE channel_bots SET cursor = GREATEST(cursor, %s)
-             WHERE workspace = %s AND channel = %s AND name = %s""",
+            UPDATE bot_members SET cursor = GREATEST(cursor, %s)
+             WHERE workspace = %s AND channel = %s AND bot = %s""",
             (seq, workspace, channel, name))
 
     async def prune(self, before_ts: float) -> int:
@@ -491,39 +504,66 @@ class WorkspaceStore:
             (seq, self.slug, channel, worker_id))
 
     # --- bots ------------------------------------------------------------
-    async def add_bot(self, channel: str, name: str, chat_id: str, bot_token: str, *,
-                      from_start: bool = False) -> None:
-        """Register somewhere the server delivers to. Starts at the head, like
-        a new member: joining a channel is not a request for its history."""
+    # Registered once for the workspace, then added to channels like a worker.
+    async def add_bot(self, name: str, chat_id: str, bot_token: str, label: str = "") -> None:
         check_name("bot", name)
         if not chat_id or not bot_token:
             raise ValueError("a bot needs a chat id and a token")
-        if not await self.channel_exists(channel):
-            raise LookupError(f"no channel {channel!r}")
-        cursor = 0 if from_start else await self.head()
         try:
-            await self.store._run("""
-                INSERT INTO channel_bots(workspace, channel, name, kind, chat_id, bot_token,
-                                         cursor, created_at)
-                VALUES (%s, %s, %s, 'telegram', %s, %s, %s, %s)""",
-                (self.slug, channel, name, chat_id, bot_token, cursor, time.time()))
+            await self.store._run(
+                "INSERT INTO bots(workspace, name, kind, chat_id, bot_token, label, created_at) "
+                "VALUES (%s, %s, 'telegram', %s, %s, %s, %s)",
+                (self.slug, name, chat_id, bot_token, label, time.time()))
         except errors.UniqueViolation:
-            raise ValueError(f"channel {channel!r} already has a bot called {name!r}") from None
+            raise ValueError(f"bot {name!r} already exists") from None
 
-    async def list_bots(self, channel: str | None = None) -> list[dict[str, Any]]:
+    async def list_bots(self) -> list[dict[str, Any]]:
         """Never the token. It is needed to send and nowhere else, so it does
         not travel to a console that only wants to list what is registered."""
-        where = "WHERE workspace = %s" + (" AND channel = %s" if channel else "")
-        args: tuple[Any, ...] = (self.slug, channel) if channel else (self.slug,)
         rows = await self.store._all(
-            f"SELECT channel, name, kind, chat_id, created_at FROM channel_bots {where} "
-            "ORDER BY channel, name", args)
-        return rows
+            "SELECT name, kind, chat_id, label, created_at FROM bots WHERE workspace = %s "
+            "ORDER BY name", (self.slug,))
+        channels: dict[str, list[str]] = {}
+        for m in await self.store._all(
+                "SELECT bot, channel FROM bot_members WHERE workspace = %s ORDER BY channel",
+                (self.slug,)):
+            channels.setdefault(m["bot"], []).append(m["channel"])
+        return [{**r, "channels": channels.get(r["name"], [])} for r in rows]
 
-    async def remove_bot(self, channel: str, name: str) -> bool:
+    async def bot_exists(self, name: str) -> bool:
+        return await self.store._one("SELECT 1 FROM bots WHERE workspace = %s AND name = %s",
+                                     (self.slug, name)) is not None
+
+    async def remove_bot(self, name: str) -> bool:
+        return await self.store._run("DELETE FROM bots WHERE workspace = %s AND name = %s",
+                                     (self.slug, name)) > 0
+
+    async def join_bot(self, channel: str, bot: str, *, from_start: bool = False) -> bool:
+        """Add a bot to a channel. Starts at the head, like any new member:
+        joining is not a request for what the channel already carried."""
+        if not await self.channel_exists(channel):
+            raise LookupError(f"no channel {channel!r}")
+        if not await self.bot_exists(bot):
+            raise LookupError(f"no bot {bot!r}")
+        cursor = 0 if from_start else await self.head()
+        return await self.store._run("""
+            INSERT INTO bot_members(workspace, channel, bot, cursor, joined_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (workspace, channel, bot) DO NOTHING""",
+            (self.slug, channel, bot, cursor, time.time())) > 0
+
+    async def leave_bot(self, channel: str, bot: str) -> bool:
         return await self.store._run(
-            "DELETE FROM channel_bots WHERE workspace = %s AND channel = %s AND name = %s",
-            (self.slug, channel, name)) > 0
+            "DELETE FROM bot_members WHERE workspace = %s AND channel = %s AND bot = %s",
+            (self.slug, channel, bot)) > 0
+
+    async def bots_of(self, channel: str) -> list[dict[str, Any]]:
+        return await self.store._all("""
+            SELECT b.name, b.chat_id, b.label
+              FROM bot_members m JOIN bots b
+                ON b.workspace = m.workspace AND b.name = m.bot
+             WHERE m.workspace = %s AND m.channel = %s
+             ORDER BY b.name""", (self.slug, channel))
 
     # --- messages --------------------------------------------------------
     async def append(self, channel: str, sender: str, body: Any, client_id: str | None = None, *,
