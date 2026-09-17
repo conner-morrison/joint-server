@@ -1,10 +1,14 @@
 .git
 .venv
 tests
-examples
+# examples/ is copied into the image: the same image run with a different
+# start command is a worker. Excluding it here made COPY fail, and the build
+# with it.
 relay.db
 relay.db-*
 mailer-state.json
+proposal-bridge.json
+telegram-alerts.json
 **/__pycache__
 *.egg-info
 .env
