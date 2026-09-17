@@ -1135,8 +1135,11 @@ function httpUrl(value) {
   }
 }
 
-const FACTS = [["Budget", "budget"], ["Published", "published"], ["Posted", "posted"],
-               ["Skills", "skills"]];
+const FACTS = [["Budget", "budget"], ["Terms", "terms"], ["Published", "published"],
+               ["Posted", "posted"], ["Skills", "skills"]];
+
+// Every field a publisher might put a link in. An invitation carries its own.
+const LINK_KEYS = ["upworkUrl", "inviteUrl", "url", "link"];
 
 // What is worth knowing about whoever posted the job, in the order it is worth
 // reading. A field the publisher did not send is simply absent: none of this
@@ -1156,7 +1159,7 @@ const CLIENT_FIELDS = [
 // Where a job description might be called home, most specific first.
 const JD_KEYS = ["description", "jobDescription", "jd", "snippet", "summary", "details", "text"];
 
-const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, "title", "url", "link", "upworkUrl",
+const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, ...LINK_KEYS, "title",
                        "type", "source", "index", "emailId", "receivedAt",
                        "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
 
@@ -1208,17 +1211,22 @@ function clientBlock(body) {
     rows.length ? h("dl", { class: "client-facts" }, rows) : false);
 }
 
-// A body with a title reads as something worth showing as itself rather than
-// as JSON. Everything else still falls through to the JSON it always was.
+// A title is what makes something worth showing as itself rather than as
+// JSON. Anything more is a bonus: requiring a known shape meant a message
+// arranged even slightly differently - an invitation, say - arrived as
+// punctuation, which is the one presentation nobody wants.
 function looksLikeJob(body) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
-  if (typeof body.title !== "string" || !body.title.trim()) return false;
-  return body.type === "job" || FACTS.some(([, key]) => body[key])
-    || Boolean(body.url || body.link || body.upworkUrl);
+  return Boolean(body && typeof body === "object" && !Array.isArray(body)
+    && typeof body.title === "string" && body.title.trim());
+}
+
+function when(value) {
+  const at = new Date(value);
+  return Number.isNaN(at.getTime()) ? String(value) : at.toLocaleString();
 }
 
 function jobCard(body) {
-  const link = httpUrl(body.upworkUrl || body.url || body.link);
+  const link = httpUrl(LINK_KEYS.map((key) => body[key]).find(Boolean));
   // The description is the longest thing here and the least often wanted, so
   // it is behind a button: a list of jobs should stay a list.
   const jd = jdOf(body);
@@ -1234,6 +1242,9 @@ function jobCard(body) {
     .filter(([, key]) => body[key] !== undefined && body[key] !== null && body[key] !== "")
     .map(([label, key]) => h("span", { class: "fact" },
       h("b", {}, label), String(Array.isArray(body[key]) ? body[key].join(", ") : body[key])));
+  if (body.receivedAt) {
+    facts.push(h("span", { class: "fact" }, h("b", {}, "Received"), when(body.receivedAt)));
+  }
   // Whatever the publisher sent that this does not have a place for. Hidden,
   // but never dropped: a body is the worker's, not the console's, to decide.
   const rest = Object.fromEntries(Object.entries(body).filter(([key]) => !SHOWN.has(key)));

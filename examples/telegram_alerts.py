@@ -23,11 +23,15 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 TELEGRAM_LIMIT = 4096                     # characters in one message
-FACTS = [("Budget", "budget"), ("Published", "published"), ("Posted", "posted")]
+FACTS = [("Budget", "budget"), ("Terms", "terms"), ("Published", "published"),
+         ("Posted", "posted")]
+# Every field a publisher might put a link in. An invitation carries its own.
+LINK_KEYS = ("upworkUrl", "inviteUrl", "url", "link")
 CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment", "paymentVerified"),
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
@@ -86,6 +90,14 @@ def source_tag(body: dict[str, Any]) -> str:
     return esc(source.replace("-", " ").replace("_", " ")) if source else ""
 
 
+def when(value: Any) -> str:
+    """An ISO timestamp read back as something a person would say."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%d %b %H:%M")
+    except ValueError:
+        return str(value)
+
+
 def as_telegram(body: Any) -> str:
     """One alert, formatted for a phone: what it is, what it pays, who is
     asking, and a way in. Long descriptions are cut, because a notification
@@ -94,7 +106,7 @@ def as_telegram(body: Any) -> str:
         return f"<pre>{esc(json.dumps(body, indent=2, ensure_ascii=False)[:1000])}</pre>"
 
     title = esc(body.get("title") or "New alert")
-    link = http_url(body.get("upworkUrl") or body.get("url") or body.get("link"))
+    link = http_url(next((body[k] for k in LINK_KEYS if body.get(k)), None))
     lines = []
     tag = source_tag(body)
     if tag:
@@ -102,6 +114,8 @@ def as_telegram(body: Any) -> str:
     lines.append(f'<b><a href="{esc(link)}">{title}</a></b>' if link else f"<b>{title}</b>")
 
     facts = [f"{label}: <b>{esc(body[key])}</b>" for label, key in FACTS if body.get(key)]
+    if body.get("receivedAt"):
+        facts.append(esc(when(body["receivedAt"])))
     if facts:
         lines.append(" · ".join(facts))
 
