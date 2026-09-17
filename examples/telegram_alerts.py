@@ -17,6 +17,7 @@ import argparse
 import html
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -31,6 +32,7 @@ CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment", "paymentVer
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
 JD_KEYS = ("description", "jobDescription", "jd", "snippet", "summary", "details", "text")
+INVITATION_RE = re.compile(r"\binvit|\binterview\b|asked you to apply|wants to interview", re.I)
 
 
 def http(method: str, url: str, body: Any = None, token: str = "", timeout: float = 60.0
@@ -69,7 +71,13 @@ def source_tag(body: dict[str, Any]) -> str:
     reading now and a search result is worth reading later."""
     source = str(body.get("source") or "").lower()
     kind = str(body.get("type") or "").lower()
-    if kind == "invitation" or "invit" in source:
+    # Also read the subject: a message labelled before the rule was corrected
+    # is still an invitation, and nothing is going to re-send it.
+    # Only where nothing better is known: a parsed job is a job however it is
+    # worded, and "interview scheduling app" is a job title.
+    said = f"{body.get('title') or ''} {body.get('emailSubject') or ''}"
+    guessable = kind != "job" and not source.startswith("vollna")
+    if kind == "invitation" or "invit" in source or (guessable and INVITATION_RE.search(said)):
         return "\U0001f4e9 <b>INVITATION</b>"
     if source.startswith("vollna"):
         return "\U0001f50e Vollna"

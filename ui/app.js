@@ -1256,12 +1256,28 @@ function jobCard(body) {
 // said on every message rather than left inside the body for someone to open.
 // An invitation is the one worth interrupting someone for: it means a client
 // asked, rather than that a search matched.
+const INVITATION_RE = /\binvit|\binterview\b|asked you to apply|wants to interview/i;
+
+// What the sender said it was, and failing that what it says it is. Messages
+// already stored were labelled by whatever rule was current when they arrived,
+// so reading the subject as well means a rule fixed later still applies to
+// them: nothing has to be re-sent to be classified correctly.
+function looksLikeInvitation(body) {
+  // Only where nothing better is known. A parsed job is a job however it is
+  // worded, and "Build an interview scheduling app" is a job title, not an
+  // invitation to interview.
+  const type = String(body.type || "").toLowerCase();
+  const source = String(body.source || "").toLowerCase();
+  if (type === "job" || source.startsWith("vollna")) return false;
+  return INVITATION_RE.test(`${body.title || ""} ${body.emailSubject || ""}`);
+}
+
 function sourceTag(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   const source = String(body.source || "").toLowerCase();
   const type = String(body.type || "").toLowerCase();
 
-  if (type === "invitation" || source.includes("invit")) {
+  if (type === "invitation" || source.includes("invit") || looksLikeInvitation(body)) {
     return h("span", { class: "src invite", title: "A client invited you to apply" }, "Invitation");
   }
   if (source.startsWith("vollna")) return h("span", { class: "src" }, "Vollna");

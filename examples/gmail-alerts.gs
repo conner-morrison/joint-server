@@ -17,12 +17,19 @@
  */
 
 // Each source is searched separately, so one sender changing its format or
-// stopping cannot quietly take the others with it.
+// stopping cannot quietly take the others with it. Upwork mail is fetched in
+// one search and sorted afterwards: Gmail matches whole words, so a search for
+// `invit` finds neither "invitation" nor "invited", and splitting the two
+// kinds by search terms quietly mislabelled every invitation as a digest.
 const SOURCES = [
   { source: 'vollna', query: 'from:info@vollna.com newer_than:2d' },
-  { source: 'upwork-invitation', query: 'from:upwork.com newer_than:2d subject:(invit OR interview)' },
-  { source: 'upwork-alert', query: 'from:upwork.com newer_than:2d -subject:(invit OR interview)' },
+  { source: 'upwork', query: 'from:upwork.com newer_than:2d' },
 ];
+
+// An invitation says someone asked for you. A digest says a search matched.
+// Matched against the subject as a prefix, so invite, invited and invitation
+// are all one rule.
+const INVITATION_RE = /\binvit|\binterview\b|asked you to apply|wants to interview/i;
 
 const MAX_IDS = 600;          // remembered message ids, across all sources
 const MAX_TEXT = 4000;        // characters of an email body worth sending on
@@ -91,18 +98,20 @@ function checkMail() {
 
 /** One email: as separate jobs where they can be found, otherwise as itself. */
 function sendEmail_(source, m) {
+  const subject = m.getSubject() || '';
+  const invitation = source !== 'vollna' && INVITATION_RE.test(subject);
   const base = {
-    source: source,
+    source: invitation ? 'upwork-invitation' : source === 'upwork' ? 'upwork-alert' : source,
     emailId: m.getId(),
-    emailSubject: m.getSubject(),
+    emailSubject: subject,
     receivedAt: m.getDate().toISOString(),
   };
   const jobs = source === 'vollna' ? parseJobs_(m.getBody()) : [];
   const bodies = jobs.length
     ? jobs.map((j, i) => Object.assign({}, base, { type: 'job', index: i }, j))
     : [Object.assign({}, base, {
-        type: source === 'upwork-invitation' ? 'invitation' : 'email',
-        title: m.getSubject(),
+        type: invitation ? 'invitation' : 'email',
+        title: subject,
         text: m.getPlainBody().slice(0, MAX_TEXT),
       })];
 
