@@ -198,6 +198,20 @@ also keeps the database off the internet, and its traffic off the egress bill.
 Pushing to `main` rebuilds and redeploys, the console included, since the
 console is part of the image.
 
+**A worker as a second service.** The image carries `examples/` too, so the
+same repository deployed again with a different start command is a worker that
+runs where the relay does rather than on somebody's laptop:
+
+```
+Start command   python examples/telegram_alerts.py --channel jobs
+Variables       RELAY_URL, RELAY_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+```
+
+Set `RELAY_TOKEN` yourself. A container keeps no disk, so a worker that
+invents its own token comes back after every deploy as a stranger waiting to be
+approved again; given one, it is the same worker each time. It prints the token
+it made if you do not set one.
+
 **Render.** `render.yaml` describes the same service; import it as a Blueprint
 and set `DATABASE_URL` in the dashboard. A free instance sleeps when idle, so
 a worker's poll waits for it to wake.

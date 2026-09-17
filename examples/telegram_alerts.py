@@ -149,7 +149,15 @@ class Alerts:
         self.bot = f"{args.api_base.rstrip('/')}/bot{args.bot_token}"
         self.state_path = Path(args.state)
         self.state = self._load()
-        self.token = args.token or self.state.get("token") or secrets.token_urlsafe(32)
+        self.token = args.token or self.state.get("token")
+        if not self.token:
+            # Somewhere with no disk that survives - a container - loses this
+            # file on every deploy and would come back as a stranger needing
+            # approval again. Saying so once is cheaper than that surprise.
+            self.token = secrets.token_urlsafe(32)
+            say("no token given, so one was made. To keep this worker's identity "
+                "across restarts, set RELAY_TOKEN to:")
+            say(f"    {self.token}")
         self.state["token"] = self.token
         self._save()
 

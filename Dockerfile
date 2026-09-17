@@ -10,6 +10,10 @@ COPY app.py ./
 # The console is part of the server now: it is served from the same origin as
 # the API, which is what makes /acme both a page and a relay.
 COPY ui ./ui
+# The workers too, so the same image can be deployed again with a different
+# start command: one service serves the relay, another watches a channel and
+# sends what arrives somewhere. They share nothing but the image.
+COPY examples ./examples
 RUN pip install --no-cache-dir . "uvicorn[standard]>=0.30"
 
 # The host says which port to listen on; 8000 is only a fallback for running
