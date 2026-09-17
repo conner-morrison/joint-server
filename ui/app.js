@@ -1252,13 +1252,39 @@ function jobCard(body) {
       : false);
 }
 
+// Where an alert came from decides how much attention it deserves, so it is
+// said on every message rather than left inside the body for someone to open.
+// An invitation is the one worth interrupting someone for: it means a client
+// asked, rather than that a search matched.
+function sourceTag(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const source = String(body.source || "").toLowerCase();
+  const type = String(body.type || "").toLowerCase();
+
+  if (type === "invitation" || source.includes("invit")) {
+    return h("span", { class: "src invite", title: "A client invited you to apply" }, "Invitation");
+  }
+  if (source.startsWith("vollna")) return h("span", { class: "src" }, "Vollna");
+  if (source.startsWith("upwork")) return h("span", { class: "src" }, "Upwork");
+  if (!source) return null;
+  return h("span", { class: "src" }, source.replace(/[-_]+/g, " "));
+}
+
 function messageBody(body) {
   if (looksLikeJob(body)) return jobCard(body);
   const isPlain = body && typeof body === "object" && !Array.isArray(body)
     && typeof body.text === "string";
   if (isPlain) {
-    return h("div", {},
-      body.emailSubject ? h("div", { class: "job-title" }, body.emailSubject) : false,
+    // An alert that could not be split into jobs still has a subject, and
+    // dropping it leaves a paragraph with nothing saying what it is about.
+    const heading = body.title || body.emailSubject;
+    const link = httpUrl(body.upworkUrl || body.url || body.link);
+    return h("div", { class: "job" },
+      heading
+        ? (link
+          ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, heading)
+          : h("div", { class: "job-title" }, heading))
+        : false,
       h("p", { class: "msg-text" }, body.text));
   }
   return h("pre", {}, JSON.stringify(body, null, 2));
@@ -1269,7 +1295,8 @@ function messageRow(m) {
     h("div", { class: "msg-meta" },
       h("span", { class: "msg-sender" + (m.sender === "@server" ? " server" : "") }, m.sender),
       h("span", {}, "#" + m.seq),
-      h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts))),
+      h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts)),
+      sourceTag(m.body)),
     messageBody(m.body));
 }
 

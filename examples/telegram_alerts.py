@@ -64,6 +64,20 @@ def http_url(value: Any) -> str | None:
     return value if value.startswith(("http://", "https://")) else None
 
 
+def source_tag(body: dict[str, Any]) -> str:
+    """A line saying where this came from, because an invitation is worth
+    reading now and a search result is worth reading later."""
+    source = str(body.get("source") or "").lower()
+    kind = str(body.get("type") or "").lower()
+    if kind == "invitation" or "invit" in source:
+        return "\U0001f4e9 <b>INVITATION</b>"
+    if source.startswith("vollna"):
+        return "\U0001f50e Vollna"
+    if source.startswith("upwork"):
+        return "\U0001f4bc Upwork"
+    return esc(source.replace("-", " ").replace("_", " ")) if source else ""
+
+
 def as_telegram(body: Any) -> str:
     """One alert, formatted for a phone: what it is, what it pays, who is
     asking, and a way in. Long descriptions are cut, because a notification
@@ -73,7 +87,11 @@ def as_telegram(body: Any) -> str:
 
     title = esc(body.get("title") or "New alert")
     link = http_url(body.get("upworkUrl") or body.get("url") or body.get("link"))
-    lines = [f'<b><a href="{esc(link)}">{title}</a></b>' if link else f"<b>{title}</b>"]
+    lines = []
+    tag = source_tag(body)
+    if tag:
+        lines.append(tag)
+    lines.append(f'<b><a href="{esc(link)}">{title}</a></b>' if link else f"<b>{title}</b>")
 
     facts = [f"{label}: <b>{esc(body[key])}</b>" for label, key in FACTS if body.get(key)]
     if facts:
