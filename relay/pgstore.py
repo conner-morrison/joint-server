@@ -82,6 +82,27 @@ CREATE TABLE IF NOT EXISTS members (
 );
 CREATE INDEX IF NOT EXISTS members_worker ON members(workspace, worker_id);
 
+-- Somewhere the server itself delivers to. Not a worker: nothing connects, so
+-- there is nobody to approve and no token to hand out. Registering one is an
+-- act of administration, like adding a member, and it is removed the same way.
+--
+-- The bot's own token is kept as it is, because sending requires it in full.
+-- It is a credential belonging to a service, not to a person, and whoever can
+-- read this table can already read every message it would forward.
+CREATE TABLE IF NOT EXISTS channel_bots (
+    workspace   TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    name        TEXT NOT NULL,              -- what it is called in the members list
+    kind        TEXT NOT NULL DEFAULT 'telegram',
+    chat_id     TEXT NOT NULL,
+    bot_token   TEXT NOT NULL,
+    cursor      BIGINT NOT NULL,            -- delivered up to here, as for a worker
+    created_at  DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (workspace, channel, name),
+    FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS channel_bots_pending ON channel_bots(workspace, channel, cursor);
+
 CREATE TABLE IF NOT EXISTS messages (
     seq         BIGSERIAL PRIMARY KEY,
     workspace   TEXT NOT NULL,
@@ -234,6 +255,28 @@ class PgStore:
             return None
         row = await self._one("SELECT workspace, worker_id FROM workers WHERE token_hash = %s", (_hash(token),))
         return (row["workspace"], row["worker_id"]) if row else None
+
+    # --- bot delivery, across every workspace ----------------------------
+    async def bots_with_work(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Registered bots that have something waiting. Asked deployment-wide
+        because the sender is one loop for the whole server, not one per
+        workspace."""
+        return await self._all("""
+            SELECT b.workspace, b.channel, b.name, b.kind, b.chat_id, b.bot_token, b.cursor
+              FROM channel_bots b
+             WHERE EXISTS (SELECT 1 FROM messages m
+                            WHERE m.workspace = b.workspace AND m.channel = b.channel
+                              AND m.seq > b.cursor)
+             ORDER BY b.cursor
+             LIMIT %s""", (limit,))
+
+    async def bot_ack(self, workspace: str, channel: str, name: str, seq: int) -> None:
+        """Advance a bot's cursor. Never backwards, so a redelivery cannot undo
+        what was already sent."""
+        await self._run("""
+            UPDATE channel_bots SET cursor = GREATEST(cursor, %s)
+             WHERE workspace = %s AND channel = %s AND name = %s""",
+            (seq, workspace, channel, name))
 
     async def prune(self, before_ts: float) -> int:
         """Old messages, across every workspace."""
@@ -446,6 +489,41 @@ class WorkspaceStore:
                SET cursor = GREATEST(cursor, LEAST(%s, (SELECT COALESCE(MAX(seq), 0) FROM messages)))
              WHERE workspace = %s AND channel = %s AND worker_id = %s""",
             (seq, self.slug, channel, worker_id))
+
+    # --- bots ------------------------------------------------------------
+    async def add_bot(self, channel: str, name: str, chat_id: str, bot_token: str, *,
+                      from_start: bool = False) -> None:
+        """Register somewhere the server delivers to. Starts at the head, like
+        a new member: joining a channel is not a request for its history."""
+        check_name("bot", name)
+        if not chat_id or not bot_token:
+            raise ValueError("a bot needs a chat id and a token")
+        if not await self.channel_exists(channel):
+            raise LookupError(f"no channel {channel!r}")
+        cursor = 0 if from_start else await self.head()
+        try:
+            await self.store._run("""
+                INSERT INTO channel_bots(workspace, channel, name, kind, chat_id, bot_token,
+                                         cursor, created_at)
+                VALUES (%s, %s, %s, 'telegram', %s, %s, %s, %s)""",
+                (self.slug, channel, name, chat_id, bot_token, cursor, time.time()))
+        except errors.UniqueViolation:
+            raise ValueError(f"channel {channel!r} already has a bot called {name!r}") from None
+
+    async def list_bots(self, channel: str | None = None) -> list[dict[str, Any]]:
+        """Never the token. It is needed to send and nowhere else, so it does
+        not travel to a console that only wants to list what is registered."""
+        where = "WHERE workspace = %s" + (" AND channel = %s" if channel else "")
+        args: tuple[Any, ...] = (self.slug, channel) if channel else (self.slug,)
+        rows = await self.store._all(
+            f"SELECT channel, name, kind, chat_id, created_at FROM channel_bots {where} "
+            "ORDER BY channel, name", args)
+        return rows
+
+    async def remove_bot(self, channel: str, name: str) -> bool:
+        return await self.store._run(
+            "DELETE FROM channel_bots WHERE workspace = %s AND channel = %s AND name = %s",
+            (self.slug, channel, name)) > 0
 
     # --- messages --------------------------------------------------------
     async def append(self, channel: str, sender: str, body: Any, client_id: str | None = None, *,

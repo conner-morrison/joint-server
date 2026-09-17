@@ -28,7 +28,9 @@ from fastapi.responses import JSONResponse
 from psycopg import Error as PgError
 from pydantic import BaseModel
 
+from relay import telegram
 from relay.notify import Notifier, key as notify_key
+from relay.sender import BotSender
 from relay.pgstore import PgStore, WorkspaceStore, check_name, slugify
 
 SERVER_SENDER = "@server"
@@ -53,6 +55,13 @@ class ChannelIn(BaseModel):
 
 
 class JoinIn(BaseModel):
+    from_start: bool = False
+
+
+class BotIn(BaseModel):
+    name: str
+    chat_id: str
+    token: str
     from_start: bool = False
 
 
@@ -94,18 +103,23 @@ def redact(text: str) -> str:
     return re.sub(r"(?i)(postgres(?:ql)?://)[^\s\"\']*", r"\1...", text)
 
 
-def create_app(store: PgStore | None, notifier: Notifier | None = None) -> FastAPI:
+def create_app(store: PgStore | None, notifier: Notifier | None = None,
+               sender: BotSender | None = None) -> FastAPI:
     """`store` is None when the deployment has no database configured. The app
     still starts: it serves the console and says what is missing, because a
     process that refuses to start can only report a crash."""
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if sender is not None:
+            sender.start()
         # Nothing is opened here. A database that is down should fail the
         # request that needed it, not stop the console from loading.
         try:
             yield
         finally:
+            if sender is not None:
+                await sender.close()
             if notifier is not None:
                 await notifier.close()
             if store is not None:
@@ -209,6 +223,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None) -> FastA
             raise HTTPException(413, f"body is larger than {MAX_BODY_BYTES} bytes")
         seq, duplicate = await scoped.append(body.channel, worker_id, body.body, body.id)
         await scoped.touch_worker(worker_id)
+        if sender is not None and not duplicate:
+            sender.nudge()
         return {"seq": seq, "duplicate": duplicate, "worker_id": worker_id}
 
     @app.get("/{ws}/messages")
@@ -317,6 +333,37 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None) -> FastA
                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
         return {"left": await scoped.leave(name, worker_id)}
 
+    @app.get("/{ws}/api/channels/{name}/bots")
+    async def list_bots(name: str, scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
+        return await scoped.list_bots(name)
+
+    @app.post("/{ws}/api/channels/{name}/bots", status_code=201)
+    async def add_bot(name: str, body: BotIn,
+                      scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Checked against Telegram before it is stored, so a mistyped token is
+        a sentence on the form rather than silence and a line in a log."""
+        try:
+            who = await telegram.check(body.token)
+        except telegram.TelegramError as exc:
+            raise HTTPException(400, f"Telegram rejected that token: {exc}") from None
+        try:
+            await scoped.add_bot(name, body.name, body.chat_id, body.token,
+                                 from_start=body.from_start)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(409 if "already" in str(exc) else 400, str(exc)) from None
+        if sender is not None:
+            sender.nudge()
+        return {"name": body.name, "bot": who.get("username") or "", "added": True}
+
+    @app.delete("/{ws}/api/channels/{name}/bots/{bot}")
+    async def remove_bot(name: str, bot: str,
+                         scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.remove_bot(name, bot):
+            raise HTTPException(404, f"no bot {bot!r} on channel {name!r}")
+        return {"removed": True}
+
     @app.get("/{ws}/api/channels/{name}/messages")
     async def history(name: str, after: int | None = None, before: int | None = None, limit: int = 100,
                       scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
@@ -336,6 +383,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None) -> FastA
         if too_large(body.body):
             raise HTTPException(413, f"body is larger than {MAX_BODY_BYTES} bytes")
         seq, duplicate = await scoped.append(name, SERVER_SENDER, body.body, body.id)
+        if sender is not None and not duplicate:
+            sender.nudge()
         return {"seq": seq, "duplicate": duplicate}
 
     async def database_down(_: Request, exc: Exception) -> JSONResponse:

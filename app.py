@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from relay.notify import Notifier
 from relay.pgstore import PgStore
+from relay.sender import BotSender
 from relay.serverless import create_app
 
 # Vercel's own POSTGRES_URL is accepted, so a database added through the
@@ -38,8 +39,13 @@ UI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
 # pool is kept small and can be tuned without a code change.
 POOL_MAX = int(os.environ.get("RELAY_POOL_MAX", "3"))
 
-app = create_app(PgStore(DSN, max_size=POOL_MAX) if DSN else None,
-                 Notifier(DSN) if DSN else None)
+_store = PgStore(DSN, max_size=POOL_MAX) if DSN else None
+_notifier = Notifier(DSN) if DSN else None
+# The server delivers to registered bots itself, so a Telegram chat needs no
+# worker running anywhere and nobody has to approve it.
+_sender = BotSender(_store, _notifier) if _store else None
+
+app = create_app(_store, _notifier, _sender)
 
 # StaticFiles raises when its directory is absent, which would be a crash at
 # import for a missing folder. The console being unavailable is worth saying

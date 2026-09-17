@@ -19,6 +19,7 @@ const state = {
   online: new Set(),
   workspace: "",
   pending: [],
+  bots: [],
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
@@ -865,6 +866,85 @@ async function rejectWorker(workerId) {
   } catch (err) { handleError(err); }
 }
 
+// A bot is somewhere the server sends to, not something that connects. It is
+// listed beside the members because that is what it behaves like from here:
+// added to a channel, removed from it, receiving what is posted.
+function botsSection(channel) {
+  const bot = h("input", { type: "text", required: true, pattern: NAME_PATTERN, placeholder: "my-phone", autocomplete: "off", spellcheck: "false" });
+  const chat = h("input", { type: "text", required: true, placeholder: "8401438560", autocomplete: "off", spellcheck: "false" });
+  const token = h("input", { type: "password", required: true, placeholder: "123456:AA...", autocomplete: "off" });
+  const history = h("input", { type: "checkbox" });
+  const err = h("p", { class: "error", hidden: true });
+  const add = h("button", { class: "btn", type: "submit" }, "Add bot");
+
+  return h("div", {},
+    h("h2", {}, "Telegram bots"),
+    state.bots.length
+      ? h("div", { id: "bot-list" }, state.bots.map((b) => h("div", { class: "member" },
+        h("span", { class: "bot-dot", title: "Delivered to by the server" }),
+        h("div", { class: "grow" },
+          h("div", { class: "strong truncate" }, b.name),
+          h("div", { class: "muted small truncate" }, "chat " + b.chat_id)),
+        h("button", {
+          class: "btn icon", title: `Remove ${b.name}`, "aria-label": `Remove ${b.name}`,
+          onclick: () => removeBot(channel, b.name),
+        }, "\u00d7"))))
+      : h("p", { class: "muted small" }, "None. The server sends to a bot itself, so there is nothing to approve."),
+    h("form", {
+      class: "stack",
+      onsubmit: async (e) => {
+        e.preventDefault();
+        err.hidden = true;
+        add.disabled = true;
+        add.textContent = "Checking\u2026";
+        try {
+          await api("POST", `/api/channels/${enc(channel)}/bots`, {
+            name: bot.value.trim(), chat_id: chat.value.trim(),
+            token: token.value.trim(), from_start: history.checked,
+          });
+          bot.value = chat.value = token.value = "";
+          history.checked = false;
+          toast("Bot added. What is posted here goes to that chat.");
+          await loadBots(channel);
+        } catch (ex) {
+          if (ex.status === 401) return handleError(ex);
+          err.textContent = ex.message;
+          err.hidden = false;
+        } finally {
+          add.disabled = false;
+          add.textContent = "Add bot";
+        }
+      },
+    },
+      field("Name", bot, "What to call it here."),
+      field("Chat ID", chat, "Where the message goes."),
+      field("Bot token", token, "From @BotFather. Kept by the server to send with."),
+      h("label", { class: "check small" }, history, "Also send retained history"),
+      err,
+      add));
+}
+
+async function loadBots(channel) {
+  try {
+    const bots = await api("GET", `/api/channels/${enc(channel)}/bots`);
+    state.bots = Array.isArray(bots) ? bots : [];
+  } catch {
+    state.bots = [];           // an older relay has no bots; an empty list is the truth
+  }
+  const el = $("#members");
+  if (el) el.dataset.shape = "";          // the panel must be rebuilt, not skipped
+  renderMembers();
+}
+
+async function removeBot(channel, name) {
+  if (!confirm(`Remove ${name} from #${channel}?\n\nIt stops receiving what is posted here.`)) return;
+  try {
+    await api("DELETE", `/api/channels/${enc(channel)}/bots/${enc(name)}`);
+    toast(`Removed ${name}`);
+    await loadBots(channel);
+  } catch (err) { handleError(err); }
+}
+
 function openNewWorker() {
   const id = h("input", { type: "text", required: true, pattern: NAME_PATTERN, placeholder: "scout-1", autocomplete: "off", spellcheck: "false" });
   const label = h("input", { type: "text", placeholder: "Office PC, 2nd floor" });
@@ -954,6 +1034,8 @@ async function renderChannelView(name) {
   renderMembers();
 
   state.feed = { channel: name, messages: [], hasOlder: false };
+  state.bots = [];
+  loadBots(name);
   try {
     const page = await api("GET", `/api/channels/${enc(name)}/messages?limit=${PAGE}`);
     if (state.feed.channel !== name) return;             // navigated away meanwhile
@@ -986,7 +1068,8 @@ function renderMembers() {
 
   // Rebuilding this while it is being used throws away a chosen worker and a
   // ticked box, so when nothing about it has changed only the list is redrawn.
-  const shape = `${ch.name}|${others.map((w) => w.worker_id).join(",")}`;
+  const shape = `${ch.name}|${others.map((w) => w.worker_id).join(",")}`
+    + `|${state.bots.map((b) => b.name).join(",")}`;
   if (el.dataset.shape === shape) return renderMemberList();
   el.dataset.shape = shape;
   const select = h("select", { "aria-label": "Worker to add" }, others.map((w) => h("option", { value: w.worker_id }, w.worker_id)));
@@ -995,6 +1078,7 @@ function renderMembers() {
   el.replaceChildren(
     h("h2", {}, "Members"),
     h("div", { id: "member-list" }),
+    botsSection(ch.name),
     h("h2", {}, "Add member"),
     others.length
       ? h("form", { class: "stack", onsubmit: (e) => { e.preventDefault(); addMember(ch.name, select.value, history.checked); } },

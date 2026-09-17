@@ -19,9 +19,12 @@ import urllib.request
 from typing import Any
 
 import uvicorn
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from relay import telegram as telegram_module
 from relay.notify import Notifier
 from relay.pgstore import PgStore
+from relay.sender import BotSender
 from relay.serverless import create_app
 
 try:
@@ -453,3 +456,209 @@ class UnreachableDatabaseTest(unittest.IsolatedAsyncioTestCase):
         said = json.dumps(body)
         self.assertNotIn("sup3rsecret", said)
         self.assertNotIn("someone", said)
+
+
+class FakeTelegram(threading.Thread):
+    """Stands in for api.telegram.org, and records what it was asked to send."""
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.sent: list[dict[str, Any]] = []
+        self.reject: set[str] = set()          # chat ids to refuse permanently
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path.endswith("/getMe"):
+                    if "bad" in self.path:
+                        return self.reply(401, {"ok": False, "description": "Unauthorized"})
+                    return self.reply(200, {"ok": True, "result": {"username": "test_bot"}})
+                if str(payload.get("chat_id")) in outer.reject:
+                    return self.reply(400, {"ok": False, "description": "chat not found"})
+                outer.sent.append(payload)
+                self.reply(200, {"ok": True, "result": {"message_id": len(outer.sent)}})
+
+            def reply(self, code: int, body: Any) -> None:
+                raw = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", self.port), Handler)
+
+    def run(self) -> None:
+        self.server.serve_forever()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+
+
+class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    """A Telegram chat registered on a channel, delivered to by the server.
+
+    Nothing connects and nothing is approved: registering is administration,
+    like adding a member, and the server does the sending.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        assert _server is not None
+        cls.telegram = FakeTelegram()
+        cls.telegram.start()
+        cls.store = PgStore(_server.get_uri(), min_size=1, max_size=8)
+        cls.notifier = Notifier(_server.get_uri())
+        cls.sender = BotSender(cls.store, cls.notifier, api=cls.telegram.url, idle=0.2)
+        cls.app = LiveApp.__new__(LiveApp)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.app.port = s.getsockname()[1]
+        cls.app.url = f"http://127.0.0.1:{cls.app.port}"
+        app = create_app(cls.store, cls.notifier, cls.sender)
+        # The route checks the token against Telegram; point it at the stand-in.
+        telegram_module.API = cls.telegram.url
+        config = uvicorn.Config(app, host="127.0.0.1", port=cls.app.port,
+                                log_level="warning", timeout_graceful_shutdown=2)
+        cls.app.server = uvicorn.Server(config)
+        cls.app.thread = threading.Thread(target=cls.app.server.run, daemon=True)
+        cls.app.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.app.stop()
+        cls.telegram.stop()
+        telegram_module.API = "https://api.telegram.org"
+
+    def setUp(self) -> None:
+        assert _server is not None
+        _server.psql("TRUNCATE workspaces CASCADE;")
+        self.telegram.sent.clear()
+        self.telegram.reject.clear()
+
+    async def call(self, method: str, path: str, body: Any = None, token: str | None = None
+                   ) -> tuple[int, Any]:
+        return await ServerlessTest.call(self, method, path, body, token)  # type: ignore[arg-type]
+
+    async def ready(self) -> str:
+        status, body = await self.call("POST", "/api/workspaces",
+                                       {"name": "Acme", "password": "p"})
+        self.assertEqual(status, 201, body)
+        await self.call("POST", "/acme/api/channels", {"name": "jobs"}, token="p")
+        return "acme"
+
+    async def eventually(self, count: int, within: float = 8.0) -> None:
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if len(self.telegram.sent) >= count:
+                return
+            await asyncio.sleep(0.05)
+        self.fail(f"expected {count} sent, saw {len(self.telegram.sent)}")
+
+    async def test_a_bot_is_registered_without_anyone_approving_it(self) -> None:
+        await self.ready()
+        status, body = await self.call("POST", "/acme/api/channels/jobs/bots",
+                                       {"name": "phone", "chat_id": "555", "token": "1:abc"},
+                                       token="p")
+        self.assertEqual((status, body["added"]), (201, True))
+        # Nothing is waiting: a bot is not a worker.
+        _, pending = await self.call("GET", "/acme/api/pending", token="p")
+        self.assertEqual(pending, [])
+
+    async def test_the_server_sends_what_arrives(self) -> None:
+        await self.ready()
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.call("POST", "/acme/api/channels/jobs/messages",
+                        {"body": {"type": "job", "title": "Build a scraper", "budget": "$500"}},
+                        token="p")
+        await self.eventually(1)
+        said = self.telegram.sent[0]
+        self.assertEqual(said["chat_id"], "555")
+        self.assertIn("Build a scraper", said["text"])
+        self.assertIn("$500", said["text"])
+
+    async def test_nothing_is_sent_twice(self) -> None:
+        await self.ready()
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        for n in range(3):
+            await self.call("POST", "/acme/api/channels/jobs/messages", {"body": {"n": n}},
+                            token="p")
+        await self.eventually(3)
+        await asyncio.sleep(1.0)              # let the loop go round again
+        self.assertEqual(len(self.telegram.sent), 3)
+
+    async def test_history_before_registering_is_not_sent(self) -> None:
+        """Registering is joining, and joining a channel is not a request for
+        everything it ever carried."""
+        await self.ready()
+        await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "old"}, token="p")
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "new"}, token="p")
+        await self.eventually(1)
+        await asyncio.sleep(0.6)
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn("new", self.telegram.sent[0]["text"])
+
+    async def test_a_removed_bot_stops_receiving(self) -> None:
+        await self.ready()
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        status, _ = await self.call("DELETE", "/acme/api/channels/jobs/bots/phone", token="p")
+        self.assertEqual(status, 200)
+        await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "after"}, token="p")
+        await asyncio.sleep(1.5)
+        self.assertEqual(self.telegram.sent, [])
+        _, bots = await self.call("GET", "/acme/api/channels/jobs/bots", token="p")
+        self.assertEqual(bots, [])
+
+    async def test_a_listing_never_carries_the_token(self) -> None:
+        await self.ready()
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "phone", "chat_id": "555", "token": "sup3rsecret"}, token="p")
+        _, bots = await self.call("GET", "/acme/api/channels/jobs/bots", token="p")
+        self.assertEqual(bots[0]["name"], "phone")
+        self.assertNotIn("sup3rsecret", json.dumps(bots))
+
+    async def test_one_undeliverable_message_does_not_block_the_rest(self) -> None:
+        """A chat that refuses a message refuses it for ever. Retrying would
+        stop every later alert behind one that can never go."""
+        await self.ready()
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "gone", "chat_id": "404", "token": "1:abc"}, token="p")
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        self.telegram.reject.add("404")
+        await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "one"}, token="p")
+        await self.call("POST", "/acme/api/channels/jobs/messages", {"body": "two"}, token="p")
+        await self.eventually(2)
+        self.assertEqual({s["chat_id"] for s in self.telegram.sent}, {"555"})
+
+    async def test_a_bad_token_is_refused_while_the_form_is_open(self) -> None:
+        await self.ready()
+        status, body = await self.call(
+            "POST", "/acme/api/channels/jobs/bots",
+            {"name": "phone", "chat_id": "555", "token": "bad"}, token="p")
+        self.assertEqual(status, 400)
+        self.assertIn("Telegram", body["detail"])
+
+    async def test_bots_belong_to_their_channel(self) -> None:
+        await self.ready()
+        await self.call("POST", "/acme/api/channels", {"name": "quiet"}, token="p")
+        await self.call("POST", "/acme/api/channels/jobs/bots",
+                        {"name": "phone", "chat_id": "555", "token": "1:abc"}, token="p")
+        await self.call("POST", "/acme/api/channels/quiet/messages", {"body": "elsewhere"},
+                        token="p")
+        await asyncio.sleep(1.2)
+        self.assertEqual(self.telegram.sent, [])
