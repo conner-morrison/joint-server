@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
 import time
 from typing import Any
@@ -132,7 +133,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe
 """
 
 
-__all__ = ["PgStore", "WorkspaceStore", "SCHEMA", "NAME_RE", "check_name", "slugify"]
+__all__ = ["PgStore", "WorkspaceStore", "SCHEMA", "NAME_RE", "check_name", "slugify",
+           "ONLINE_WINDOW"]
+
+# How recently a worker must have been in touch to count as online.
+#
+# Nothing stays connected here: a worker holds one request at a time and opens
+# the next when it returns, so being online means having been heard from
+# lately rather than holding a socket. A worker waiting the full 25 seconds
+# touches this at least that often, and this leaves room for two of those to
+# be missed before it is called gone.
+ONLINE_WINDOW = float(os.environ.get("RELAY_ONLINE_WINDOW", "75"))
 
 
 def slugify(name: str) -> str:
@@ -344,8 +355,10 @@ class WorkspaceStore:
 
     async def list_workers(self) -> list[dict[str, Any]]:
         rows = await self.store._all(
-            "SELECT worker_id, label, created_at, last_seen FROM workers WHERE workspace = %s ORDER BY worker_id",
-            (self.slug,))
+            "SELECT worker_id, label, created_at, last_seen, "
+            "       (last_seen IS NOT NULL AND last_seen > %s) AS online "
+            "  FROM workers WHERE workspace = %s ORDER BY worker_id",
+            (time.time() - ONLINE_WINDOW, self.slug))
         channels: dict[str, list[str]] = {}
         for m in await self.store._all(
                 "SELECT worker_id, channel FROM members WHERE workspace = %s ORDER BY channel", (self.slug,)):

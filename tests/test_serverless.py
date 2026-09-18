@@ -285,6 +285,28 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, _ = await self.call("POST", f"/{ws}/api/pending/second", token="hunter2")
         self.assertEqual(status, 200)
 
+    async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
+        """Nothing stays connected here: a worker holds one request and opens
+        the next when it returns. Online therefore means heard from lately,
+        and a worker that has never called is not online however healthy it
+        is elsewhere."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/enrol", {"worker_id": "quiet", "token": "quiet-token"})
+        await self.call("POST", f"/{ws}/api/pending/quiet", token="hunter2")
+        await self.call("POST", f"/{ws}/enrol", {"worker_id": "busy", "token": "busy-token"})
+        await self.call("POST", f"/{ws}/api/pending/busy", token="hunter2")
+
+        _, before = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        self.assertEqual({w["worker_id"]: w["online"] for w in before},
+                         {"busy": False, "quiet": False})
+
+        # Asking for messages is being in touch.
+        await self.call("GET", f"/{ws}/messages", token="busy-token")
+        _, after = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        seen = {w["worker_id"]: w["online"] for w in after}
+        self.assertTrue(seen["busy"], "a worker that just polled should be online")
+        self.assertFalse(seen["quiet"], "a worker that never called should not be")
+
     # --- delivery ---------------------------------------------------------
     async def test_a_worker_polls_acks_and_does_not_see_it_again(self) -> None:
         ws = await self.workspace()

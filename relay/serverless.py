@@ -256,6 +256,7 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
     async def ack(body: AckIn, who: tuple[WorkspaceStore, str] = Depends(worker)) -> dict[str, Any]:
         scoped, worker_id = who
         await scoped.ack(body.channel, worker_id, body.seq)
+        await scoped.touch_worker(worker_id)
         return {"ok": True}
 
     # --- the console's api -----------------------------------------------
