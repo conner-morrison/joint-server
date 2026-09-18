@@ -1226,14 +1226,50 @@ async function loadOlder() {
   } catch (err) { handleError(err); }
 }
 
+// A job id is what ties one worker's answer to another worker's request.
+// Whoever mentions it first is the thing being answered.
+const JOB_ID_KEYS = ["jobId", "job_id", "job", "proposalId", "proposal_id"];
+
+function jobIdOf(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  for (const key of JOB_ID_KEYS) {
+    const value = body[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number") return String(value);
+  }
+  return null;
+}
+
+// Messages arranged as what happened and what came back. A later message
+// carrying a job id already seen belongs under the one that introduced it,
+// because that is what it is: an answer, not a new event.
+function thread(messages) {
+  const sources = new Map();          // job id -> the message that introduced it
+  const replies = new Map();          // seq of that message -> answers to it
+  const top = [];
+  for (const m of messages) {
+    const id = jobIdOf(m.body);
+    const source = id ? sources.get(id) : null;
+    if (!source) {
+      if (id) sources.set(id, m);
+      top.push(m);
+      continue;
+    }
+    if (!replies.has(source.seq)) replies.set(source.seq, []);
+    replies.get(source.seq).push(m);
+  }
+  return { top, replies };
+}
+
 function renderFeed(stick) {
   const feed = $("#feed");
   if (!feed) return;
   const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
   const { messages, hasOlder } = state.feed;
+  const { top, replies } = thread(messages);
   fill(feed,
     hasOlder && h("div", { class: "older" }, h("button", { class: "btn small", onclick: loadOlder }, "Load older messages")),
-    messages.length ? messages.map(messageRow)
+    top.length ? top.map((m) => messageRow(m, replies.get(m.seq)))
       : empty("No messages yet", "What members post appears here as it happens. You can also post below."));
   if (stick || nearBottom) feed.scrollTop = feed.scrollHeight;
 }
@@ -1313,7 +1349,7 @@ const CLIENT_FIELDS = [
 const JD_KEYS = ["description", "jobDescription", "jd", "snippet", "summary", "details", "text"];
 
 const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, ...LINK_KEYS,
-                       "links", "urls", "title",
+                       ...JOB_ID_KEYS, "links", "urls", "title",
                        "type", "source", "index", "emailId", "receivedAt",
                        "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
 
@@ -1381,7 +1417,13 @@ function when(value) {
 
 function jobCard(body) {
   const links = linksOf(body);
-  const link = links.length ? links[0].url : null;
+  const jobId = jobIdOf(body);
+  // When an item carries a job id and links, the two are about different
+  // things: the title names the work, the links point at where it was done.
+  // Linking the title to the first of them would say they were the same.
+  const separate = Boolean(jobId && links.length);
+  const link = separate ? null : (links.length ? links[0].url : null);
+  const listed = separate ? links : links.slice(1);
   // The description is the longest thing here and the least often wanted, so
   // it is behind a button: a list of jobs should stay a list.
   const jd = jdOf(body);
@@ -1401,6 +1443,9 @@ function jobCard(body) {
   if (body.receivedAt) {
     facts.push(h("span", { class: "fact" }, h("b", {}, "Received"), when(body.receivedAt)));
   }
+  if (jobId) {
+    facts.unshift(h("span", { class: "fact" }, h("b", {}, "Job"), h("code", {}, jobId)));
+  }
   // Whatever the publisher sent that this does not have a place for. Hidden,
   // but never dropped: a body is the worker's, not the console's, to decide.
   const rest = Object.fromEntries(Object.entries(body).filter(([key]) => !SHOWN.has(key)));
@@ -1411,8 +1456,8 @@ function jobCard(body) {
       : h("div", { class: "job-title" }, body.title),
     facts.length ? h("div", { class: "job-facts" }, facts) : false,
     shortJd ? h("p", { class: "msg-text" }, shortJd) : false,
-    links.length > 1
-      ? h("div", { class: "job-links" }, links.map((l) =>
+    listed.length
+      ? h("div", { class: "job-links" }, listed.map((l) =>
         h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
                  title: l.url }, l.label)))
       : false,
@@ -1485,14 +1530,41 @@ function messageBody(body) {
   return h("pre", {}, JSON.stringify(body, null, 2));
 }
 
-function messageRow(m) {
+function messageRow(m, replies) {
   return h("article", { class: "msg" },
     h("div", { class: "msg-meta" },
       h("span", { class: "msg-sender" + (m.sender === "@server" ? " server" : "") }, m.sender),
       h("span", {}, "#" + m.seq),
       h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts)),
       sourceTag(m.body)),
-    messageBody(m.body));
+    messageBody(m.body),
+    replies && replies.length
+      ? h("div", { class: "replies" }, replies.map(replyRow))
+      : false);
+}
+
+// An answer to something above it. Short by nature: who, when, and what they
+// said, which is usually one word.
+function replyRow(m) {
+  const body = m.body;
+  const said = body && typeof body === "object" && !Array.isArray(body)
+    ? String(body.status || body.state || body.result || body.text || body.message || "")
+    : String(body ?? "");
+  const done = /^(done|ok|complete|completed|success|succeeded|finished|merged)$/i.test(said.trim());
+  const links = linksOf(body);
+  return h("div", { class: "reply" },
+    h("span", { class: "reply-mark" + (done ? " done" : "") }, done ? "\u2713" : "\u203a"),
+    h("div", { class: "grow" },
+      h("div", { class: "reply-said" },
+        said ? h("span", { class: done ? "strong" : "" }, said) : h("span", { class: "muted" }, "replied"),
+        h("span", { class: "muted small" }, "\u00b7 " + m.sender),
+        h("time", { class: "muted small", title: new Date(m.ts * 1000).toLocaleString() },
+          "\u00b7 " + clock(m.ts))),
+      links.length
+        ? h("div", { class: "job-links" }, links.map((l) =>
+          h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
+                   title: l.url }, l.label)))
+        : false));
 }
 
 // --- live stream -----------------------------------------------------------
