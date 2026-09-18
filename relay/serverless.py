@@ -290,7 +290,13 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
 
     @app.post("/{ws}/api/pending/{worker_id}")
     async def approve(worker_id: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
-        if not await scoped.approve_worker(worker_id):
+        try:
+            approved = await scoped.approve_worker(worker_id)
+        except ValueError as exc:
+            # The request is still there. Whoever is looking at it can reject
+            # it, or the worker can ask again with a token of its own.
+            raise HTTPException(409, str(exc)) from None
+        if not approved:
             raise HTTPException(404, f"nothing waiting as {worker_id!r}")
         return {"worker_id": worker_id, "approved": True}
 

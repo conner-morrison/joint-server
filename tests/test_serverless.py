@@ -252,6 +252,39 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, body = await self.call("GET", f"/{upwork}/messages", token="shared-token")
         self.assertEqual((status, body["status"]), (401, "unregistered"))
 
+    async def test_two_workers_cannot_share_one_token(self) -> None:
+        """A token is the whole of a worker's identity: it is all that arrives
+        with a request. Two workers holding one would be one worker to this
+        server, sharing channels and a cursor, so whichever acknowledged first
+        would quietly consume the other's messages."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/enrol", {"worker_id": "first", "token": "shared"})
+        await self.call("POST", f"/{ws}/api/pending/first", token="hunter2")
+
+        status, body = await self.call("POST", f"/{ws}/enrol",
+                                       {"worker_id": "second", "token": "shared"})
+        self.assertEqual(status, 409)
+        self.assertIn("first", body["detail"])
+        self.assertIn("own", body["detail"])
+
+    async def test_a_clash_at_approval_keeps_the_request_and_says_why(self) -> None:
+        """The token can be taken between asking and being approved. Silently
+        discarding the request then reads as "nothing waiting", which says
+        nothing about what to do."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/enrol", {"worker_id": "second", "token": "shared"})
+        # The same token is registered to somebody else meanwhile.
+        await self.call("POST", f"/{ws}/enrol", {"worker_id": "first", "token": "shared2"})
+        await self.call("POST", f"/{ws}/api/pending/first", token="hunter2")
+        await self.call("DELETE", f"/{ws}/api/workers/first", token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers", {"worker_id": "holder"}, token="hunter2")
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        self.assertEqual([r["worker_id"] for r in rows], ["second"])
+
+        # Approving the waiting one works, since nothing else holds its token.
+        status, _ = await self.call("POST", f"/{ws}/api/pending/second", token="hunter2")
+        self.assertEqual(status, 200)
+
     # --- delivery ---------------------------------------------------------
     async def test_a_worker_polls_acks_and_does_not_see_it_again(self) -> None:
         ws = await self.workspace()

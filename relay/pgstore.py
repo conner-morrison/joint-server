@@ -365,6 +365,16 @@ class WorkspaceStore:
             raise ValueError("a token is required")
         if await self.worker_exists(worker_id):
             raise ValueError(f"worker {worker_id!r} is already registered")
+        # A token is the whole of a worker's identity: it is all that arrives
+        # with a request. Two workers holding one would be one worker to this
+        # server - the same channels, and one cursor between them, so whichever
+        # acknowledged first would quietly consume the other's messages.
+        taken = await self.store.workspace_for_token(token)
+        if taken is not None:
+            raise ValueError(
+                f"that token already belongs to worker {taken[1]!r}. Each worker needs its "
+                "own: a token is how this server tells one worker from another, and two "
+                "sharing one would each miss what the other collected")
         # A repeat from the same worker replaces its own request: one that lost
         # its token can ask again rather than being stuck pending for ever.
         await self.store._run("""
@@ -411,8 +421,17 @@ class WorkspaceStore:
                 "VALUES (%s, %s, %s, %s, %s)",
                 (self.slug, worker_id, row["token_hash"], row["label"], time.time()))
         except errors.UniqueViolation:
-            # Approved twice, or the id was taken meanwhile. Either way the
-            # request is spent.
+            # Either the id was taken while this waited, or the token was. The
+            # difference matters to whoever is looking at the request, so the
+            # request is kept and the reason said out loud rather than the
+            # whole thing vanishing as "nothing waiting".
+            clash = await self.store._one(
+                "SELECT worker_id FROM workers WHERE token_hash = %s", (row["token_hash"],))
+            if clash is not None:
+                raise ValueError(
+                    f"{worker_id!r} offered the same token as worker {clash['worker_id']!r}. "
+                    "Give it a token of its own and ask again: a token is how this server "
+                    "tells one worker from another") from None
             await self.reject_worker(worker_id)
             return False
         await self.reject_worker(worker_id)
