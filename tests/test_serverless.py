@@ -366,6 +366,35 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, mine = await self.call("GET", f"/{ws}/messages?wait=1", token="reporter-token")
         self.assertEqual((status, mine["messages"]), (200, []))
 
+    async def test_delivery_says_who_is_behind(self) -> None:
+        """Whether something reached a worker is otherwise unanswerable from
+        outside. A worker that never joined receives nothing and says nothing,
+        and one that is asleep looks exactly like one that is up to date."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        for who in ("reporter", "listener", "stranger"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+        for who in ("reporter", "listener"):
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+
+        await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": {"n": 1}},
+                        token="reporter-token")
+        status, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
+        self.assertEqual(status, 200)
+        behind = {r["name"]: r["waiting"] for r in rows}
+        # The listener has it waiting; the sender is not owed its own message;
+        # the one that never joined is not there at all, which is the answer.
+        self.assertEqual(behind, {"listener": 1, "reporter": 0})
+
+        # Once it collects and acknowledges, it is caught up.
+        _, got = await self.call("GET", f"/{ws}/messages", token="listener-token")
+        await self.call("POST", f"/{ws}/ack",
+                        {"channel": "github", "seq": got["messages"][0]["seq"]},
+                        token="listener-token")
+        _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
+        self.assertEqual({r["name"]: r["waiting"] for r in rows}, {"listener": 0, "reporter": 0})
+
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})

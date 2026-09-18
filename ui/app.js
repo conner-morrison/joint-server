@@ -20,6 +20,7 @@ const state = {
   workspace: "",
   pending: [],
   bots: [],
+  delivery: [],
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
@@ -1043,6 +1044,8 @@ async function renderChannelView(name) {
   renderMembers();
 
   state.feed = { channel: name, messages: [], hasOlder: false };
+  state.delivery = [];
+  loadDelivery(name);
   try {
     const page = await api("GET", `/api/channels/${enc(name)}/messages?limit=${PAGE}`);
     if (state.feed.channel !== name) return;             // navigated away meanwhile
@@ -1096,6 +1099,9 @@ function renderMembers() {
         h("div", { class: "grow" },
           h("div", { class: "strong truncate" }, b.name),
           h("div", { class: "muted small truncate" }, "chat " + b.chat_id)),
+        waitingFor(b.name)
+          ? h("span", { class: "behind", title: `${waitingFor(b.name)} not sent yet` }, waitingFor(b.name))
+          : false,
         h("button", {
           class: "btn icon", title: `Remove ${b.name} from this channel`,
           "aria-label": `Remove ${b.name} from this channel`,
@@ -1121,15 +1127,42 @@ function renderMembers() {
   renderMemberList();
 }
 
+// How far behind each member is. Without it, a worker that never joined and a
+// worker that is merely asleep look identical from here: both silent, both
+// apparently fine, and only one of them will ever receive anything.
+async function loadDelivery(channel) {
+  try {
+    const rows = await api("GET", `/api/channels/${enc(channel)}/delivery`);
+    if (state.feed.channel !== channel) return;          // navigated away meanwhile
+    state.delivery = Array.isArray(rows) ? rows : [];
+  } catch {
+    state.delivery = [];             // an older relay cannot say; claim nothing
+  }
+  renderMemberList();
+}
+
+function waitingFor(name) {
+  const row = state.delivery.find((r) => r.name === name);
+  return row ? Number(row.waiting) || 0 : null;
+}
+
 function renderMemberList() {
   const el = $("#member-list");
   const ch = currentChannel();
   if (!el || !ch) return;
   el.replaceChildren(ch.members.length
-    ? h("ul", { class: "member-list" }, ch.members.map((id) => h("li", {},
-      dot(state.online.has(id)),
-      h("span", { class: "mono truncate", title: id }, id),
-      h("button", { class: "btn icon", title: `Remove ${id} from #${ch.name}`, "aria-label": `Remove ${id} from #${ch.name}`, onclick: () => removeMember(ch.name, id) }, "×"))))
+    ? h("ul", { class: "member-list" }, ch.members.map((id) => {
+      const waiting = waitingFor(id);
+      return h("li", {},
+        dot(state.online.has(id)),
+        h("span", { class: "mono truncate", title: id }, id),
+        waiting
+          ? h("span", { class: "behind", title: `${waiting} not delivered yet` }, waiting)
+          : waiting === 0
+            ? h("span", { class: "caught-up", title: "has everything posted here" }, "\u2713")
+            : false,
+        h("button", { class: "btn icon", title: `Remove ${id} from #${ch.name}`, "aria-label": `Remove ${id} from #${ch.name}`, onclick: () => removeMember(ch.name, id) }, "×"));
+    }))
     : h("p", { class: "muted small" }, "No members yet. Only members can post here and receive what is posted."));
 }
 

@@ -326,3 +326,12 @@ a.job-title::after { content: " ↗"; font-size: 12px; color: var(--muted); text
    rather than spaces around them. */
 .reply-said { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px; }
 .job-facts .fact code { font: 12px/1.5 var(--mono); }
+
+/* --- how far behind a member is ------------------------------------------ */
+.behind {
+  margin-left: auto; padding: 0 7px; border-radius: 999px;
+  background: var(--warn-soft, #fdf0d5); color: #8a5a00;
+  font-size: 11px; font-weight: 700; line-height: 18px;
+}
+.caught-up { margin-left: auto; color: var(--ok); font-size: 12px; }
+.member-list .behind + .btn, .member-list .caught-up + .btn { margin-left: 6px; }

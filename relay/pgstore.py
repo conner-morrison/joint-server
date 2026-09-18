@@ -494,6 +494,33 @@ class WorkspaceStore:
             "SELECT channel, cursor FROM members WHERE workspace = %s AND worker_id = %s ORDER BY channel",
             (self.slug, worker_id))}
 
+    async def delivery_of(self, channel: str) -> list[dict[str, Any]]:
+        """Each member of a channel and how far behind it is.
+
+        Whether something reached a worker is otherwise unanswerable from
+        outside: a worker that is not a member receives nothing and says
+        nothing, and one that is offline is indistinguishable from one that is
+        up to date. A count of what is still waiting separates them.
+        """
+        workers = await self.store._all("""
+            SELECT m.worker_id AS name, m.cursor,
+                   (SELECT COUNT(*) FROM messages g
+                     WHERE g.workspace = m.workspace AND g.channel = m.channel
+                       AND g.seq > m.cursor AND g.sender <> m.worker_id) AS waiting
+              FROM members m
+             WHERE m.workspace = %s AND m.channel = %s
+             ORDER BY m.worker_id""", (self.slug, channel))
+        bots = await self.store._all("""
+            SELECT b.bot AS name, b.cursor,
+                   (SELECT COUNT(*) FROM messages g
+                     WHERE g.workspace = b.workspace AND g.channel = b.channel
+                       AND g.seq > b.cursor) AS waiting
+              FROM bot_members b
+             WHERE b.workspace = %s AND b.channel = %s
+             ORDER BY b.bot""", (self.slug, channel))
+        return ([{**r, "kind": "worker"} for r in workers]
+                + [{**r, "kind": "bot"} for r in bots])
+
     async def ack(self, channel: str, worker_id: str, seq: int) -> None:
         """Advance a cursor. It never moves backwards, and never past the last
         stored message, so a bad ack cannot make a worker skip future ones."""

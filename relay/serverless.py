@@ -367,6 +367,14 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
         return {"left": await scoped.leave(name, worker_id)}
 
+    @app.get("/{ws}/api/channels/{name}/delivery")
+    async def delivery(name: str, scoped: WorkspaceStore = Depends(admin)
+                       ) -> list[dict[str, Any]]:
+        """Who is behind on this channel, and by how much."""
+        if not await scoped.channel_exists(name):
+            raise HTTPException(404, f"no channel {name!r}")
+        return await scoped.delivery_of(name)
+
     @app.get("/{ws}/api/channels/{name}/bots")
     async def channel_bots(name: str, scoped: WorkspaceStore = Depends(admin)
                            ) -> list[dict[str, Any]]:
