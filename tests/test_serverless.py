@@ -395,6 +395,41 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
         self.assertEqual({r["name"]: r["waiting"] for r in rows}, {"listener": 0, "reporter": 0})
 
+    async def test_skipping_a_backlog_starts_a_member_from_now(self) -> None:
+        """A worker away long enough has a stack of stale news to read before
+        it reaches anything current. Skipping passes over it without touching
+        the channel: the messages stay, and everyone else still gets them."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        for who in ("reporter", "away", "other"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+
+        for n in range(8):
+            await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": {"n": n}},
+                            token="reporter-token")
+
+        status, done = await self.call("POST", f"/{ws}/api/channels/github/skip/away",
+                                       token="hunter2")
+        self.assertEqual((status, done["skipped"]), (200, 8))
+
+        # Nothing waiting for it, and nothing waiting is nothing delivered.
+        status, got = await self.call("GET", f"/{ws}/messages?wait=1", token="away-token")
+        self.assertEqual((status, got["messages"]), (200, []))
+
+        # What is posted next does reach it.
+        await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": {"n": "new"}},
+                        token="reporter-token")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="away-token")
+        self.assertEqual([m["body"] for m in got["messages"]], [{"n": "new"}])
+
+        # The other member was not skipped, and the channel still holds all nine.
+        _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
+        self.assertEqual({r["name"]: r["waiting"] for r in rows}["other"], 9)
+        _, history = await self.call("GET", f"/{ws}/api/channels/github/messages", token="hunter2")
+        self.assertEqual(len(history), 9)
+
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})

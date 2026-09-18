@@ -367,6 +367,16 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
         return {"left": await scoped.leave(name, worker_id)}
 
+    @app.post("/{ws}/api/channels/{name}/skip/{who}")
+    async def skip_backlog(name: str, who: str, bot: bool = False,
+                           scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Pass over what a member never collected, and start it from now."""
+        try:
+            skipped = await scoped.skip_to_now(name, who, bot=bot)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return {"skipped": skipped}
+
     @app.get("/{ws}/api/channels/{name}/delivery")
     async def delivery(name: str, scoped: WorkspaceStore = Depends(admin)
                        ) -> list[dict[str, Any]]:

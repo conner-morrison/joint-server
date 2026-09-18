@@ -494,6 +494,30 @@ class WorkspaceStore:
             "SELECT channel, cursor FROM members WHERE workspace = %s AND worker_id = %s ORDER BY channel",
             (self.slug, worker_id))}
 
+    async def skip_to_now(self, channel: str, name: str, *, bot: bool = False) -> int:
+        """Give up on what a member never collected and start it from here.
+
+        A backlog is kept because a worker that was away should miss nothing.
+        That is the right default and the wrong answer for a worker that was
+        away for a week: the news it would receive is no longer news. Returns
+        how many were passed over.
+        """
+        head = await self.head()
+        table, column = ("bot_members", "bot") if bot else ("members", "worker_id")
+        row = await self.store._one(
+            f"SELECT cursor FROM {table} WHERE workspace = %s AND channel = %s AND {column} = %s",
+            (self.slug, channel, name))
+        if row is None:
+            raise LookupError(f"{name!r} is not in channel {channel!r}")
+        skipped = await self.store._one(
+            "SELECT COUNT(*) AS n FROM messages WHERE workspace = %s AND channel = %s AND seq > %s",
+            (self.slug, channel, int(row["cursor"])))
+        await self.store._run(
+            f"UPDATE {table} SET cursor = GREATEST(cursor, %s) "
+            f"WHERE workspace = %s AND channel = %s AND {column} = %s",
+            (head, self.slug, channel, name))
+        return int(skipped["n"]) if skipped else 0
+
     async def delivery_of(self, channel: str) -> list[dict[str, Any]]:
         """Each member of a channel and how far behind it is.
 

@@ -1100,7 +1100,11 @@ function renderMembers() {
           h("div", { class: "strong truncate" }, b.name),
           h("div", { class: "muted small truncate" }, "chat " + b.chat_id)),
         waitingFor(b.name)
-          ? h("span", { class: "behind", title: `${waitingFor(b.name)} not sent yet` }, waitingFor(b.name))
+          ? h("button", {
+            class: "behind",
+            title: `${waitingFor(b.name)} waiting. Click to skip them and start from now.`,
+            onclick: () => skipBacklog(ch.name, b.name, waitingFor(b.name), true),
+          }, waitingFor(b.name))
           : false,
         h("button", {
           class: "btn icon", title: `Remove ${b.name} from this channel`,
@@ -1141,6 +1145,21 @@ async function loadDelivery(channel) {
   renderMemberList();
 }
 
+// A backlog is kept so a worker that was away misses nothing. For one that
+// was away long enough, that is a stack of stale news it will read in order
+// before reaching anything current, which is rarely what anyone wants.
+async function skipBacklog(channel, name, waiting, isBot) {
+  if (!confirm(`Skip ${waiting} message${waiting === 1 ? "" : "s"} waiting for ${name}?\n\n`
+    + "They stay in the channel and stay visible here. "
+    + `${name} will not receive them, and starts from what is posted next.`)) return;
+  try {
+    const done = await api("POST",
+      `/api/channels/${enc(channel)}/skip/${enc(name)}${isBot ? "?bot=true" : ""}`);
+    toast(`Skipped ${done.skipped} for ${name}`);
+    await loadDelivery(channel);
+  } catch (err) { handleError(err); }
+}
+
 function waitingFor(name) {
   const row = state.delivery.find((r) => r.name === name);
   return row ? Number(row.waiting) || 0 : null;
@@ -1157,7 +1176,10 @@ function renderMemberList() {
         dot(state.online.has(id)),
         h("span", { class: "mono truncate", title: id }, id),
         waiting
-          ? h("span", { class: "behind", title: `${waiting} not delivered yet` }, waiting)
+          ? h("button", {
+            class: "behind", title: `${waiting} waiting. Click to skip them and start from now.`,
+            onclick: () => skipBacklog(ch.name, id, waiting, false),
+          }, waiting)
           : waiting === 0
             ? h("span", { class: "caught-up", title: "has everything posted here" }, "\u2713")
             : false,
