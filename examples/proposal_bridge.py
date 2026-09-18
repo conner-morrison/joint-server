@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -30,6 +31,47 @@ CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment verified", "p
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
 JD_KEYS = ("description", "jobDescription", "jd", "snippet", "summary", "details", "text")
+JOB_ID_KEYS = ("jobId", "job_id", "job", "proposalId", "proposal_id")
+LINK_KEYS = ("upworkUrl", "inviteUrl", "url", "link", "html_url", "htmlUrl")
+# proposal-writer names a job with eight hex characters. Anything else is
+# somebody else's id and not ours to act on.
+JOB_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def job_id_of(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    for key in JOB_ID_KEYS:
+        value = body.get(key)
+        if isinstance(value, (str, int)) and JOB_ID_RE.match(str(value).strip().lower()):
+            return str(value).strip().lower()
+    return None
+
+
+def said_in(body: dict[str, Any]) -> str:
+    for key in ("status", "state", "result", "message", "text"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def links_in(body: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    def take(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                take(item)
+        elif isinstance(value, dict):
+            take(value.get("url") or value.get("href") or value.get("link"))
+        elif isinstance(value, str) and value.startswith(("http://", "https://")) \
+                and value not in found:
+            found.append(value)
+    for key in LINK_KEYS:
+        take(body.get(key))
+    take(body.get("links"))
+    take(body.get("urls"))
+    return found
 
 
 def http(method: str, url: str, body: Any = None, token: str = "", timeout: float = 60.0
@@ -132,11 +174,54 @@ class Bridge:
 
     def deliver(self, msg: dict[str, Any]) -> bool:
         """Hand one message to proposal-writer. False means try again later,
-        so a local server that is down or restarting loses nothing."""
+        so a local server that is down or restarting loses nothing.
+
+        What arrives is either work to draft a proposal for, or news about
+        work already drafted. Treating the second as the first would have
+        proposal-writer write a proposal for the word "done".
+        """
+        body = msg.get("body")
+        job = job_id_of(body)
+        if job and isinstance(body, dict) and not body.get("jd") and not body.get("description"):
+            return self.report(msg, job, body)
+        return self.draft(msg)
+
+    def report(self, msg: dict[str, Any], job: str, body: dict[str, Any]) -> bool:
+        """News about a job that already exists: say so on the job itself."""
+        said = said_in(body) or "done"
+        links = links_in(body)
+        note = said + (" \u00b7 " + links[0] if links else "")
+        text = f"From #{msg.get('channel')}: {said}"
+        if links:
+            text += "\n" + "\n".join(links)
+        try:
+            status, _ = http("POST", f"{self.local()}/api/job/{job}/message",
+                             {"role": "user", "text": text}, timeout=self.args.local_timeout)
+            if status == 200:
+                http("POST", f"{self.local()}/api/job/{job}/note", {"note": note[:200]},
+                     timeout=self.args.local_timeout)
+        except OSError as exc:
+            say(f"proposal-writer is not answering ({exc}); will try #{msg['seq']} again")
+            return False
+        if status == 404:
+            # The job was deleted, or belongs to another machine. Waiting will
+            # not conjure it, and holding the channel for it helps nobody.
+            say(f"#{msg['seq']} mentions job {job}, which proposal-writer does not have")
+            return True
+        if status != 200:
+            say(f"proposal-writer refused news for {job}: {status}")
+            return True
+        say(f"#{msg['seq']} {said} -> job {job}")
+        return True
+
+    def local(self) -> str:
+        return self.args.local.rstrip("/")
+
+    def draft(self, msg: dict[str, Any]) -> bool:
         jd = as_jd(msg.get("body"))
         payload = {"guide": self.args.guide, "person": self.args.person, "jd": jd}
         try:
-            status, body = http("POST", f"{self.args.local.rstrip('/')}/api/generate", payload,
+            status, body = http("POST", f"{self.local()}/api/generate", payload,
                                 timeout=self.args.local_timeout)
         except OSError as exc:
             say(f"proposal-writer is not answering ({exc}); will try #{msg['seq']} again")
@@ -151,7 +236,9 @@ class Bridge:
         return True
 
     def run(self) -> None:
-        say(f"watching {self.relay} as {self.args.worker_id}, feeding {self.args.local}")
+        watching = ", ".join(f"#{c}" for c in self.args.channel) or "every channel"
+        say(f"watching {watching} at {self.relay} as {self.args.worker_id}, "
+            f"feeding {self.args.local}")
         waiting_since = 0.0
         while True:
             try:
@@ -184,7 +271,7 @@ class Bridge:
                 waiting_since = 0.0
 
             for msg in body.get("messages", []):
-                if self.args.channel and msg.get("channel") != self.args.channel:
+                if self.args.channel and msg.get("channel") not in self.args.channel:
                     continue
                 if not self.deliver(msg):
                     time.sleep(self.args.retry)
@@ -210,7 +297,8 @@ def main() -> None:
                    help="the workspace address, e.g. https://relay.example.com/upwork")
     p.add_argument("--local", default=os.environ.get("PROPOSAL_UI", "http://127.0.0.1:8765"),
                    help="where proposal-writer is listening")
-    p.add_argument("--channel", default="jobs", help="only forward this channel; '' for all")
+    p.add_argument("--channel", action="append", default=[],
+                   help="a channel to watch; repeatable, and every channel when not given")
     p.add_argument("--worker-id", default=os.environ.get("RELAY_WORKER", "proposal-writer"))
     p.add_argument("--label", default="proposal-writer bridge")
     p.add_argument("--guide", default=os.environ.get("PROPOSAL_GUIDE", "general"))
