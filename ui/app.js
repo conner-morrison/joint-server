@@ -1084,7 +1084,7 @@ function renderMembers() {
   const select = h("select", { "aria-label": "Worker to add" }, others.map((w) => h("option", { value: w.worker_id }, w.worker_id)));
   const history = h("input", { type: "checkbox" });
 
-  el.replaceChildren(
+  fill(el,
     h("h2", {}, "Members"),
     h("div", { id: "member-list" }),
 
@@ -1254,8 +1254,45 @@ function httpUrl(value) {
 const FACTS = [["Budget", "budget"], ["Terms", "terms"], ["Published", "published"],
                ["Posted", "posted"], ["Skills", "skills"]];
 
-// Every field a publisher might put a link in. An invitation carries its own.
-const LINK_KEYS = ["upworkUrl", "inviteUrl", "url", "link"];
+// Every field a publisher might put a link in. An invitation carries its own,
+// and `links` holds however many an item has.
+const LINK_KEYS = ["upworkUrl", "inviteUrl", "url", "link", "html_url", "htmlUrl"];
+
+// What to call a link when the publisher did not say. The end of the path
+// usually names the thing; the host is a decent fallback for a bare domain.
+function labelFor(url) {
+  try {
+    const at = new URL(url);
+    const tail = at.pathname.split("/").filter(Boolean).slice(-2).join("/");
+    return tail ? `${at.hostname.replace(/^www\./, "")}/${tail}` : at.hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+// An item may carry no link, one, or several. Collected from wherever they
+// were put, http and https only, in the order they were given and without
+// repeats: the same URL under two field names is one link, not two.
+function linksOf(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return [];
+  const found = [];
+  const seen = new Set();
+  const take = (value, label) => {
+    if (Array.isArray(value)) return value.forEach((v) => take(v));
+    if (value && typeof value === "object") {
+      return take(value.url || value.href || value.link,
+        value.label || value.title || value.name);
+    }
+    const url = httpUrl(value);
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    found.push({ url, label: label || labelFor(url) });
+  };
+  for (const key of LINK_KEYS) take(body[key]);
+  take(body.links);
+  take(body.urls);
+  return found;
+}
 
 // What is worth knowing about whoever posted the job, in the order it is worth
 // reading. A field the publisher did not send is simply absent: none of this
@@ -1275,7 +1312,8 @@ const CLIENT_FIELDS = [
 // Where a job description might be called home, most specific first.
 const JD_KEYS = ["description", "jobDescription", "jd", "snippet", "summary", "details", "text"];
 
-const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, ...LINK_KEYS, "title",
+const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, ...LINK_KEYS,
+                       "links", "urls", "title",
                        "type", "source", "index", "emailId", "receivedAt",
                        "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
 
@@ -1342,12 +1380,14 @@ function when(value) {
 }
 
 function jobCard(body) {
-  const link = httpUrl(LINK_KEYS.map((key) => body[key]).find(Boolean));
+  const links = linksOf(body);
+  const link = links.length ? links[0].url : null;
   // The description is the longest thing here and the least often wanted, so
   // it is behind a button: a list of jobs should stay a list.
   const jd = jdOf(body);
-  const jdBox = jd ? h("div", { class: "jd", hidden: true }, jd) : null;
-  const jdButton = jd ? h("button", {
+  const shortJd = jd && jd.length <= 240 && !jd.includes("\n\n") ? jd : null;
+  const jdBox = jd && !shortJd ? h("div", { class: "jd", hidden: true }, jd) : null;
+  const jdButton = jdBox ? h("button", {
     class: "btn small jd-toggle", type: "button",
     onclick: () => {
       jdBox.hidden = !jdBox.hidden;
@@ -1370,6 +1410,12 @@ function jobCard(body) {
       ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, body.title)
       : h("div", { class: "job-title" }, body.title),
     facts.length ? h("div", { class: "job-facts" }, facts) : false,
+    shortJd ? h("p", { class: "msg-text" }, shortJd) : false,
+    links.length > 1
+      ? h("div", { class: "job-links" }, links.map((l) =>
+        h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
+                 title: l.url }, l.label)))
+      : false,
     jdButton ? h("div", { class: "job-actions" }, jdButton) : false,
     jdBox || false,
     clientBlock(body),
@@ -1421,14 +1467,20 @@ function messageBody(body) {
     // An alert that could not be split into jobs still has a subject, and
     // dropping it leaves a paragraph with nothing saying what it is about.
     const heading = body.title || body.emailSubject;
-    const link = httpUrl(body.upworkUrl || body.url || body.link);
+    const plainLinks = linksOf(body);
+    const link = plainLinks.length ? plainLinks[0].url : null;
     return h("div", { class: "job" },
       heading
         ? (link
           ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, heading)
           : h("div", { class: "job-title" }, heading))
         : false,
-      h("p", { class: "msg-text" }, body.text));
+      h("p", { class: "msg-text" }, body.text),
+      plainLinks.length > 1
+        ? h("div", { class: "job-links" }, plainLinks.map((l) =>
+          h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
+                   title: l.url }, l.label)))
+        : false);
   }
   return h("pre", {}, JSON.stringify(body, null, 2));
 }

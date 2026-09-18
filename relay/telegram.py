@@ -29,7 +29,7 @@ FACTS = [("Budget", "budget"), ("Terms", "terms"), ("Published", "published"),
 CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment", "paymentVerified"),
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
-LINK_KEYS = ("upworkUrl", "inviteUrl", "url", "link")
+LINK_KEYS = ("upworkUrl", "inviteUrl", "url", "link", "html_url", "htmlUrl")
 JD_KEYS = ("description", "jobDescription", "jd", "snippet", "summary", "details", "text")
 INVITATION_WORDS = ("invit", "interview", "asked you to apply", "wants to interview")
 
@@ -51,6 +51,42 @@ def http_url(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value if value.startswith(("http://", "https://")) else None
+
+
+def label_for(url: str) -> str:
+    """What to call a link when the publisher did not say."""
+    rest = url.split("://", 1)[-1]
+    host, _, path = rest.partition("/")
+    tail = "/".join([p for p in path.split("/") if p][-2:])
+    host = host.removeprefix("www.")
+    return f"{host}/{tail}" if tail else host
+
+
+def links_of(body: dict[str, Any]) -> list[tuple[str, str]]:
+    """An item may carry no link, one, or several. Collected from wherever they
+    were put, http and https only, in order and without repeats."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def take(value: Any, label: str = "") -> None:
+        if isinstance(value, list):
+            for item in value:
+                take(item)
+            return
+        if isinstance(value, dict):
+            return take(value.get("url") or value.get("href") or value.get("link"),
+                        value.get("label") or value.get("title") or value.get("name") or "")
+        url = http_url(value)
+        if not url or url in seen:
+            return
+        seen.add(url)
+        found.append((url, label or label_for(url)))
+
+    for key in LINK_KEYS:
+        take(body.get(key))
+    take(body.get("links"))
+    take(body.get("urls"))
+    return found
 
 
 def when(value: Any) -> str:
@@ -91,8 +127,14 @@ def render(body: Any, channel: str = "") -> str:
         lines.append(f"{tag}{f'  ·  #{esc(channel)}' if channel else ''}")
 
     title = esc(body.get("title") or body.get("emailSubject") or "New message")
-    link = http_url(next((body[k] for k in LINK_KEYS if body.get(k)), None))
+    links = links_of(body)
+    link = links[0][0] if links else None
     lines.append(f'<b><a href="{esc(link)}">{title}</a></b>' if link else f"<b>{title}</b>")
+    # The first link is the title. The rest are worth their own line, because
+    # an item with several is an item where the extra ones matter.
+    if len(links) > 1:
+        lines.append(" · ".join(f'<a href="{esc(url)}">{esc(label)}</a>'
+                                for url, label in links[1:]))
 
     facts = [f"{label}: <b>{esc(body[key])}</b>" for label, key in FACTS if body.get(key)]
     if body.get("receivedAt"):
