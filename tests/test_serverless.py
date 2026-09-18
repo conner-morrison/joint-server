@@ -430,6 +430,43 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, history = await self.call("GET", f"/{ws}/api/channels/github/messages", token="hunter2")
         self.assertEqual(len(history), 9)
 
+    async def test_resending_gives_a_member_the_last_message_again(self) -> None:
+        """Answering "did that actually arrive". Nothing is republished: the
+        member's place is put back, so the relay sends it what it already had,
+        and nobody else is touched."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        for who in ("reporter", "listener", "other"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+
+        for body in ({"n": 1}, {"jobId": "e5c5f515", "status": "done"}):
+            await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": body},
+                            token="reporter-token")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="listener-token")
+        await self.call("POST", f"/{ws}/ack",
+                        {"channel": "github", "seq": got["messages"][-1]["seq"]},
+                        token="listener-token")
+        _, nothing = await self.call("GET", f"/{ws}/messages?wait=1", token="listener-token")
+        self.assertEqual(nothing["messages"], [])
+
+        status, again = await self.call("POST", f"/{ws}/api/channels/github/resend/listener",
+                                        token="hunter2")
+        self.assertEqual((status, again["resending"]), (200, 1))
+
+        # The last one, once, and it is the same message rather than a copy.
+        _, back = await self.call("GET", f"/{ws}/messages?wait=5", token="listener-token")
+        self.assertEqual([m["body"] for m in back["messages"]],
+                         [{"jobId": "e5c5f515", "status": "done"}])
+        self.assertEqual(back["messages"][0]["seq"], got["messages"][-1]["seq"])
+
+        # The channel still holds two, and the other member is unaffected.
+        _, history = await self.call("GET", f"/{ws}/api/channels/github/messages", token="hunter2")
+        self.assertEqual(len(history), 2)
+        _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
+        self.assertEqual({r["name"]: r["waiting"] for r in rows}["other"], 2)
+
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})

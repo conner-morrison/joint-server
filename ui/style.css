@@ -337,3 +337,5 @@ a.job-title::after { content: " ↗"; font-size: 12px; color: var(--muted); text
 .member-list .behind + .btn, .member-list .caught-up + .btn { margin-left: 6px; }
 .behind { border: 0; cursor: pointer; font-family: inherit; }
 .behind:hover { filter: brightness(.95); text-decoration: underline; }
+.caught-up { border: 0; background: none; cursor: pointer; font-family: inherit; padding: 0 4px; }
+.caught-up:hover { filter: brightness(1.2); }

@@ -1160,6 +1160,19 @@ async function skipBacklog(channel, name, waiting, isBot) {
   } catch (err) { handleError(err); }
 }
 
+// Sending the last message again, to answer "did that actually arrive".
+// Nothing is republished: the member's place is put back, so the relay sends
+// it what it already had. Everyone else is untouched.
+async function resendLast(channel, name, isBot) {
+  if (!confirm(`Send ${name} the last message in #${channel} again?`)) return;
+  try {
+    const done = await api("POST",
+      `/api/channels/${enc(channel)}/resend/${enc(name)}${isBot ? "?bot=true" : ""}`);
+    toast(done.resending ? `Resending 1 to ${name}` : "Nothing to send again");
+    await loadDelivery(channel);
+  } catch (err) { handleError(err); }
+}
+
 function waitingFor(name) {
   const row = state.delivery.find((r) => r.name === name);
   return row ? Number(row.waiting) || 0 : null;
@@ -1181,7 +1194,11 @@ function renderMemberList() {
             onclick: () => skipBacklog(ch.name, id, waiting, false),
           }, waiting)
           : waiting === 0
-            ? h("span", { class: "caught-up", title: "has everything posted here" }, "\u2713")
+            ? h("button", {
+              class: "caught-up",
+              title: "Has everything posted here. Click to send the last one again.",
+              onclick: () => resendLast(ch.name, id, false),
+            }, "\u2713")
             : false,
         h("button", { class: "btn icon", title: `Remove ${id} from #${ch.name}`, "aria-label": `Remove ${id} from #${ch.name}`, onclick: () => removeMember(ch.name, id) }, "×"));
     }))

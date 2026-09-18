@@ -377,6 +377,18 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(404, str(exc)) from None
         return {"skipped": skipped}
 
+    @app.post("/{ws}/api/channels/{name}/resend/{who}")
+    async def resend(name: str, who: str, count: int = 1, bot: bool = False,
+                     scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Send a member the last thing again, to see whether it arrives."""
+        try:
+            again = await scoped.resend_to(name, who, count=min(max(count, 1), 100), bot=bot)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        if again and sender is not None:
+            sender.nudge()
+        return {"resending": again}
+
     @app.get("/{ws}/api/channels/{name}/delivery")
     async def delivery(name: str, scoped: WorkspaceStore = Depends(admin)
                        ) -> list[dict[str, Any]]:

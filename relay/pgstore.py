@@ -518,6 +518,39 @@ class WorkspaceStore:
             (head, self.slug, channel, name))
         return int(skipped["n"]) if skipped else 0
 
+    async def resend_to(self, channel: str, name: str, *, count: int = 1,
+                        bot: bool = False) -> int:
+        """Put a member's place back by `count` messages, so it is sent them
+        again.
+
+        A cursor never moves backwards on its own: a worker's own
+        acknowledgement must not be able to rewind it, or a confused worker
+        would read the same message for ever. Moving it back deliberately is a
+        different act, and the only way to answer "did that actually arrive".
+        Returns how many will be sent again.
+        """
+        table, column = ("bot_members", "bot") if bot else ("members", "worker_id")
+        row = await self.store._one(
+            f"SELECT cursor FROM {table} WHERE workspace = %s AND channel = %s AND {column} = %s",
+            (self.slug, channel, name))
+        if row is None:
+            raise LookupError(f"{name!r} is not in channel {channel!r}")
+        # The last `count` messages at or below where it had got to. Anything
+        # above the cursor is already coming, and does not need resending.
+        rows = await self.store._all("""
+            SELECT seq FROM messages
+             WHERE workspace = %s AND channel = %s AND seq <= %s
+             ORDER BY seq DESC LIMIT %s""",
+            (self.slug, channel, int(row["cursor"]), max(1, count)))
+        if not rows:
+            return 0
+        back = int(rows[-1]["seq"]) - 1
+        await self.store._run(
+            f"UPDATE {table} SET cursor = %s "
+            f"WHERE workspace = %s AND channel = %s AND {column} = %s",
+            (back, self.slug, channel, name))
+        return len(rows)
+
     async def delivery_of(self, channel: str) -> list[dict[str, Any]]:
         """Each member of a channel and how far behind it is.
 
