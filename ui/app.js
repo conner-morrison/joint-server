@@ -1123,7 +1123,11 @@ function renderMembers() {
     others.length
       ? h("form", { class: "stack", onsubmit: (e) => { e.preventDefault(); addMember(ch.name, select.value, history.checked); } },
         select,
-        h("label", { class: "check small" }, history, "Also deliver retained history"),
+        // A new member starts from now. This is the one way to ask for what it
+        // missed, so it says how much that is: "retained history" is easy to
+        // tick without realising it means four hundred old messages.
+        h("label", { class: "check small" }, history,
+          ch.messages ? `Also send the ${ch.messages} already here` : "Also send what is already here"),
         h("button", { class: "btn", type: "submit" }, "Add to channel"))
       : h("p", { class: "muted small" }, state.workers.length
         ? "Every worker is already a member."

@@ -307,6 +307,37 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(seen["busy"], "a worker that just polled should be online")
         self.assertFalse(seen["quiet"], "a worker that never called should not be")
 
+    async def test_a_new_member_starts_from_now(self) -> None:
+        """Joining a channel is not a request for what it already carried. A
+        worker added today is not owed a week of alerts it could do nothing
+        about, and asking for them is the exception rather than the default."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        for n in range(5):
+            await self.call("POST", f"/{ws}/api/channels/github/messages", {"body": {"old": n}},
+                            token="hunter2")
+
+        for who in ("late", "late-with-history"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+        await self.call("PUT", f"/{ws}/api/channels/github/members/late", {}, token="hunter2")
+        await self.call("PUT", f"/{ws}/api/channels/github/members/late-with-history",
+                        {"from_start": True}, token="hunter2")
+
+        _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
+        self.assertEqual({r["name"]: r["waiting"] for r in rows},
+                         {"late": 0, "late-with-history": 5})
+
+        # And it really is nothing, not merely nothing counted.
+        status, got = await self.call("GET", f"/{ws}/messages?wait=1", token="late-token")
+        self.assertEqual((status, got["messages"]), (200, []))
+
+        # What is posted next does reach it.
+        await self.call("POST", f"/{ws}/api/channels/github/messages", {"body": {"new": True}},
+                        token="hunter2")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="late-token")
+        self.assertEqual([m["body"] for m in got["messages"]], [{"new": True}])
+
     # --- delivery ---------------------------------------------------------
     async def test_a_worker_polls_acks_and_does_not_see_it_again(self) -> None:
         ws = await self.workspace()
