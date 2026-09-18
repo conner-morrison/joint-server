@@ -326,6 +326,46 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         await poster
         self.assertEqual((status, body["messages"]), (200, []))
 
+    async def test_one_worker_publishing_wakes_every_other_member(self) -> None:
+        """What a channel is for. A publish reaches each other member at once,
+        each with its own copy: this is a channel, not a queue, so two workers
+        waiting on it do not race for the same message and neither takes it
+        away from the other. The publisher is not told its own news.
+        """
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        for who in ("reporter", "builder", "notifier"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+
+        async def publish_soon() -> None:
+            await asyncio.sleep(0.5)
+            await self.call("POST", f"/{ws}/publish",
+                            {"channel": "github", "body": {"event": "push", "ref": "main"}},
+                            token="reporter-token")
+
+        started = time.monotonic()
+        poster = asyncio.create_task(publish_soon())
+        # Both other members wait at the same time.
+        listeners = [self.call("GET", f"/{ws}/messages?wait=20", token=f"{who}-token")
+                     for who in ("builder", "notifier")]
+        answers = await asyncio.gather(*listeners)
+        woken = time.monotonic() - started
+        await poster
+
+        for status, body in answers:
+            self.assertEqual(status, 200)
+            self.assertEqual([m["body"] for m in body["messages"]],
+                             [{"event": "push", "ref": "main"}],
+                             f"{body['worker_id']} did not get its own copy")
+            self.assertEqual(body["messages"][0]["sender"], "reporter")
+        self.assertLess(woken - 0.5, 1.0, f"woken {woken - 0.5:.2f}s after the publish")
+
+        # The one that published is not told about its own message.
+        status, mine = await self.call("GET", f"/{ws}/messages?wait=1", token="reporter-token")
+        self.assertEqual((status, mine["messages"]), (200, []))
+
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})
