@@ -29,7 +29,12 @@ FACTS = [("Budget", "budget"), ("Terms", "terms"), ("Published", "published"),
 CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment", "paymentVerified"),
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
-LINK_KEYS = ("upworkUrl", "inviteUrl", "url", "link", "html_url", "htmlUrl")
+NAMED_LINKS = (("published", "Published"), ("deployed", "Published"), ("live", "Published"),
+               ("demo", "Demo"), ("source", "Source"), ("repo", "Source"),
+               ("repository", "Source"), ("homepage", "Homepage"),
+               ("upworkUrl", "Upwork"), ("inviteUrl", "Invitation"),
+               ("html_url", "Link"), ("htmlUrl", "Link"), ("url", "Link"), ("link", "Link"))
+LINK_KEYS = tuple(key for key, _ in NAMED_LINKS)
 JD_KEYS = ("description", "jobDescription", "jd", "snippet", "summary", "details", "text")
 INVITATION_WORDS = ("invit", "interview", "asked you to apply", "wants to interview")
 
@@ -82,8 +87,8 @@ def links_of(body: dict[str, Any]) -> list[tuple[str, str]]:
         seen.add(url)
         found.append((url, label or label_for(url)))
 
-    for key in LINK_KEYS:
-        take(body.get(key))
+    for key, label in NAMED_LINKS:
+        take(body.get(key), "" if label == "Link" else label)
     take(body.get("links"))
     take(body.get("urls"))
     return found
@@ -99,7 +104,7 @@ def when(value: Any) -> str:
 def source_tag(body: dict[str, Any]) -> str:
     """Where it came from decides how much attention it deserves: a client
     asking for you is worth reading now, a search that matched is not."""
-    source = str(body.get("source") or "").lower()
+    source = "" if http_url(body.get("source")) else str(body.get("source") or "").lower()
     kind = str(body.get("type") or "").lower()
     said = f"{body.get('title') or ''} {body.get('emailSubject') or ''}".lower()
     # Guessed from the subject only when nothing better is known: a parsed job
@@ -136,7 +141,10 @@ def render(body: Any, channel: str = "") -> str:
         lines.append(" · ".join(f'<a href="{esc(url)}">{esc(label)}</a>'
                                 for url, label in links[1:]))
 
-    facts = [f"{label}: <b>{esc(body[key])}</b>" for label, key in FACTS if body.get(key)]
+    # `published` is a time on a job and a URL on a reply. A URL is a link,
+    # already shown as one, and not a fact to repeat.
+    facts = [f"{label}: <b>{esc(body[key])}</b>" for label, key in FACTS
+             if body.get(key) and not http_url(body.get(key))]
     if body.get("receivedAt"):
         facts.append(esc(when(body["receivedAt"])))
     if facts:

@@ -1368,7 +1368,14 @@ const FACTS = [["Budget", "budget"], ["Terms", "terms"], ["Published", "publishe
 
 // Every field a publisher might put a link in. An invitation carries its own,
 // and `links` holds however many an item has.
-const LINK_KEYS = ["upworkUrl", "inviteUrl", "url", "link", "html_url", "htmlUrl"];
+// Named links, with what to call each. A reply from a worker says where the
+// work was published and where its source is; both are worth their names.
+const NAMED_LINKS = [["published", "Published"], ["deployed", "Published"], ["live", "Published"],
+                     ["demo", "Demo"], ["source", "Source"], ["repo", "Source"],
+                     ["repository", "Source"], ["homepage", "Homepage"],
+                     ["upworkUrl", "Upwork"], ["inviteUrl", "Invitation"],
+                     ["html_url", "Link"], ["htmlUrl", "Link"], ["url", "Link"], ["link", "Link"]];
+const LINK_KEYS = NAMED_LINKS.map(([key]) => key);
 
 // What to call a link when the publisher did not say. The end of the path
 // usually names the thing; the host is a decent fallback for a bare domain.
@@ -1390,17 +1397,18 @@ function linksOf(body) {
   const found = [];
   const seen = new Set();
   const take = (value, label) => {
-    if (Array.isArray(value)) return value.forEach((v) => take(v));
+    if (Array.isArray(value)) return value.forEach((v) => take(v, label));
     if (value && typeof value === "object") {
       return take(value.url || value.href || value.link,
-        value.label || value.title || value.name);
+        value.label || value.title || value.name || label);
     }
     const url = httpUrl(value);
     if (!url || seen.has(url)) return;
     seen.add(url);
-    found.push({ url, label: label || labelFor(url) });
+    // A named field is called by its name; a bare URL by where it points.
+    found.push({ url, label: label && label !== "Link" ? `${label}: ${labelFor(url)}` : labelFor(url) });
   };
-  for (const key of LINK_KEYS) take(body[key]);
+  for (const [key, label] of NAMED_LINKS) take(body[key], label);
   take(body.links);
   take(body.urls);
   return found;
@@ -1513,7 +1521,10 @@ function jobCard(body) {
     },
   }, "View JD") : false;
   const facts = FACTS
-    .filter(([, key]) => body[key] !== undefined && body[key] !== null && body[key] !== "")
+    // `published` is a time on a job and a URL on a reply; a URL is a link,
+    // already listed as one, not a fact to repeat.
+    .filter(([, key]) => body[key] !== undefined && body[key] !== null && body[key] !== ""
+      && !httpUrl(body[key]))
     .map(([label, key]) => h("span", { class: "fact" },
       h("b", {}, label), String(Array.isArray(body[key]) ? body[key].join(", ") : body[key])));
   if (body.receivedAt) {
@@ -1561,14 +1572,14 @@ function looksLikeInvitation(body) {
   // worded, and "Build an interview scheduling app" is a job title, not an
   // invitation to interview.
   const type = String(body.type || "").toLowerCase();
-  const source = String(body.source || "").toLowerCase();
+  const source = httpUrl(body.source) ? "" : String(body.source || "").toLowerCase();
   if (type === "job" || source.startsWith("vollna")) return false;
   return INVITATION_RE.test(`${body.title || ""} ${body.emailSubject || ""}`);
 }
 
 function sourceTag(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-  const source = String(body.source || "").toLowerCase();
+  const source = httpUrl(body.source) ? "" : String(body.source || "").toLowerCase();
   const type = String(body.type || "").toLowerCase();
 
   if (type === "invitation" || source.includes("invit") || looksLikeInvitation(body)) {

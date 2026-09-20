@@ -32,7 +32,14 @@ CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment verified", "p
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
 JD_KEYS = ("description", "jobDescription", "jd", "snippet", "summary", "details", "text")
 JOB_ID_KEYS = ("jobId", "job_id", "job", "proposalId", "proposal_id")
-LINK_KEYS = ("upworkUrl", "inviteUrl", "url", "link", "html_url", "htmlUrl")
+# Named links a reply might carry, with what to call each. `published` is the
+# one proposal-writer most wants: where the work can be seen running.
+NAMED_LINKS = (("published", "Published"), ("deployed", "Published"), ("live", "Published"),
+               ("demo", "Demo"), ("source", "Source"), ("repo", "Source"),
+               ("repository", "Source"), ("homepage", "Homepage"),
+               ("upworkUrl", "Upwork"), ("inviteUrl", "Invitation"),
+               ("html_url", "Link"), ("htmlUrl", "Link"), ("url", "Link"), ("link", "Link"))
+LINK_KEYS = tuple(key for key, _ in NAMED_LINKS)
 # proposal-writer names a job with eight hex characters. Anything else is
 # somebody else's id and not ours to act on.
 JOB_ID_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -56,19 +63,27 @@ def said_in(body: dict[str, Any]) -> str:
     return ""
 
 
-def links_in(body: dict[str, Any]) -> list[str]:
-    found: list[str] = []
-    def take(value: Any) -> None:
+def links_in(body: dict[str, Any]) -> list[tuple[str, str]]:
+    """(label, url) for every link in a reply, named fields first. A field
+    like `source` may hold a word rather than a URL - "vollna", say - and
+    then it is not a link and is left alone."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def take(value: Any, label: str = "Link") -> None:
         if isinstance(value, list):
             for item in value:
-                take(item)
+                take(item, label)
         elif isinstance(value, dict):
-            take(value.get("url") or value.get("href") or value.get("link"))
+            take(value.get("url") or value.get("href") or value.get("link"),
+                 value.get("label") or value.get("title") or label)
         elif isinstance(value, str) and value.startswith(("http://", "https://")) \
-                and value not in found:
-            found.append(value)
-    for key in LINK_KEYS:
-        take(body.get(key))
+                and value not in seen:
+            seen.add(value)
+            found.append((label, value))
+
+    for key, label in NAMED_LINKS:
+        take(body.get(key), label)
     take(body.get("links"))
     take(body.get("urls"))
     return found
@@ -190,10 +205,14 @@ class Bridge:
         """News about a job that already exists: say so on the job itself."""
         said = said_in(body) or "done"
         links = links_in(body)
-        note = said + (" \u00b7 " + links[0] if links else "")
+        # The note is the one line seen in the job list, so it carries the link
+        # that matters most: where the work is published, failing that any.
+        headline = next((url for label, url in links if label == "Published"),
+                        links[0][1] if links else "")
+        note = said + (" \u00b7 " + headline if headline else "")
         text = f"From #{msg.get('channel')}: {said}"
         if links:
-            text += "\n" + "\n".join(links)
+            text += "\n" + "\n".join(f"{label}: {url}" for label, url in links)
         try:
             status, _ = http("POST", f"{self.local()}/api/job/{job}/message",
                              {"role": "user", "text": text}, timeout=self.args.local_timeout)
