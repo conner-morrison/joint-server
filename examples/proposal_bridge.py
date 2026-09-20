@@ -204,15 +204,15 @@ class Bridge:
     def report(self, msg: dict[str, Any], job: str, body: dict[str, Any]) -> bool:
         """News about a job that already exists: say so on the job itself."""
         said = said_in(body) or "done"
-        links = links_in(body)
-        # The note is the one line seen in the job list, so it carries the link
-        # that matters most: where the work is published, failing that any.
-        headline = next((url for label, url in links if label == "Published"),
-                        links[0][1] if links else "")
-        note = said + (" \u00b7 " + headline if headline else "")
+        # Only where the work is published goes on to proposal-writer. A reply
+        # may also say where the source lives, but that is the worker's
+        # business, not the proposal's: what a client can be shown is the
+        # running thing, not the repository.
+        published = [url for label, url in links_in(body) if label == "Published"]
+        note = said + (" \u00b7 " + published[0] if published else "")
         text = f"From #{msg.get('channel')}: {said}"
-        if links:
-            text += "\n" + "\n".join(f"{label}: {url}" for label, url in links)
+        if published:
+            text += "\n" + "\n".join(f"Published: {url}" for url in published)
         try:
             status, _ = http("POST", f"{self.local()}/api/job/{job}/message",
                              {"role": "user", "text": text}, timeout=self.args.local_timeout)
