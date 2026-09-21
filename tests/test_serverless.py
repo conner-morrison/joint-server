@@ -907,6 +907,23 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         _, bots = await self.call("GET", "/acme/api/bots", token="p")
         self.assertEqual(bots, [])
 
+    async def test_the_same_bot_and_chat_cannot_be_registered_twice(self) -> None:
+        """Two registrations of one bot to one chat is two copies of every
+        alert, and the console has no way to show that it is what happened."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc", join=False)
+        status, body = await self.call("POST", "/acme/api/bots",
+                                       {"name": "phone-again", "chat_id": "555", "token": "1:abc"},
+                                       token="p")
+        self.assertEqual(status, 409)
+        self.assertIn("phone", body["detail"])
+        self.assertIn("twice", body["detail"])
+        # A different bot to the same chat is fine: that is a different sender.
+        status, _ = await self.call("POST", "/acme/api/bots",
+                                    {"name": "other-bot", "chat_id": "555", "token": "2:xyz"},
+                                    token="p")
+        self.assertEqual(status, 201)
+
     async def test_bots_belong_to_their_channel(self) -> None:
         await self.ready()
         await self.call("POST", "/acme/api/channels", {"name": "quiet"}, token="p")

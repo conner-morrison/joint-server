@@ -625,6 +625,18 @@ class WorkspaceStore:
         check_name("bot", name)
         if not chat_id or not bot_token:
             raise ValueError("a bot needs a chat id and a token")
+        # The same bot sending to the same chat, registered twice under two
+        # names, is two copies of every alert. A bot is workspace-wide and
+        # joins as many channels as it likes, so there is never a reason for
+        # two of them, and the mistake is easy to make while testing.
+        twin = await self.store._one(
+            "SELECT name FROM bots WHERE workspace = %s AND chat_id = %s AND bot_token = %s",
+            (self.slug, chat_id, bot_token))
+        if twin is not None:
+            raise ValueError(
+                f"bot {twin['name']!r} already sends to that chat with that token. "
+                "Add it to more channels instead: registering it twice would send "
+                "everything twice")
         try:
             await self.store._run(
                 "INSERT INTO bots(workspace, name, kind, chat_id, bot_token, label, created_at) "
