@@ -609,6 +609,36 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                                     token="hunter2")
         self.assertEqual(status, 404)
 
+    async def test_the_same_job_posted_twice_reaches_nobody_twice(self) -> None:
+        """One job arrives more than once: a Vollna digest and an Upwork alert
+        can both carry it, and two digests an hour apart often repeat it. A
+        publisher that names a job by the job makes the repeat a no-op here -
+        once, for every reader at once, rather than each of them working out
+        separately that they have seen it."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        for who in ("gmail-bot", "writer"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+
+        same = {"channel": "jobs", "id": "job:~021987abc"}
+        first = await self.call("POST", f"/{ws}/publish",
+                                {**same, "body": {"source": "vollna", "title": "Scraper"}},
+                                token="gmail-bot-token")
+        # The same job, seen again in another source, with a different link.
+        again = await self.call("POST", f"/{ws}/publish",
+                                {**same, "body": {"source": "upwork-alert", "title": "Scraper"}},
+                                token="gmail-bot-token")
+        self.assertFalse(first[1]["duplicate"])
+        self.assertTrue(again[1]["duplicate"])
+        self.assertEqual(first[1]["seq"], again[1]["seq"])
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        self.assertEqual(len(got["messages"]), 1, "delivered once, not once per arrival")
+        _, history = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
+        self.assertEqual(len(history), 1, "stored once, so the console shows one job")
+
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})

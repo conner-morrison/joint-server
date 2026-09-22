@@ -31,6 +31,19 @@ const SOURCES = [
 // are all one rule.
 const INVITATION_RE = /\binvit|\binterview\b|asked you to apply|wants to interview/i;
 
+// The same job reaches this inbox more than once: a Vollna digest and an
+// Upwork alert can both carry it, and two digests an hour apart often repeat
+// it. The relay stores one message per id, so giving a job the id of the job
+// itself makes a repeat a no-op there - once, for every reader at once,
+// rather than each of them working out separately that they have seen it.
+function jobKey_(job) {
+  const url = job.upworkUrl || job.url || '';
+  const id = (url.match(/~[0-9a-z]+/i) || [])[1 - 1];   // Upwork's own job id
+  if (id) return 'job:' + id;
+  if (url) return 'job:' + url;
+  return '';                                            // nothing stable to go on
+}
+
 const MAX_IDS = 600;          // remembered message ids, across all sources
 const MAX_TEXT = 4000;        // characters of an email body worth sending on
 
@@ -116,9 +129,11 @@ function sendEmail_(source, m) {
       })];
 
   for (let i = 0; i < bodies.length; i++) {
-    // The id is what makes a retry harmless: the relay stores one message per
-    // id, so re-sending after a failure cannot duplicate what already arrived.
-    if (!post_(bodies[i], m.getId() + ':' + i)) return false;
+    // A job is identified by the job; anything else by the mail it came in.
+    // Either way the id is what makes a retry harmless, because the relay
+    // stores one message per id.
+    const id = jobKey_(bodies[i]) || (m.getId() + ':' + i);
+    if (!post_(bodies[i], id)) return false;
   }
   return true;
 }
@@ -174,7 +189,13 @@ function post_(body, id) {
       muteHttpExceptions: true,
     });
     const code = res.getResponseCode();
-    if (code >= 200 && code < 300) return true;
+    if (code >= 200 && code < 300) {
+      // The relay says when it has seen this id before. Nothing was stored and
+      // nobody was told, which is the point; worth a line while watching.
+      const said = JSON.parse(res.getContentText() || '{}');
+      if (said.duplicate) console.log('already posted, skipped: ' + id);
+      return true;
+    }
     // 401 is "who are you", 403 is "not yet approved" or "not in that channel".
     console.error(`Relay answered ${code}: ${res.getContentText().slice(0, 300)}`);
   } catch (e) {
