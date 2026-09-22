@@ -90,11 +90,15 @@ class PgStoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first, dup1, again, dup2), (first, False, first, True))
         self.assertEqual(len(await self.store.messages_after("jobs", 0)), 1)
 
-    async def test_the_same_id_from_a_different_sender_is_not_a_resend(self) -> None:
-        a, _ = await self.store.append("jobs", "alice", 1, "shared")
-        b, dup = await self.store.append("jobs", "bob", 1, "shared")
-        self.assertNotEqual(a, b)
-        self.assertFalse(dup)
+    async def test_the_same_id_is_one_message_whoever_sends_it(self) -> None:
+        """The same job can reach two different workers - a mail parser and a
+        webhook - and it is still one job. Scoping this to the sender would let
+        each of them store its own copy."""
+        a, first = await self.store.append("jobs", "alice", 1, "shared")
+        b, again = await self.store.append("jobs", "bob", 2, "shared")
+        self.assertEqual(a, b, "the second sender is told which message already has that id")
+        self.assertEqual((first, again), (False, True))
+        self.assertEqual(len(await self.store.messages_after("jobs", 0)), 1)
 
     async def test_ack_never_moves_back_or_past_the_log(self) -> None:
         seq, _ = await self.store.append("jobs", "bob", {"n": 1})
@@ -270,3 +274,53 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slugify("  Upwork  "), "upwork")
         self.assertEqual(slugify("a/b?c"), "abc")
         self.assertEqual(slugify("Rele-vant_1.0"), "rele-vant_1.0")
+
+
+class WidenDedupeTest(unittest.IsolatedAsyncioTestCase):
+    """Moving a database made before dedupe covered every publisher.
+
+    `CREATE INDEX IF NOT EXISTS` does nothing when an index of that name
+    exists, whatever its definition, so the old rule survives a deploy unless
+    it is replaced by name.
+    """
+
+    async def asyncSetUp(self) -> None:
+        assert _server is not None
+        _server.psql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        self.db = PgStore(_server.get_uri(), min_size=1, max_size=4)
+        await self.db.open()
+        async with self.db.pool.connection() as conn:       # as an older deploy left it
+            await conn.execute("DROP INDEX IF EXISTS messages_dedupe_workspace")
+            await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe "
+                               "ON messages(workspace, sender, client_id) "
+                               "WHERE client_id IS NOT NULL")
+        await self.db.create_workspace("acme", "p", "Acme")
+        self.ws = self.db.ws("acme")
+        await self.ws.add_channel("jobs")
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+
+    async def dedupe_indexes(self) -> list[str]:
+        rows = await self.db._all(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'messages'")
+        return sorted(r["indexname"] for r in rows if "dedupe" in r["indexname"])
+
+    async def test_a_restart_widens_it(self) -> None:
+        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe"])
+        await self.db.setup()
+        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe_workspace"])
+        await self.ws.append("jobs", "one", 1, "job:~123")
+        seq, dup = await self.ws.append("jobs", "two", 1, "job:~123")
+        self.assertTrue(dup, "a second publisher with that id is the same message")
+
+    async def test_history_that_cannot_be_widened_is_left_alone(self) -> None:
+        """Two senders already share an id. Those messages are history and not
+        this code's to delete, so the old rule stays and the deployment runs."""
+        await self.ws.append("jobs", "one", 1, "job:~123")
+        await self.ws.append("jobs", "two", 1, "job:~123")
+        await self.db.setup()
+        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe"])
+        # Still serving, still deduplicating per sender.
+        _, dup = await self.ws.append("jobs", "one", 1, "job:~123")
+        self.assertTrue(dup)

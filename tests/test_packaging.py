@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import sys
 import tomllib
 import unittest
 
@@ -42,8 +43,10 @@ class PackagingTest(unittest.TestCase):
     FROM_EXTRAS = {"psycopg_pool": "psycopg"}     # psycopg[pool]
 
     def test_the_entrypoint_only_imports_what_is_declared(self) -> None:
-        stdlib = {"os", "sys", "json", "typing", "__future__", "pathlib", "asyncio",
-                  "contextlib", "time", "re", "secrets", "hashlib"}
+        # Python's own list, rather than one kept by hand here: a missing name
+        # in a hand-written set fails a correct import and teaches people to
+        # distrust this test.
+        stdlib = set(sys.stdlib_module_names) | {"__future__"}
         for module in ("app.py", "relay/serverless.py", "relay/pgstore.py"):
             for name in top_level_imports(ROOT / module):
                 if name in stdlib or name == "relay":

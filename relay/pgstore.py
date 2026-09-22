@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import time
@@ -32,6 +33,8 @@ from psycopg_pool import AsyncConnectionPool
 
 from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
 from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
+
+log = logging.getLogger("relay.pgstore")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -142,8 +145,16 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_channel_seq ON messages(workspace, channel, seq);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
-CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe
-    ON messages(workspace, sender, client_id) WHERE client_id IS NOT NULL;
+-- One message per id in a workspace, whoever published it. The same job can
+-- reach two different workers - a mail parser and a webhook, say - and it is
+-- still one job; scoping this to the sender would let each of them store its
+-- own copy.
+--
+-- The cost is that publishers in a workspace share one namespace of ids, so an
+-- id must mean the same thing to all of them. A job's own URL does; a counter
+-- that starts at one does not.
+CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe_workspace
+    ON messages(workspace, client_id) WHERE client_id IS NOT NULL;
 """
 
 
@@ -217,6 +228,44 @@ class PgStore:
                 await conn.execute(SCHEMA)
             except (errors.DuplicateTable, errors.DuplicateObject, errors.UniqueViolation):
                 pass
+        await self._widen_dedupe()
+
+    async def _widen_dedupe(self) -> None:
+        """Move an existing database from per-sender dedupe to per-workspace.
+
+        `CREATE INDEX IF NOT EXISTS` does nothing when an index of that name
+        exists, whatever its definition, so a database made before this change
+        keeps the old rule until it is replaced by name. Done in its own
+        transaction, and never at the cost of starting: a deployment that
+        cannot widen its dedupe should still run.
+        """
+        try:
+            async with self.pool.connection() as conn:
+                old = await (await conn.execute(
+                    "SELECT 1 FROM pg_indexes WHERE indexname = 'messages_dedupe'")).fetchone()
+                if old is None:
+                    return
+                # Two messages already sharing an id, from different senders,
+                # would make the new index impossible. They are history and not
+                # ours to delete, so say so and leave the old rule in place.
+                clash = await (await conn.execute("""
+                    SELECT workspace, client_id, COUNT(*) AS n FROM messages
+                     WHERE client_id IS NOT NULL
+                     GROUP BY workspace, client_id HAVING COUNT(*) > 1 LIMIT 1""")).fetchone()
+                if clash is not None:
+                    log.warning(
+                        "keeping per-sender dedupe: id %r in workspace %r is already on %d "
+                        "messages. Remove or re-id them to dedupe across publishers.",
+                        clash["client_id"], clash["workspace"], clash["n"])
+                    return
+                await conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe_workspace "
+                    "ON messages(workspace, client_id) WHERE client_id IS NOT NULL")
+                await conn.execute("DROP INDEX IF EXISTS messages_dedupe")
+                log.info("dedupe now covers every publisher in a workspace")
+        except Exception as exc:                 # noqa: BLE001 - reported, never fatal
+            log.warning("could not widen dedupe (%s); the old rule still applies",
+                        type(exc).__name__)
 
     async def _all(self, sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         await self.ready()
@@ -734,9 +783,11 @@ class WorkspaceStore:
                     raise
                 # A failed INSERT poisons the transaction; the lookup needs a clean one.
                 await conn.rollback()
+                # Found by id alone: the message that claimed it may have come
+                # from another publisher, which is the point.
                 cur = await conn.execute(
-                    "SELECT seq FROM messages WHERE workspace = %s AND sender = %s AND client_id = %s",
-                    (self.slug, sender, client_id))
+                    "SELECT seq FROM messages WHERE workspace = %s AND client_id = %s",
+                    (self.slug, client_id))
                 row = await cur.fetchone()
                 if row is None:
                     raise

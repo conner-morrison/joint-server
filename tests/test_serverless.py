@@ -626,10 +626,11 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         first = await self.call("POST", f"/{ws}/publish",
                                 {**same, "body": {"source": "vollna", "title": "Scraper"}},
                                 token="gmail-bot-token")
-        # The same job, seen again in another source, with a different link.
+        # The same job again - and from a different publisher, which is still
+        # the same job.
         again = await self.call("POST", f"/{ws}/publish",
                                 {**same, "body": {"source": "upwork-alert", "title": "Scraper"}},
-                                token="gmail-bot-token")
+                                token="writer-token")
         self.assertFalse(first[1]["duplicate"])
         self.assertTrue(again[1]["duplicate"])
         self.assertEqual(first[1]["seq"], again[1]["seq"])
