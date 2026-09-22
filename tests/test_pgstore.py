@@ -130,6 +130,49 @@ class PgStoreTest(unittest.IsolatedAsyncioTestCase):
             got = await self.store.messages_before("jobs", seq + 1, limit=1)
             self.assertEqual(got[0]["body"], body, f"{body!r} did not survive the round trip")
 
+    async def test_a_channel_keeps_only_its_newest(self) -> None:
+        """A channel is the last hundred things that happened, not everything
+        that ever did. The oldest go as the newest arrive, in order."""
+        from relay import pgstore
+        was, pgstore.CHANNEL_MAX = pgstore.CHANNEL_MAX, 5
+        try:
+            for n in range(8):
+                await self.store.append("jobs", "alice", {"n": n})
+            kept = await self.store.messages_after("jobs", 0)
+            self.assertEqual([m["body"]["n"] for m in kept], [3, 4, 5, 6, 7])
+        finally:
+            pgstore.CHANNEL_MAX = was
+
+    async def test_the_cap_is_per_channel(self) -> None:
+        """One busy channel does not evict another's history."""
+        from relay import pgstore
+        was, pgstore.CHANNEL_MAX = pgstore.CHANNEL_MAX, 3
+        try:
+            await self.store.add_channel("quiet")
+            await self.store.append("quiet", "alice", {"kept": True})
+            for n in range(6):
+                await self.store.append("jobs", "alice", {"n": n})
+            quiet = await self.store.messages_after("quiet", 0)
+            self.assertEqual([m["body"] for m in quiet], [{"kept": True}])
+            self.assertEqual(len(await self.store.messages_after("jobs", 0)), 3)
+        finally:
+            pgstore.CHANNEL_MAX = was
+
+    async def test_the_head_survives_the_cap(self) -> None:
+        """Dropping the oldest must not rewind the sequence, or a new member
+        would start below messages that still exist and be handed old ones."""
+        from relay import pgstore
+        was, pgstore.CHANNEL_MAX = pgstore.CHANNEL_MAX, 2
+        try:
+            for n in range(5):
+                await self.store.append("jobs", "alice", {"n": n})
+            head = await self.store.head()
+            await self.store.join("jobs", "carol")
+            self.assertEqual((await self.store.channels_of("carol"))["jobs"], head)
+            self.assertEqual(await self.store.messages_after("jobs", head), [])
+        finally:
+            pgstore.CHANNEL_MAX = was
+
     async def test_removing_a_channel_takes_its_messages_and_members(self) -> None:
         await self.store.append("jobs", "alice", {"n": 1})
         self.assertTrue(await self.store.remove_channel("jobs"))

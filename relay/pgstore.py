@@ -175,6 +175,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe_workspace
 __all__ = ["PgStore", "WorkspaceStore", "SCHEMA", "NAME_RE", "check_name", "slugify",
            "ONLINE_WINDOW"]
 
+# How many messages a channel keeps. The oldest go when the newest arrives,
+# so a channel is the last hundred things that happened rather than everything
+# that ever did. 0 keeps them all.
+CHANNEL_MAX = int(os.environ.get("RELAY_CHANNEL_MAX", "100"))
+
 # How recently a worker must have been in touch to count as online.
 #
 # Nothing stays connected here: a worker holds one request at a time and opens
@@ -830,6 +835,7 @@ class WorkspaceStore:
                     (self.slug, channel, sender, client_id, json.dumps(body),
                      time.time() if ts is None else ts))
                 row = await cur.fetchone()
+                await self._trim(conn, channel)
                 # Announced in the same transaction as the insert, so nobody is
                 # ever told about a message that then fails to commit.
                 await conn.execute("SELECT pg_notify(%s, %s)",
@@ -849,6 +855,31 @@ class WorkspaceStore:
                 if row is None:
                     raise
                 return int(row["seq"]), True
+
+    async def _trim(self, conn: Any, channel: str) -> None:
+        """Drop the oldest so the channel keeps only its newest CHANNEL_MAX.
+
+        In the same transaction as the message that pushed it over, so the
+        channel is never briefly longer than it is allowed to be. A member
+        that had not reached the dropped messages will not see them: the cap
+        is a statement that they are no longer worth delivering, and a cursor
+        below them simply has nothing there to find.
+        """
+        if CHANNEL_MAX <= 0:
+            return
+        cutoff = await (await conn.execute(
+            "SELECT seq FROM messages WHERE workspace = %s AND channel = %s "
+            " ORDER BY seq DESC OFFSET %s LIMIT 1",
+            (self.slug, channel, CHANNEL_MAX))).fetchone()
+        if cutoff is None:
+            return
+        await conn.execute(
+            "DELETE FROM messages WHERE workspace = %s AND channel = %s AND seq <= %s",
+            (self.slug, channel, cutoff["seq"]))
+        # A request to send one of them again can no longer be honoured.
+        await conn.execute(
+            "DELETE FROM redeliveries WHERE workspace = %s AND channel = %s AND seq <= %s",
+            (self.slug, channel, cutoff["seq"]))
 
     async def messages_after(self, channel: str, after: int, *, limit: int = 200,
                              exclude_sender: str | None = None) -> list[dict[str, Any]]:

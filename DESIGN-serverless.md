@@ -120,3 +120,19 @@ process buys, if it is ever wanted, is a connection the server can hold open,
 which would let the console be told about changes rather than asking for them.
 The polling it does now works in both places, which is why it is what is
 written.
+
+## How long a channel keeps things
+
+A channel keeps its newest `RELAY_CHANNEL_MAX` messages, 100 by default, and
+drops the oldest as new ones arrive. `0` keeps everything.
+
+The trim happens in the same transaction as the message that pushed the
+channel over, so it is never briefly longer than it is allowed to be. A member
+whose cursor had not reached the dropped messages will not see them: the cap
+says they are no longer worth delivering, and a cursor below them finds
+nothing there. The sequence is not rewound, so a member joining afterwards
+still starts at the head rather than below messages that still exist.
+
+One thing follows from this and is worth knowing. Dedupe remembers an id for
+as long as its message is kept, so a job dropped by the cap can arrive again
+and be treated as new. Muting is separate and is not forgotten.
