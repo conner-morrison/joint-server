@@ -640,6 +640,52 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, history = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
         self.assertEqual(len(history), 1, "stored once, so the console shows one job")
 
+    async def test_a_muted_job_reaches_nobody(self) -> None:
+        """A job silenced before it arrives is refused at the door: not stored,
+        so not announced, so nothing to delete afterwards and no alert that has
+        to be explained away."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        for who in ("gmail-bot", "writer"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+
+        # Muted by its link; the publisher names it by its id. They must agree.
+        status, done = await self.call(
+            "POST", f"/{ws}/api/muted",
+            {"url": "https://www.upwork.com/jobs/~021987abc"}, token="hunter2")
+        self.assertEqual((status, done["key"]), (201, "job:~021987abc"))
+
+        # The same job arrives, under a link with different tracking on it.
+        status, said = await self.call(
+            "POST", f"/{ws}/publish",
+            {"channel": "jobs", "id": "job:~021987abc",
+             "body": {"title": "Build a scraper",
+                      "upworkUrl": "https://www.upwork.com/jobs/~021987abc?ref=vollna"}},
+            token="gmail-bot-token")
+        self.assertEqual((status, said["muted"], said["seq"]), (200, True, None))
+
+        _, history = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
+        self.assertEqual(history, [], "a muted job is not in the channel")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=1", token="writer-token")
+        self.assertEqual(got["messages"], [], "and reaches no worker")
+
+        # Unmuted, it comes through as any other job would.
+        await self.call("DELETE", f"/{ws}/api/muted/job:~021987abc", token="hunter2")
+        _, said = await self.call(
+            "POST", f"/{ws}/publish",
+            {"channel": "jobs", "id": "job:~021987abc", "body": {"title": "Build a scraper"}},
+            token="gmail-bot-token")
+        self.assertIsNotNone(said["seq"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        self.assertEqual([m["body"]["title"] for m in got["messages"]], ["Build a scraper"])
+
+    async def test_muting_needs_something_to_go_on(self) -> None:
+        ws = await self.workspace()
+        status, _ = await self.call("POST", f"/{ws}/api/muted", {"url": "   "}, token="hunter2")
+        self.assertEqual(status, 400)
+
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})

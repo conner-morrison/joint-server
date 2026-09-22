@@ -81,6 +81,11 @@ class EnrolIn(BaseModel):
     label: str = ""
 
 
+class MuteIn(BaseModel):
+    url: str
+    note: str = ""
+
+
 class AckIn(BaseModel):
     channel: str
     seq: int
@@ -212,7 +217,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
                 "message": "waiting for someone to approve this worker in the console"}
 
     @app.post("/{ws}/publish", status_code=201)
-    async def publish(body: PublishIn, who: tuple[WorkspaceStore, str] = Depends(worker)) -> dict[str, Any]:
+    async def publish(body: PublishIn,
+                      who: tuple[WorkspaceStore, str] = Depends(worker)) -> Any:
         scoped, worker_id = who
         if not await scoped.is_member(body.channel, worker_id):
             # A channel it is not in and a channel that does not exist look the
@@ -220,6 +226,14 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(403, f"{worker_id} is not a member of channel {body.channel!r}")
         if too_large(body.body):
             raise HTTPException(413, f"body is larger than {MAX_BODY_BYTES} bytes")
+        # Refused at the door: a muted job is never stored, so nothing is
+        # announced and nothing has to be explained away afterwards. The
+        # publisher is told it was accepted, because there is nothing for it
+        # to do differently.
+        if await scoped.is_muted(body.id):
+            await scoped.touch_worker(worker_id)
+            # 200, not the route's 201: nothing was created.
+            return JSONResponse({"seq": None, "muted": True, "worker_id": worker_id}, 200)
         seq, duplicate = await scoped.append(body.channel, worker_id, body.body, body.id)
         await scoped.touch_worker(worker_id)
         if sender is not None and not duplicate:
@@ -343,6 +357,25 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(404, f"no bot {bot!r}")
         return {"removed": True}
 
+    @app.get("/{ws}/api/muted")
+    async def list_muted(scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
+        return await scoped.muted()
+
+    @app.post("/{ws}/api/muted", status_code=201)
+    async def add_muted(body: MuteIn, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Silence one job before it arrives, by its link."""
+        try:
+            key = await scoped.mute(body.url, body.note)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"key": key, "muted": True}
+
+    @app.delete("/{ws}/api/muted/{key:path}")
+    async def remove_muted(key: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.unmute(key):
+            raise HTTPException(404, f"{key!r} is not muted")
+        return {"unmuted": True}
+
     @app.get("/{ws}/api/channels")
     async def list_channels(scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
         return await scoped.list_channels()
@@ -449,11 +482,13 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
 
     @app.post("/{ws}/api/channels/{name}/messages", status_code=201)
     async def post_as_server(name: str, body: PostIn,
-                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+                             scoped: WorkspaceStore = Depends(admin)) -> Any:
         if not await scoped.channel_exists(name):
             raise HTTPException(404, f"no channel {name!r}")
         if too_large(body.body):
             raise HTTPException(413, f"body is larger than {MAX_BODY_BYTES} bytes")
+        if await scoped.is_muted(body.id):
+            return JSONResponse({"seq": None, "muted": True}, 200)
         seq, duplicate = await scoped.append(name, SERVER_SENDER, body.body, body.id)
         if sender is not None and not duplicate:
             sender.nudge()

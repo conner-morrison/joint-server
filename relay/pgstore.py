@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from typing import Any
@@ -132,6 +133,19 @@ CREATE TABLE IF NOT EXISTS redeliveries (
     PRIMARY KEY (workspace, channel, worker_id, seq)
 );
 
+-- Jobs to be let through no further. The key is the same id a publisher
+-- gives a job, so muting is the dedupe rule pointed at something that has not
+-- arrived yet: the job is refused at the door rather than stored, announced
+-- and then explained away.
+CREATE TABLE IF NOT EXISTS muted (
+    workspace  TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    url        TEXT NOT NULL DEFAULT '',
+    note       TEXT NOT NULL DEFAULT '',
+    muted_at   DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (workspace, key)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     seq         BIGSERIAL PRIMARY KEY,
     workspace   TEXT NOT NULL,
@@ -169,6 +183,23 @@ __all__ = ["PgStore", "WorkspaceStore", "SCHEMA", "NAME_RE", "check_name", "slug
 # touches this at least that often, and this leaves room for two of those to
 # be missed before it is called gone.
 ONLINE_WINDOW = float(os.environ.get("RELAY_ONLINE_WINDOW", "75"))
+
+
+# Upwork names a job in its own links: ~021987abc. Two links to one job differ
+# in their tracking, never in that. This is the rule a publisher uses to name a
+# job, and muting has to agree with it exactly or it would mute nothing.
+UPWORK_JOB = re.compile(r"~[0-9a-z]+", re.I)
+
+
+def job_key(url_or_key: str) -> str:
+    """The id a job is known by, from a link or from an id already formed."""
+    said = (url_or_key or "").strip()
+    if not said:
+        return ""
+    if not said.startswith(("http://", "https://")):
+        return said                      # already an id
+    found = UPWORK_JOB.search(said)
+    return f"job:{found.group(0)}" if found else f"job:{said}"
 
 
 def slugify(name: str) -> str:
@@ -757,6 +788,32 @@ class WorkspaceStore:
              ORDER BY b.name""", (self.slug, channel))
 
     # --- messages --------------------------------------------------------
+    # --- muted ------------------------------------------------------------
+    async def mute(self, url_or_key: str, note: str = "") -> str:
+        key = job_key(url_or_key)
+        if not key:
+            raise ValueError("give the job's link, or its id")
+        await self.store._run("""
+            INSERT INTO muted(workspace, key, url, note, muted_at) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (workspace, key) DO UPDATE SET note = EXCLUDED.note""",
+            (self.slug, key, url_or_key.strip(), note, time.time()))
+        return key
+
+    async def unmute(self, key: str) -> bool:
+        return await self.store._run("DELETE FROM muted WHERE workspace = %s AND key = %s",
+                                     (self.slug, job_key(key))) > 0
+
+    async def muted(self) -> list[dict[str, Any]]:
+        return await self.store._all(
+            "SELECT key, url, note, muted_at FROM muted WHERE workspace = %s ORDER BY muted_at DESC",
+            (self.slug,))
+
+    async def is_muted(self, client_id: str | None) -> bool:
+        if not client_id:
+            return False
+        return await self.store._one("SELECT 1 FROM muted WHERE workspace = %s AND key = %s",
+                                     (self.slug, client_id)) is not None
+
     async def append(self, channel: str, sender: str, body: Any, client_id: str | None = None, *,
                      ts: float | None = None) -> tuple[int, bool]:
         """Store a message. Returns (seq, duplicate).

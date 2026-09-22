@@ -21,6 +21,7 @@ const state = {
   pending: [],
   bots: [],
   delivery: [],
+  muted: [],
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
@@ -651,6 +652,10 @@ async function refreshAll({ rethrow = false } = {}) {
       api("GET", "/api/pending").catch(() => []),
       api("GET", "/api/bots").catch(() => []),
     ]);
+    api("GET", "/api/muted").then((rows) => {
+      state.muted = Array.isArray(rows) ? rows : [];
+      renderMembers();
+    }).catch(() => { state.muted = []; });
     state.workers = workers;
     state.channels = channels;
     state.pending = Array.isArray(pending) ? pending : [];
@@ -1081,7 +1086,8 @@ function renderMembers() {
   // Rebuilding this while it is being used throws away a chosen worker and a
   // ticked box, so when nothing about it has changed only the list is redrawn.
   const shape = `${ch.name}|${others.map((w) => w.worker_id).join(",")}`
-    + `|${state.bots.map((b) => b.name + ":" + (b.channels || []).join("+")).join(",")}`;
+    + `|${state.bots.map((b) => b.name + ":" + (b.channels || []).join("+")).join(",")}`
+    + `|${state.muted.map((m) => m.key).join(",")}`;
   if (el.dataset.shape === shape) return renderMemberList();
   el.dataset.shape = shape;
   const select = h("select", { "aria-label": "Worker to add" }, others.map((w) => h("option", { value: w.worker_id }, w.worker_id)));
@@ -1118,6 +1124,12 @@ function renderMembers() {
         class: "btn small", onclick: () => addBotMember(ch.name, b.name, false),
       }, `Add ${b.name}`)))
       : false,
+
+    // A job silenced before it arrives. Pasting its link here is the whole
+    // action: it is never stored, so nothing is alerted and nothing has to be
+    // deleted afterwards.
+    h("h2", {}, "Muted jobs"),
+    mutedSection(),
 
     h("h2", {}, "Add member"),
     others.length
@@ -1180,6 +1192,53 @@ async function resendLast(channel, name, isBot) {
 function waitingFor(name) {
   const row = state.delivery.find((r) => r.name === name);
   return row ? Number(row.waiting) || 0 : null;
+}
+
+function mutedSection() {
+  const url = h("input", {
+    type: "text", required: true, placeholder: "https://www.upwork.com/jobs/~01…",
+    autocomplete: "off", spellcheck: "false",
+  });
+  const err = h("p", { class: "error", hidden: true });
+  const add = h("button", { class: "btn", type: "submit" }, "Mute");
+
+  return h("div", {},
+    state.muted.length
+      ? h("ul", { class: "member-list" }, state.muted.map((m) => h("li", {},
+        h("span", { class: "muted small truncate", title: m.url || m.key }, m.url || m.key),
+        h("button", {
+          class: "btn icon", title: `Stop muting ${m.key}`, "aria-label": `Stop muting ${m.key}`,
+          onclick: () => unmute(m.key),
+        }, "\u00d7"))))
+      : h("p", { class: "muted small" }, "None. Paste a job link to silence it before it arrives."),
+    h("form", {
+      class: "stack", onsubmit: async (e) => {
+        e.preventDefault();
+        err.hidden = true;
+        add.disabled = true;
+        try {
+          const done = await api("POST", "/api/muted", { url: url.value.trim() });
+          url.value = "";
+          toast(`Muted ${done.key}`);
+          state.muted = await api("GET", "/api/muted");
+          renderMembers();
+        } catch (ex) {
+          if (ex.status === 401) return handleError(ex);
+          err.textContent = ex.message;
+          err.hidden = false;
+        } finally {
+          add.disabled = false;
+        }
+      },
+    }, url, err, add));
+}
+
+async function unmute(key) {
+  try {
+    await api("DELETE", "/api/muted/" + enc(key));
+    state.muted = await api("GET", "/api/muted");
+    renderMembers();
+  } catch (err) { handleError(err); }
 }
 
 function renderMemberList() {
