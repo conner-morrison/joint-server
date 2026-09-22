@@ -243,6 +243,7 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             found = await scoped.waiting_for(worker_id, limit=min(max(limit, 1), 1000))
             left = deadline - time.monotonic()
             if found or left <= 0:
+                await scoped.redelivered(worker_id, [int(m["seq"]) for m in found])
                 return {"messages": found, "worker_id": worker_id}
             # Woken by the publish itself. The timeout is a safety net for a
             # notification that never arrives, not the thing doing the work,
@@ -383,6 +384,16 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from None
         return {"skipped": skipped}
+
+    @app.post("/{ws}/api/channels/{name}/send/{who}")
+    async def send_one(name: str, who: str, seq: int,
+                       scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Hand one message to one member again, whatever it has already had."""
+        try:
+            await scoped.send_again(name, who, seq)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return {"sent": True, "seq": seq, "worker_id": who}
 
     @app.post("/{ws}/api/channels/{name}/resend/{who}")
     async def resend(name: str, who: str, count: int = 1, bot: bool = False,

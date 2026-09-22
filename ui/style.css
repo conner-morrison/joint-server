@@ -339,3 +339,8 @@ a.job-title::after { content: " ↗"; font-size: 12px; color: var(--muted); text
 .behind:hover { filter: brightness(.95); text-decoration: underline; }
 .caught-up { border: 0; background: none; cursor: pointer; font-family: inherit; padding: 0 4px; }
 .caught-up:hover { filter: brightness(1.2); }
+/* Visible, not loud. Hidden until hover would make it undiscoverable, and
+   unreachable by touch. */
+.send-again { font-size: 15px; opacity: .45; transition: opacity .12s; }
+.msg:hover .send-again, .send-again:focus-visible { opacity: 1; }
+.send-again:hover { color: var(--accent); }

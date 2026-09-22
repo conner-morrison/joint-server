@@ -115,6 +115,20 @@ CREATE TABLE IF NOT EXISTS bot_members (
 );
 CREATE INDEX IF NOT EXISTS bot_members_pending ON bot_members(workspace, channel, cursor);
 
+-- One message, asked for again by a person, for one member.
+--
+-- A cursor is a single mark: moving it back to reach one old message would
+-- resend everything after it as well. This says "that one, once more" without
+-- disturbing where the member had got to.
+CREATE TABLE IF NOT EXISTS redeliveries (
+    workspace   TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    worker_id   TEXT NOT NULL,
+    seq         BIGINT NOT NULL,
+    asked_at    DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (workspace, channel, worker_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     seq         BIGSERIAL PRIMARY KEY,
     workspace   TEXT NOT NULL,
@@ -746,13 +760,47 @@ class WorkspaceStore:
 
     async def waiting_for(self, worker_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         """Everything above this worker's cursors, across all its channels,
-        oldest first. One query, because a poll should be one round trip."""
+        oldest first, plus anything asked for again by hand. One query,
+        because a poll should be one round trip."""
         rows = await self.store._all("""
             SELECT m.seq, m.channel, m.sender, m.body, m.ts
               FROM messages m
               JOIN members mem
                 ON mem.workspace = m.workspace AND mem.channel = m.channel
-             WHERE m.workspace = %s AND mem.worker_id = %s
-               AND m.seq > mem.cursor AND m.sender <> %s
+             WHERE m.workspace = %s AND mem.worker_id = %s AND m.sender <> %s
+               AND (m.seq > mem.cursor
+                    OR EXISTS (SELECT 1 FROM redeliveries r
+                                WHERE r.workspace = m.workspace AND r.channel = m.channel
+                                  AND r.worker_id = mem.worker_id AND r.seq = m.seq))
              ORDER BY m.seq LIMIT %s""", (self.slug, worker_id, worker_id, limit))
         return [_message(r) for r in rows]
+
+    async def send_again(self, channel: str, worker_id: str, seq: int) -> bool:
+        """Ask for one message to be delivered to one member again."""
+        if not await self.is_member(channel, worker_id):
+            raise LookupError(f"{worker_id!r} is not in channel {channel!r}")
+        if await self.store._one(
+                "SELECT 1 FROM messages WHERE workspace = %s AND channel = %s AND seq = %s",
+                (self.slug, channel, seq)) is None:
+            raise LookupError(f"no message {seq} in channel {channel!r}")
+        async with self.store.pool.connection() as conn:
+            await conn.execute("""
+                INSERT INTO redeliveries(workspace, channel, worker_id, seq, asked_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (workspace, channel, worker_id, seq) DO NOTHING""",
+                (self.slug, channel, worker_id, seq, time.time()))
+            # Announced like a publish, so a worker holding a poll has it now
+            # rather than whenever its wait happens to run out.
+            await conn.execute("SELECT pg_notify(%s, %s)",
+                               (NOTIFY_CHANNEL, notify_key(self.slug, channel)))
+        return True
+
+    async def redelivered(self, worker_id: str, seqs: list[int]) -> None:
+        """Spent once handed over. A message asked for by hand is asked for
+        again by hand if it needs to be: keeping the row until the worker
+        acknowledges would resend it on every poll until then."""
+        if not seqs:
+            return
+        await self.store._run(
+            "DELETE FROM redeliveries WHERE workspace = %s AND worker_id = %s AND seq = ANY(%s)",
+            (self.slug, worker_id, seqs))

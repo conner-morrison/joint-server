@@ -1617,13 +1617,58 @@ function messageBody(body) {
   return h("pre", {}, JSON.stringify(body, null, 2));
 }
 
+// Handing one message to one worker again. Everything here has already been
+// delivered to whoever was listening; this is for the times that was not
+// enough - a worker that was down, or one whose answer went astray.
+function sendAgain(m) {
+  const ch = currentChannel();
+  if (!ch) return;
+  const others = ch.members.filter((id) => id !== m.sender);
+  if (!others.length) {
+    return toast(m.sender ? `Only ${m.sender} is in this channel, and it sent this.`
+      : "No workers in this channel yet.", true);
+  }
+  // One obvious recipient needs no question asked.
+  if (others.length === 1) return deliverAgain(ch.name, others[0], m);
+
+  const pick = h("select", { "aria-label": "Worker to send to" },
+    others.map((id) => h("option", { value: id }, id)));
+  const err = h("p", { class: "error", hidden: true });
+  openDialog(`Send #${m.seq} again`,
+    [h("p", { class: "muted small" },
+      "It is delivered again to the worker you choose, whether or not it already had it. "
+      + "Nothing is added to the channel."),
+     field("Worker", pick), err],
+    [cancel(), h("button", { class: "btn primary", type: "submit" }, "Send")],
+    async (dlg) => {
+      try {
+        await deliverAgain(ch.name, pick.value, m);
+        dlg.close();
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.hidden = false;
+      }
+    });
+}
+
+async function deliverAgain(channel, worker, m) {
+  const done = await api("POST",
+    `/api/channels/${enc(channel)}/send/${enc(worker)}?seq=${m.seq}`);
+  toast(`#${done.seq} sent to ${worker}`);
+  loadDelivery(channel);
+}
+
 function messageRow(m, replies) {
   return h("article", { class: "msg" },
     h("div", { class: "msg-meta" },
       h("span", { class: "msg-sender" + (m.sender === "@server" ? " server" : "") }, m.sender),
       h("span", {}, "#" + m.seq),
       h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts)),
-      sourceTag(m.body)),
+      sourceTag(m.body),
+      h("button", {
+        class: "btn icon send-again", title: "Send this to a worker again",
+        "aria-label": "Send this to a worker again", onclick: () => sendAgain(m),
+      }, "\u2192")),
     messageBody(m.body),
     replies && replies.length
       ? h("div", { class: "replies" }, replies.map(replyRow))

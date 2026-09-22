@@ -553,6 +553,62 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
         self.assertEqual({r["name"]: r["waiting"] for r in rows}["other"], 2)
 
+    async def test_sending_one_message_again_leaves_the_rest_alone(self) -> None:
+        """The button on a message means that message. A cursor is a single
+        mark, so reaching an old one by moving it back would resend everything
+        after it too; this hands over the one that was asked for."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        for who in ("writer", "other"):
+            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
+            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+
+        seqs = []
+        for n in range(3):
+            _, said = await self.call("POST", f"/{ws}/api/channels/jobs/messages",
+                                      {"body": {"n": n}}, token="hunter2")
+            seqs.append(said["seq"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        await self.call("POST", f"/{ws}/ack", {"channel": "jobs", "seq": seqs[-1]},
+                        token="writer-token")
+        _, nothing = await self.call("GET", f"/{ws}/messages?wait=1", token="writer-token")
+        self.assertEqual(nothing["messages"], [])
+
+        # The middle one, and only it.
+        status, done = await self.call(
+            "POST", f"/{ws}/api/channels/jobs/send/writer?seq={seqs[1]}", token="hunter2")
+        self.assertEqual((status, done["seq"]), (200, seqs[1]))
+        _, again = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        self.assertEqual([m["body"] for m in again["messages"]], [{"n": 1}])
+
+        # Spent: it is not handed over a second time on the next poll.
+        _, after = await self.call("GET", f"/{ws}/messages?wait=1", token="writer-token")
+        self.assertEqual(after["messages"], [])
+
+        # And the other member's place was never touched.
+        _, rows = await self.call("GET", f"/{ws}/api/channels/jobs/delivery", token="hunter2")
+        self.assertEqual({r["name"]: r["waiting"] for r in rows}["other"], 3)
+
+    async def test_sending_again_refuses_what_it_cannot_do(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        await self.call("POST", f"/{ws}/enrol", {"worker_id": "writer", "token": "writer-token"})
+        await self.call("POST", f"/{ws}/api/pending/writer", token="hunter2")
+        _, said = await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": 1},
+                                  token="hunter2")
+
+        # Not a member of the channel.
+        status, _ = await self.call(
+            "POST", f"/{ws}/api/channels/jobs/send/writer?seq={said['seq']}", token="hunter2")
+        self.assertEqual(status, 404)
+
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/writer", {}, token="hunter2")
+        # A message that is not in this channel.
+        status, _ = await self.call("POST", f"/{ws}/api/channels/jobs/send/writer?seq=9999",
+                                    token="hunter2")
+        self.assertEqual(status, 404)
+
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})
