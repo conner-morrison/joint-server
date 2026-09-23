@@ -38,10 +38,21 @@ const INVITATION_RE = /\binvit|\binterview\b|asked you to apply|wants to intervi
 // rather than each of them working out separately that they have seen it.
 function jobKey_(job) {
   const url = job.upworkUrl || job.url || '';
-  const id = (url.match(/~[0-9a-z]+/i) || [])[1 - 1];   // Upwork's own job id
+  const id = (url.match(/~[0-9a-z]+/i) || [])[0];       // Upwork's own job id
   if (id) return 'job:' + id;
   if (url) return 'job:' + url;
   return '';                                            // nothing stable to go on
+}
+
+// Every Upwork job id a mail mentions, without repeats. Used for the mail that
+// could not be read as jobs at all: when it names exactly one job it is about
+// that job, and can carry the same id as the reading of it that arrived
+// elsewhere. Invitations are left out - being asked for by name is news even
+// about a job already seen.
+function jobIdsIn_(html) {
+  const ids = [...String(html).matchAll(/jobs(?:\/|%2F|%252F|%25252F)(~[0-9a-z]{6,})/gi)]
+    .map(m => m[1].toLowerCase());
+  return [...new Set(ids)];
 }
 
 const MAX_IDS = 600;          // remembered message ids, across all sources
@@ -128,11 +139,13 @@ function sendEmail_(source, m) {
         text: m.getPlainBody().slice(0, MAX_TEXT),
       })];
 
+  const mentioned = bodies.length === 1 ? jobIdsIn_(m.getBody()) : [];
   for (let i = 0; i < bodies.length; i++) {
     // A job is identified by the job; anything else by the mail it came in.
     // Either way the id is what makes a retry harmless, because the relay
     // stores one message per id.
-    const id = jobKey_(bodies[i]) || (m.getId() + ':' + i);
+    const named = bodies[i].type === 'email' && mentioned.length === 1 ? 'job:' + mentioned[0] : '';
+    const id = jobKey_(bodies[i]) || named || (m.getId() + ':' + i);
     if (!post_(bodies[i], id)) return false;
   }
   return true;
