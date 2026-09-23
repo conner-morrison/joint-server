@@ -1065,3 +1065,38 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
                         token="p")
         await asyncio.sleep(1.2)
         self.assertEqual(self.telegram.sent, [])
+
+    async def test_a_full_channel_still_delivers_its_newest(self) -> None:
+        """The FIFO cap drops the oldest messages as new ones arrive. A bot
+        whose cursor sits among the dropped ones must still be sent what came
+        after them: a cap on history is not a reason for an alert to go
+        missing."""
+        from relay.pgstore import CHANNEL_MAX
+
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        for n in range(CHANNEL_MAX + 3):
+            status, _ = await self.call("POST", "/acme/api/channels/jobs/messages",
+                                        {"body": {"type": "job", "title": f"Job {n}"}},
+                                        token="p")
+            self.assertEqual(status, 201)
+        await self.eventually(CHANNEL_MAX + 3, within=30)
+        self.assertIn(f"Job {CHANNEL_MAX + 2}", self.telegram.sent[-1]["text"])
+
+    async def test_a_muted_job_is_the_only_thing_kept_quiet(self) -> None:
+        """Muting one job must not quieten the next one. The mute is matched
+        against the publisher's own id, which is now the job's id, so a rule
+        that was too broad would silence everything that followed."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        status, _ = await self.call("POST", "/acme/api/muted",
+                                    {"url": "https://www.upwork.com/jobs/~0111"}, token="p")
+        self.assertEqual(status, 201)
+        for job in ("~0111", "~0222"):
+            await self.call("POST", "/acme/api/channels/jobs/messages",
+                            {"body": {"title": f"Job {job}",
+                                      "upworkUrl": f"https://www.upwork.com/jobs/{job}"},
+                             "id": f"job:{job}"}, token="p")
+        await self.eventually(1)
+        await asyncio.sleep(1.0)
+        self.assertEqual([s["text"].count("~0222") > 0 for s in self.telegram.sent], [True])
