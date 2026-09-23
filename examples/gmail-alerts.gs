@@ -139,27 +139,59 @@ function sendEmail_(source, m) {
 }
 
 function parseJobs_(html) {
-  const jobs = [];
+  // One job is linked more than once in these emails - the title, a view
+  // link, a tracking wrapper - and each link starts a new slice of the text
+  // after it. Taken one link at a time that is three jobs: one with the money
+  // in it, one with only a title, one holding the description. They are the
+  // same job, and the link says which, so they are put back together.
   const re = /<a\b[^>]*href="([^"]*place(?:=|%3D)title[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
   const matches = [...html.matchAll(re)];
+  const byJob = new Map();
+  const order = [];
+
   matches.forEach((mt, i) => {
     const href = mt[1];
     const end = i + 1 < matches.length ? matches[i + 1].index : mt.index + mt[0].length + 2000;
     const cells = lines_(html.slice(mt.index + mt[0].length, end));
-    const jobId = (href.match(/jobs(?:\/|%2F|%252F|%25252F)(~\d+)/i) || [])[1];
+    // Upwork's ids are not only digits: ~021987abc truncated to ~021987 is a
+    // link that does not open, and a key two different jobs could share.
+    const jobId = (href.match(/jobs(?:\/|%2F|%252F|%25252F)(~[0-9a-z]+)/i) || [])[1];
     const pid = (href.match(/pid(?:=|%3D)(\d+)/i) || [])[1];
-    jobs.push({
-      title: lines_(mt[2]).join(' '),
-      budget: cells[0] || null,
-      published: cells[1] || null,
-      upworkUrl: jobId ? `https://www.upwork.com/jobs/${jobId}` : null,
-      vollnaProjectId: pid || null,
-      // Everything found between this job and the next. Sent as it is until
-      // somebody has read enough of them to say which cell means what.
-      cells: cells,
-    });
+    const title = lines_(mt[2]).join(' ');
+
+    // Without an id there is nothing to say two links are one job, so each
+    // stands alone rather than being merged into whatever came before it.
+    const key = jobId || (pid && 'pid:' + pid) || ('at:' + mt.index);
+    let job = byJob.get(key);
+    if (!job) {
+      job = {
+        title: '',
+        budget: null,
+        published: null,
+        upworkUrl: jobId ? `https://www.upwork.com/jobs/${jobId}` : null,
+        vollnaProjectId: pid || null,
+        cells: [],
+      };
+      byJob.set(key, job);
+      order.push(job);
+      // The first slice is the one laid out as a row: money, then when.
+      job.budget = cells[0] || null;
+      job.published = cells[1] || null;
+    }
+    if (!job.title && title) job.title = title;
+    if (!job.upworkUrl && jobId) job.upworkUrl = `https://www.upwork.com/jobs/${jobId}`;
+    if (!job.vollnaProjectId && pid) job.vollnaProjectId = pid;
+    for (const cell of cells) if (!job.cells.includes(cell)) job.cells.push(cell);
   });
-  return jobs;
+
+  // The longest thing said about a job is its description, wherever in the
+  // email it turned up.
+  for (const job of order) {
+    const longest = job.cells.reduce((a, b) => (b.length > a.length ? b : a), '');
+    if (longest.length >= 80) job.description = longest;
+  }
+  // A fragment with neither a title nor a link is markup, not a job.
+  return order.filter(j => j.title || j.upworkUrl);
 }
 
 function lines_(s) {
