@@ -26,7 +26,7 @@ from typing import Any, AsyncIterator
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Request
 from fastapi.responses import JSONResponse
 from psycopg import Error as PgError
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from relay import telegram
 from relay.notify import Notifier, key as notify_key
@@ -62,6 +62,15 @@ class BotIn(BaseModel):
     name: str
     chat_id: str
     token: str
+
+    @field_validator("name", "chat_id", "token")
+    @classmethod
+    def trimmed(cls, value: str) -> str:
+        """A chat id and a token are pasted, and paste brings its spaces and
+        newlines with it. Untrimmed, " 555 " and "555" are two chats as far
+        as the check for a second registration is concerned, and a token with
+        a trailing newline is a URL Telegram never sees."""
+        return value.strip()
 
 
 class PostIn(BaseModel):
@@ -335,6 +344,13 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         looking. Sending is the only check that covers both, and it arrives as
         the message that says the bot is working.
         """
+        # Asked before the welcome is sent, so a registration that is going to
+        # be refused does not put a message in the chat saying it worked.
+        twin = await scoped.bot_for_chat(body.chat_id)
+        if twin is not None:
+            raise HTTPException(409, f"bot {twin!r} already sends to that chat. Add it to "
+                                     "more channels instead: a second one here would send "
+                                     "everything twice")
         try:
             who = await telegram.check(body.token)
             await telegram.send(body.token, body.chat_id, telegram.WELCOME)

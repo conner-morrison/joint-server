@@ -127,9 +127,14 @@ def render(body: Any, channel: str = "") -> str:
         return f"<pre>{esc(json.dumps(body, indent=2, ensure_ascii=False)[:1000])}</pre>"
 
     lines: list[str] = []
-    tag = source_tag(body)
-    if tag:
-        lines.append(f"{tag}{f'  ·  #{esc(channel)}' if channel else ''}")
+    # The channel is named even when nothing else about the source is known.
+    # Two notifications for one job are two channels carrying it, or two bots
+    # sending from one - and a line that says which turns that from a mystery
+    # into something a person can see and fix.
+    head = "  ·  ".join(part for part in (
+        source_tag(body), f"#{esc(channel)}" if channel else "") if part)
+    if head:
+        lines.append(head)
 
     title = esc(body.get("title") or body.get("emailSubject") or "New message")
     links = links_of(body)

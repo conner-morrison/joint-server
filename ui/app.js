@@ -799,6 +799,28 @@ function renderMain() {
   else renderChannelView(state.view.name);
 }
 
+// Two bots pointing at one chat is two copies of every alert on the same
+// phone. Registering a second one is refused now, but a pair made before that
+// rule existed is still there and still sending twice, and the only way
+// anyone finds out is by counting notifications. So it is said plainly.
+function sharedChats() {
+  const byChat = new Map();
+  for (const b of state.bots) {
+    const chat = String(b.chat_id || "");
+    if (!byChat.has(chat)) byChat.set(chat, []);
+    byChat.get(chat).push(b.name);
+  }
+  const shared = [...byChat.entries()].filter(([, names]) => names.length > 1);
+  if (!shared.length) return null;
+  return h("div", { class: "notice" },
+    h("strong", {}, "More than one bot sends to the same chat"),
+    shared.map(([chat, names]) => h("div", {},
+      `Chat ${chat} is sent to by ${names.join(" and ")}. `
+      + `Every alert arrives ${names.length} times there.`)),
+    h("div", {}, "Remove all but one of them below. Which one you keep makes no "
+      + "difference; a bot can be in as many channels as you like."));
+}
+
 // --- workers ---------------------------------------------------------------
 function renderWorkersView() {
   $("#main").replaceChildren(
@@ -821,7 +843,7 @@ function renderWorkersTable() {
       + "and approve it when it asks to join."));
     return;
   }
-  box.replaceChildren(waiting || "", h("div", { class: "table-wrap" }, h("table", {},
+  box.replaceChildren(waiting || "", sharedChats() || "", h("div", { class: "table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {}, ["Worker", "Channels", "Last seen", ""].map((t) => h("th", {}, t)))),
     h("tbody", {},
       // Bots first: nothing about them changes minute to minute, and they are
