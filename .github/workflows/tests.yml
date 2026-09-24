@@ -52,7 +52,7 @@ jobs:
           docker run --rm relay:ci python -c "
           import pathlib, sys
           missing = [p for p in ('app.py', 'ui/index.html', 'ui/app.js',
-                                 'examples/telegram_alerts.py', 'examples/proposal_bridge.py')
+                                 'examples/proposal_bridge.py', 'examples/mailer.py')
                      if not pathlib.Path(p).is_file()]
           print('missing from the image:', missing or 'nothing')
           sys.exit(1 if missing else 0)"

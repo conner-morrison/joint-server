@@ -203,9 +203,15 @@ same repository deployed again with a different start command is a worker that
 runs where the relay does rather than on somebody's laptop:
 
 ```
-Start command   python examples/telegram_alerts.py --channel jobs
-Variables       RELAY_URL, RELAY_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Start command   python examples/mailer.py --channel jobs
+Variables       RELAY_URL, RELAY_TOKEN, SMTP_URL, MAIL_TO
 ```
+
+Telegram does not need one of these. The server sends to a chat itself, from
+the console's **+ Telegram bot** button: a chat is somewhere to be sent to
+rather than something that connects, so there is nothing to enrol, approve or
+keep running. A worker doing the same job alongside it is how one alert
+becomes two.
 
 Set `RELAY_TOKEN` yourself. A container keeps no disk, so a worker that
 invents its own token comes back after every deploy as a stranger waiting to be
