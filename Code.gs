@@ -417,16 +417,21 @@ function parseJobs_(html) {
 
     let job = byKey[key];
     if (!job) {
-      job = { title: '', upworkUrl: null, vollnaProjectId: null, cells: [] };
+      job = { title: '', upworkUrl: null, vollnaProjectId: null, cells: [], slices: [] };
       byKey[key] = job;
       order.push(job);
     }
     if (!job.title && text && !NOT_A_TITLE.test(text)) job.title = text;
     if (!job.upworkUrl && jobId) job.upworkUrl = `https://www.upwork.com/jobs/${jobId}`;
     if (!job.vollnaProjectId && pid) job.vollnaProjectId = pid;
-    // The wrapper link repeats what the title link already said, so a line
-    // that is already held is not held twice.
-    cells.forEach(c => { if (job.cells.indexOf(c) < 0) job.cells.push(c); });
+    // A wrapper link repeats the whole slice the title link already gave, so
+    // an identical slice is dropped whole. Not line by line: a description
+    // may say the same short thing twice, and both times are part of it.
+    const slice = cells.join('\n');
+    if (slice && job.slices.indexOf(slice) < 0) {
+      job.slices.push(slice);
+      job.cells.push(...cells);
+    }
   });
 
   // A fragment with neither a name nor a link is markup, not a job.

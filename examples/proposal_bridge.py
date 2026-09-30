@@ -108,6 +108,20 @@ def http(method: str, url: str, body: Any = None, token: str = "", timeout: floa
             return exc.code, {"detail": raw.decode("utf-8", "replace")[:300]}
 
 
+def described(body: Any) -> str:
+    """The posting's own words, as the publisher sent them.
+
+    Worth having on its own so a run can say how much of a job actually
+    arrived. Nothing here shortens a description, so a short one means it was
+    already short when it was published - and that is the difference between
+    looking for the fault here and looking for it in the parser upstream.
+    """
+    if not isinstance(body, dict):
+        return ""
+    return next((body[key].strip() for key in JD_KEYS
+                 if isinstance(body.get(key), str) and body[key].strip()), "")
+
+
 def as_jd(body: Any) -> str:
     """A job description proposal-writer can work from.
 
@@ -251,7 +265,12 @@ class Bridge:
             say(f"proposal-writer refused #{msg['seq']}: {status} {body}")
             return True
         made = body.get("job") or body.get("mode") or "written"
-        say(f"#{msg['seq']} {as_title(jd)} -> {made}")
+        words = described(msg.get("body"))
+        say(f"#{msg['seq']} {as_title(jd)} -> {made} "
+            f"({len(words)} characters of description, {len(jd)} sent in all)")
+        if not words:
+            say(f"   #{msg['seq']} carried no description at all: only its title, terms "
+                f"and client reached proposal-writer, because that is all that was published")
         return True
 
     def run(self) -> None:

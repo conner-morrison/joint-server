@@ -184,6 +184,7 @@ function parseJobs_(html) {
         upworkUrl: jobId ? `https://www.upwork.com/jobs/${jobId}` : null,
         vollnaProjectId: pid || null,
         cells: [],
+        slices: [],
       };
       byJob.set(key, job);
       order.push(job);
@@ -194,7 +195,14 @@ function parseJobs_(html) {
     if (!job.title && title) job.title = title;
     if (!job.upworkUrl && jobId) job.upworkUrl = `https://www.upwork.com/jobs/${jobId}`;
     if (!job.vollnaProjectId && pid) job.vollnaProjectId = pid;
-    for (const cell of cells) if (!job.cells.includes(cell)) job.cells.push(cell);
+    // A wrapper link repeats the whole slice the title link already gave, so
+    // an identical slice is dropped whole. Not line by line: a description
+    // may say the same short thing twice, and both times are part of it.
+    const slice = cells.join('\n');
+    if (slice && job.slices.indexOf(slice) < 0) {
+      job.slices.push(slice);
+      job.cells.push(...cells);
+    }
   });
 
   // The longest thing said about a job is its description, wherever in the
