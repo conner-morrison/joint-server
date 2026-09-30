@@ -78,9 +78,14 @@ class BotSender:
         waiting = await scoped.messages_after(bot["channel"], int(bot["cursor"]), limit=20)
         sent = 0
         for message in waiting:
-            text = telegram.render(message["body"], channel=bot["channel"])
+            # Usually one. A job whose description is longer than Telegram will
+            # carry is rendered as a message and its continuation, and the
+            # cursor waits for the last part: half a job description delivered
+            # and then forgotten would be worse than delivering it again.
+            parts = telegram.render(message["body"], channel=bot["channel"])
             try:
-                await telegram.send(bot["bot_token"], bot["chat_id"], text, api=self.api)
+                for part in parts:
+                    await telegram.send(bot["bot_token"], bot["chat_id"], part, api=self.api)
             except telegram.TelegramError as exc:
                 if exc.retry_after:
                     log.info("telegram asked to wait %.0fs", exc.retry_after)

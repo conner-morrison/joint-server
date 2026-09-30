@@ -1114,3 +1114,28 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         await self.eventually(1)
         await asyncio.sleep(1.0)
         self.assertEqual([s["text"].count("~0222") > 0 for s in self.telegram.sent], [True])
+
+    async def test_a_long_description_arrives_whole_and_is_acknowledged_once(self) -> None:
+        """Telegram will not carry more than 4096 characters, and a job
+        description is sometimes longer. It continues into the message after
+        it, and the cursor moves once the last part has gone: half a
+        description delivered and then forgotten would be worse than
+        delivering it twice."""
+        from relay.telegram import LIMIT
+
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        jd = "\n".join(f"Paragraph {n}: " + "what the client wants. " * 14 for n in range(1, 30))
+        self.assertGreater(len(jd), LIMIT)
+        await self.call("POST", "/acme/api/channels/jobs/messages",
+                        {"body": {"source": "vollna", "type": "job",
+                                  "title": "Adaptive recommendation engine",
+                                  "description": jd}}, token="p")
+        await self.eventually(2)
+        await asyncio.sleep(1.0)                  # nothing more after the last part
+        arrived = " ".join(s["text"] for s in self.telegram.sent)
+        self.assertEqual(arrived.count("Paragraph 1:"), 1, "a part was sent twice")
+        for n in range(1, 30):
+            self.assertIn(f"Paragraph {n}:", arrived, f"paragraph {n} never arrived")
+        for part in self.telegram.sent:
+            self.assertLessEqual(len(part["text"]), LIMIT)

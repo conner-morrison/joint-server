@@ -24,6 +24,7 @@ log = logging.getLogger("relay.telegram")
 
 API = "https://api.telegram.org"
 LIMIT = 4096                              # characters Telegram accepts in one message
+MIN_JD = 320                              # too little room left to begin a description in
 FACTS = [("Budget", "budget"), ("Terms", "terms"), ("Published", "published"),
          ("Posted", "posted")]
 CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment", "paymentVerified"),
@@ -120,21 +121,56 @@ def source_tag(body: dict[str, Any]) -> str:
     return esc(source.replace("-", " ").replace("_", " ")) if source else ""
 
 
-def render(body: Any, channel: str = "") -> str:
-    """One message, formatted for a phone: what it is, what it pays, who is
-    asking, and a way in."""
+def fit(text: str, budget: int) -> tuple[str, str]:
+    """As much of `text` as fits in `budget` characters once escaped, and what
+    is left over. Broken at the end of a line where there is one, otherwise
+    between words, so a description continues mid-sentence only when a single
+    word is longer than a whole message.
+
+    Escaping is what decides the length: an ampersand becomes five characters,
+    so measuring the text as typed would overrun and Telegram would refuse the
+    message rather than shorten it.
+    """
+    if len(esc(text)) <= budget:
+        return text, ""
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if len(esc(text[:mid])) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    window = text[:low]
+    at = window.rfind("\n")
+    if at < budget // 4:
+        at = window.rfind(" ")
+    if at < budget // 4:
+        at = low                        # one unbroken run of characters
+    return text[:at].rstrip(), text[at:].lstrip()
+
+
+def render(body: Any, channel: str = "") -> list[str]:
+    """One job as one message: what it is, what it pays, who is asking, and a
+    way in, with the description under it.
+
+    A list, because Telegram will not carry more than LIMIT characters and a
+    job description is sometimes longer than that. Cutting it was the wrong
+    answer - the part that got cut is as much the job as the part that fit - so
+    a long description continues into the message after it. Everything a job
+    says arrives; only rarely in one piece.
+    """
     if not isinstance(body, dict):
-        return f"<pre>{esc(json.dumps(body, indent=2, ensure_ascii=False)[:1000])}</pre>"
+        return [f"<pre>{esc(json.dumps(body, indent=2, ensure_ascii=False)[:1000])}</pre>"]
 
     lines: list[str] = []
     # The channel is named even when nothing else about the source is known.
     # Two notifications for one job are two channels carrying it, or two bots
     # sending from one - and a line that says which turns that from a mystery
     # into something a person can see and fix.
-    head = "  ·  ".join(part for part in (
+    where = "  ·  ".join(part for part in (
         source_tag(body), f"#{esc(channel)}" if channel else "") if part)
-    if head:
-        lines.append(head)
+    if where:
+        lines.append(where)
 
     title = esc(body.get("title") or body.get("emailSubject") or "New message")
     links = links_of(body)
@@ -168,14 +204,26 @@ def render(body: Any, channel: str = "") -> str:
     if about:
         lines += ["", "<i>Client</i>", " · ".join(about)]
 
-    for key in JD_KEYS:
-        if isinstance(body.get(key), str) and body[key].strip():
-            text = body[key].strip()
-            room = LIMIT - sum(len(line) + 1 for line in lines) - 40
-            if room > 200:
-                lines += ["", esc(text[:room] + ("…" if len(text) > room else ""))]
-            break
-    return "\n".join(lines)[:LIMIT]
+    head = "\n".join(lines)
+    text = next((body[key].strip() for key in JD_KEYS
+                 if isinstance(body.get(key), str) and body[key].strip()), "")
+    if not text:
+        return [head[:LIMIT]]
+
+    # What is left of the message after the job's own facts, less the blank
+    # line that separates them from the description.
+    room = LIMIT - len(head) - 2
+    if room < MIN_JD:
+        # The facts filled the message. The description starts in the next one
+        # rather than being squeezed into a few words here.
+        messages, rest = [head], text
+    else:
+        piece, rest = fit(text, room)
+        messages = [f"{head}\n\n{esc(piece)}"]
+    while rest:
+        piece, rest = fit(rest, LIMIT)
+        messages.append(esc(piece))
+    return messages
 
 
 class TelegramError(Exception):
