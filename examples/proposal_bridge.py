@@ -199,7 +199,10 @@ class Bridge:
         joining the queue again under a second name.
         """
         if self.ticket:
-            status, body = http("GET", f"{self.relay}/enrol/{self.ticket}")
+            # Held open at the other end, so the answer arrives when the person
+            # clicks rather than on the next pass round this loop.
+            status, body = http("GET", f"{self.relay}/enrol/{self.ticket}?wait={self.args.wait}",
+                                timeout=self.args.wait + 20)
             if status == 200 and body.get("worker_id"):
                 self.worker_id = str(body["worker_id"])
                 self.state["worker_id"] = self.worker_id

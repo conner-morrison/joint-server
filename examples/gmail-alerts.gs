@@ -156,6 +156,10 @@ function checkMail() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) return;
   try {
+    // Asked first thing, not only when there is something to send: a worker
+    // approved while the inbox was quiet would otherwise sit there registered
+    // and not know it until the next email arrived.
+    collect_();
     const sent = new Set(loadIds_());
     for (const { source, query } of SOURCES) {
       const fresh = [];

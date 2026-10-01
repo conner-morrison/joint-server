@@ -190,11 +190,16 @@ worker  ->  POST /{ws}/enrol  {"name": "Office PC"}
 person  ->  approves it in the console, which shows the name and a fingerprint
             the worker printed too, so the right machine gets approved
 
-worker  ->  GET /{ws}/enrol/{ticket}
+worker  ->  GET /{ws}/enrol/{ticket}?wait=25
         <-  200 {"status": "registered", "worker_id": "w-9f3c…", "name": "Office PC"}
 
 worker  ->  everything after that, with Authorization: Bearer w-9f3c…
 ```
+
+The server never calls the worker: a worker has no address, which is the point
+of it dialling out. So it learns it was approved by asking - and with `wait` the
+question is held open, so the answer arrives when the person clicks rather than
+whenever the worker next had a reason to speak.
 
 The id is the worker's identity and its credential at once, so it is random,
 128 bits of it, and it deserves the care a password does. The console shows it

@@ -235,18 +235,33 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
                 "message": "waiting for someone to approve this worker in the console"}
 
     @app.get("/{ws}/enrol/{ticket}")
-    async def enrolled(ticket: str, response: Response,
+    async def enrolled(ticket: str, response: Response, wait: float = 0.0,
                        ws: str = Depends(workspace)) -> dict[str, Any]:
         """What came of a request. The worker asks until it is answered.
+
+        With `wait`, the request is held open until it is answered or the time
+        runs out, the same way a worker waits for messages. The server cannot
+        call a worker - a worker has no address, which is the whole point of it
+        dialling out - so a worker learns it was approved by asking. Holding the
+        question open is what makes the answer arrive when the person clicks
+        rather than whenever the worker next had a reason to speak.
 
         Answered once and then kept for a week, so a worker that lost the reply
         on the way can ask again instead of registering all over again.
         """
-        found = await db().ws(ws).registration(ticket)
-        if found is None:
-            raise HTTPException(404, {"status": "unknown",
-                                      "message": "no such request: it was declined, or it has expired. "
-                                                 "Ask again by name."})
+        scoped = db().ws(ws)
+        deadline = time.monotonic() + min(max(wait, 0.0), POLL_MAX_WAIT)
+        while True:
+            found = await scoped.registration(ticket)
+            if found is None:
+                raise HTTPException(404, {"status": "unknown",
+                                          "message": "no such request: it was declined, or it has "
+                                                     "expired. Ask again by name."})
+            if found["granted_id"] or time.monotonic() >= deadline:
+                break
+            # Approval is a person clicking, so a second is soon enough and
+            # costs one small query. There is nothing to notify on here.
+            await asyncio.sleep(min(1.0, max(deadline - time.monotonic(), 0.05)))
         if not found["granted_id"]:
             response.status_code = 202
             return {"status": "pending", "name": found["name"],

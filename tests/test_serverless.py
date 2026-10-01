@@ -338,6 +338,36 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                                        {"channel": "jobs", "body": 1}, token=old)
         self.assertEqual((status, said["status"]), (401, "unregistered"))
 
+    async def test_a_waiting_worker_hears_the_moment_it_is_approved(self) -> None:
+        """The server cannot call a worker - a worker has no address, which is
+        why it dials out - so it learns it was approved by asking. Holding the
+        question open is what makes the answer arrive when the person clicks,
+        rather than whenever the worker next had a reason to speak."""
+        ws = await self.workspace()
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+
+        async def approve_soon() -> None:
+            await asyncio.sleep(1.0)
+            await self.call("POST", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
+
+        started = time.monotonic()
+        clicker = asyncio.create_task(approve_soon())
+        status, got = await self.call("GET", f"/{ws}/enrol/{asked['ticket']}?wait=20")
+        took = time.monotonic() - started
+        await clicker
+        self.assertEqual((status, got["status"]), (200, "registered"), got)
+        self.assertTrue(got["worker_id"])
+        self.assertLess(took, 2.5, f"heard {took - 1:.1f}s after being approved")
+
+    async def test_a_held_question_gives_up_rather_than_hanging(self) -> None:
+        ws = await self.workspace()
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        started = time.monotonic()
+        status, body = await self.call("GET", f"/{ws}/enrol/{asked['ticket']}?wait=1")
+        self.assertEqual((status, body["status"]), (202, "pending"))
+        self.assertLess(time.monotonic() - started, 4)
+
     async def test_a_request_is_confined_to_its_workspace(self) -> None:
         acme = await self.workspace("Acme", "acme-pass")
         upwork = await self.workspace("Upwork", "upwork-pass")
@@ -1188,3 +1218,4 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"Paragraph {n}:", arrived, f"paragraph {n} never arrived")
         for part in self.telegram.sent:
             self.assertLessEqual(len(part["text"]), LIMIT)
+
