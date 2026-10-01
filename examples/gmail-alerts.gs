@@ -3,12 +3,17 @@
  *
  * Script properties (Project Settings -> Script properties):
  *   RELAY_URL      https://relay-xxx.up.railway.app/upwork   (the workspace, not the console)
- *   RELAY_TOKEN    this worker's own token; invent one, or let enrol() make it
  *   RELAY_CHANNEL  jobs
- *   RELAY_WORKER   gmail-bot
+ *   RELAY_NAME     what to call this worker in the console, e.g. Gmail alerts
  *
- * Run enrol() once, approve it in the console, then run setup() to install the
- * trigger. checkMail() runs every minute after that.
+ * Written by the script itself, not by you:
+ *   RELAY_TICKET   while a request is waiting to be approved
+ *   RELAY_ID       the id the relay gave this worker. It is the whole of this
+ *                  worker's identity and its way in, so treat it as a password.
+ *
+ * Run enrol() once and approve it in the console. The id arrives by itself;
+ * nothing is copied from the console to here. Then run setup() to install the
+ * trigger, and checkMail() runs every minute after that.
  *
  * Mail arrives from more than one place and in more than one shape. Every
  * source is read; what cannot be parsed into separate jobs is still sent, as
@@ -72,23 +77,72 @@ function setup() {
   Logger.log(`trigger installed; ${ids.length} existing messages marked as seen`);
 }
 
-/** Ask the relay to let this worker in. Run once; approve it in the console. */
+/**
+ * Ask the relay to let this worker in. Run once; approve it in the console.
+ *
+ * All this sends is a name. There is nothing to invent here and nothing to
+ * carry back from the console: the relay answers with a ticket, and once a
+ * person has said yes, that ticket is exchanged for the id this worker uses
+ * from then on. collect() does the exchange, and publishing does it too, so in
+ * practice there is nothing to run but this.
+ */
 function enrol() {
   const p = PropertiesService.getScriptProperties();
-  let token = p.getProperty('RELAY_TOKEN');
-  if (!token) {
-    token = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, '');
-    p.setProperty('RELAY_TOKEN', token);
-  }
   const res = UrlFetchApp.fetch(base_() + '/enrol', {
     method: 'post', contentType: 'application/json', muteHttpExceptions: true,
-    payload: JSON.stringify({
-      worker_id: p.getProperty('RELAY_WORKER') || 'gmail-bot',
-      token: token,
-      label: 'Gmail alerts',
-    }),
+    payload: JSON.stringify({ name: p.getProperty('RELAY_NAME') || 'Gmail alerts',
+                              label: 'Gmail alerts (Apps Script)' }),
   });
-  Logger.log(res.getContentText());
+  const said = JSON.parse(res.getContentText() || '{}');
+  if (said.ticket) {
+    p.setProperty('RELAY_TICKET', said.ticket);
+    p.deleteProperty('RELAY_ID');
+    Logger.log('asked to join as "' + said.name + '". Approve it in the console; '
+               + 'the id arrives on its own.');
+    return;
+  }
+  Logger.log('could not ask to join: ' + res.getResponseCode() + ' ' + res.getContentText());
+}
+
+/**
+ * Collect the id, if a person has approved the request by now.
+ *
+ * Returns the id, or an empty string while there is still nothing to collect.
+ * Safe to call as often as you like: once the id is here it does nothing.
+ */
+function collect_() {
+  const p = PropertiesService.getScriptProperties();
+  const known = p.getProperty('RELAY_ID');
+  if (known) return known;
+  const ticket = p.getProperty('RELAY_TICKET');
+  if (!ticket) return '';
+  const res = UrlFetchApp.fetch(base_() + '/enrol/' + encodeURIComponent(ticket),
+                                { muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  const said = JSON.parse(res.getContentText() || '{}');
+  if (code === 200 && said.worker_id) {
+    p.setProperty('RELAY_ID', said.worker_id);
+    p.deleteProperty('RELAY_TICKET');
+    console.log('registered as "' + said.name + '"');
+    return said.worker_id;
+  }
+  if (code === 404) {
+    // Declined, or waited so long the relay forgot it. Asking again is the
+    // only thing that can help, and it costs one request.
+    p.deleteProperty('RELAY_TICKET');
+    console.log('the request is gone; asking again');
+    enrol();
+  }
+  return '';
+}
+
+/** What came of the request, in words, for the Run dropdown. */
+function registration() {
+  const p = PropertiesService.getScriptProperties();
+  const id = collect_();
+  if (id) Logger.log('registered. The id is in RELAY_ID; treat it as a password.');
+  else if (p.getProperty('RELAY_TICKET')) Logger.log('waiting to be approved in the console');
+  else Logger.log('not registered and not waiting: run enrol()');
 }
 
 /** Send one message, to check the relay accepts this worker. */
@@ -231,13 +285,21 @@ function base_() {
 
 function post_(body, id) {
   const p = PropertiesService.getScriptProperties();
+  // Nothing can be published until this worker has been given an id, and the
+  // moment it has, everything waiting goes. Checking here is what makes
+  // approval take effect by itself.
+  const worker = collect_();
+  if (!worker) {
+    console.log('not registered yet; nothing published. Approve it in the console.');
+    return false;
+  }
   const payload = { channel: p.getProperty('RELAY_CHANNEL') || 'jobs', body: body };
   if (id) payload.id = id;
   try {
     const res = UrlFetchApp.fetch(base_() + '/publish', {
       method: 'post',
       contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + p.getProperty('RELAY_TOKEN') },
+      headers: { Authorization: 'Bearer ' + worker },
       payload: JSON.stringify(payload),
       muteHttpExceptions: true,
     });
@@ -249,7 +311,15 @@ function post_(body, id) {
       if (said.duplicate) console.log('already posted, skipped: ' + id);
       return true;
     }
-    // 401 is "who are you", 403 is "not yet approved" or "not in that channel".
+    if (code === 401) {
+      // The id this worker held means nothing to the relay any more: it was
+      // removed, or given a new one. Asking again is how it gets back in.
+      p.deleteProperty('RELAY_ID');
+      console.error('the relay does not know this id any more; asking to join again');
+      enrol();
+      return false;
+    }
+    // 403 is "not in that channel".
     console.error(`Relay answered ${code}: ${res.getContentText().slice(0, 300)}`);
   } catch (e) {
     console.error('Relay unreachable: ' + e);

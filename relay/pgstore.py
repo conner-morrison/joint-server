@@ -45,27 +45,41 @@ CREATE TABLE IF NOT EXISTS workspaces (
     created_at    DOUBLE PRECISION NOT NULL
 );
 
+-- A worker is known by an id this server gave it. The id is its name to the
+-- server and its way in at once, so it is random and long: everything else
+-- about a worker can be edited, and none of it is what lets it speak.
+--
+-- `name` is what a person calls it, and need not be unique - two machines may
+-- both reasonably be called "gmail". `token_hash` is only ever set on a worker
+-- registered before ids existed, and is how that worker still gets in.
 CREATE TABLE IF NOT EXISTS workers (
     workspace   TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
     worker_id   TEXT NOT NULL,
-    token_hash  TEXT NOT NULL UNIQUE,        -- unique everywhere: a token names its workspace too
+    name        TEXT NOT NULL DEFAULT '',
+    token_hash  TEXT UNIQUE,
     label       TEXT NOT NULL DEFAULT '',
     created_at  DOUBLE PRECISION NOT NULL,
     last_seen   DOUBLE PRECISION,
     PRIMARY KEY (workspace, worker_id)
 );
 
--- A worker that turned up unannounced. It has chosen an id and a token and
--- is waiting for a person to say yes; until then the token opens nothing.
-CREATE TABLE IF NOT EXISTS pending_workers (
+-- A worker asking to join. It has nothing to offer but what it is called:
+-- there is no credential for it to invent, and none for a person to carry
+-- anywhere. The ticket is the one secret involved, it belongs to the request
+-- rather than to the worker, and it is only good for asking what came of it.
+-- `granted_id` is the answer, kept until the worker has collected it so that a
+-- lost reply costs a retry rather than a registration.
+CREATE TABLE IF NOT EXISTS registrations (
     workspace    TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
-    worker_id    TEXT NOT NULL,
-    token_hash   TEXT NOT NULL,
+    ref          TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    ticket_hash  TEXT NOT NULL,
     label        TEXT NOT NULL DEFAULT '',
+    granted_id   TEXT,
     requested_at DOUBLE PRECISION NOT NULL,
-    PRIMARY KEY (workspace, worker_id)
+    PRIMARY KEY (workspace, ref)
 );
-CREATE INDEX IF NOT EXISTS pending_token ON pending_workers(token_hash);
+CREATE INDEX IF NOT EXISTS registrations_ticket ON registrations(ticket_hash);
 
 CREATE TABLE IF NOT EXISTS channels (
     workspace   TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
@@ -196,6 +210,29 @@ ONLINE_WINDOW = float(os.environ.get("RELAY_ONLINE_WINDOW", "75"))
 UPWORK_JOB = re.compile(r"~[0-9a-z]+", re.I)
 
 
+WORKER_NAME_RE = re.compile(r"^[^\x00-\x1f]{1,64}$")
+
+
+def check_worker_name(name: str) -> str:
+    """What a worker calls itself, tidied. A name is shown to people and is
+    nothing else: it does not have to be unique, and it never has to be typed
+    into an address, so it may contain whatever reads well."""
+    said = " ".join((name or "").split())
+    if not said or not WORKER_NAME_RE.match(said):
+        raise ValueError("a worker needs a name of 1 to 64 characters")
+    return said
+
+
+def new_worker_id() -> str:
+    """The id this server gives a worker when it is registered.
+
+    It identifies the worker and lets it in, both, which is why it is random
+    and not counted: a guessable id would be a way into a workspace. Shaped so
+    it is safe in an address, because it travels in one.
+    """
+    return "w-" + secrets.token_hex(16)
+
+
 def job_key(url_or_key: str) -> str:
     """The id a job is known by, from a link or from an id already formed."""
     said = (url_or_key or "").strip()
@@ -265,6 +302,7 @@ class PgStore:
             except (errors.DuplicateTable, errors.DuplicateObject, errors.UniqueViolation):
                 pass
         await self._widen_dedupe()
+        await self._retire_tokens()
 
     async def _widen_dedupe(self) -> None:
         """Move an existing database from per-sender dedupe to per-workspace.
@@ -301,6 +339,35 @@ class PgStore:
                 log.info("dedupe now covers every publisher in a workspace")
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
             log.warning("could not widen dedupe (%s); the old rule still applies",
+                        type(exc).__name__)
+
+    async def _retire_tokens(self) -> None:
+        """Move an existing database to workers identified by an id.
+
+        A worker used to arrive with an id and a token it chose itself. Now it
+        arrives with a name and the server gives it an id. The workers already
+        registered keep their token, because the alternative is a pipeline that
+        stops at deploy time and three machines to go and edit before it runs
+        again; their name becomes the id they were registered under, which is
+        what a person had been reading all along.
+
+        Requests still waiting under the old flow cannot be honoured - their
+        whole premise was a token the worker brought - so that table goes.
+
+        Never at the cost of starting: a deployment that cannot migrate should
+        still serve the workers it has.
+        """
+        try:
+            async with self.pool.connection() as conn:
+                await conn.execute(
+                    "ALTER TABLE workers ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''")
+                # Written before ids existed: the id was the name.
+                await conn.execute("UPDATE workers SET name = worker_id WHERE name = ''")
+                # A worker registered from now on has no token at all.
+                await conn.execute("ALTER TABLE workers ALTER COLUMN token_hash DROP NOT NULL")
+                await conn.execute("DROP TABLE IF EXISTS pending_workers")
+        except Exception as exc:                 # noqa: BLE001 - reported, never fatal
+            log.warning("could not move workers onto ids (%s); they keep their tokens",
                         type(exc).__name__)
 
     async def _all(self, sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
@@ -368,15 +435,6 @@ class PgStore:
         """Slugs and names only. Never the password hashes."""
         return await self._all("SELECT slug, name, created_at FROM workspaces ORDER BY slug")
 
-    async def workspace_for_token(self, token: str) -> tuple[str, str] | None:
-        """(workspace, worker_id) for a worker token. Tokens are unique across
-        the deployment, so a worker's token says which workspace it is in and
-        the address never has to be trusted for that."""
-        if not token:
-            return None
-        row = await self._one("SELECT workspace, worker_id FROM workers WHERE token_hash = %s", (_hash(token),))
-        return (row["workspace"], row["worker_id"]) if row else None
-
     # --- bot delivery, across every workspace ----------------------------
     async def bots_with_work(self, limit: int = 50) -> list[dict[str, Any]]:
         """Bot memberships that have something waiting. Asked deployment-wide,
@@ -415,24 +473,54 @@ class WorkspaceStore:
         self.slug = slug
 
     # --- workers ---------------------------------------------------------
-    async def add_worker(self, worker_id: str, label: str = "") -> str:
-        check_name("worker", worker_id)
-        token = secrets.token_urlsafe(32)
-        try:
-            await self.store._run(
-                "INSERT INTO workers(workspace, worker_id, token_hash, label, created_at) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (self.slug, worker_id, _hash(token), label, time.time()))
-        except errors.UniqueViolation:
-            raise ValueError(f"worker {worker_id!r} already exists") from None
-        return token
+    async def add_worker(self, name: str, label: str = "") -> dict[str, Any]:
+        """Register a worker outright, without waiting to be asked. The id is
+        the server's to give, here as everywhere."""
+        name = check_worker_name(name)
+        worker_id = new_worker_id()
+        await self.store._run(
+            "INSERT INTO workers(workspace, worker_id, name, label, created_at) "
+            "VALUES (%s, %s, %s, %s, %s)", (self.slug, worker_id, name, label, time.time()))
+        return {"worker_id": worker_id, "name": name}
 
-    async def rotate_token(self, worker_id: str) -> str | None:
-        token = secrets.token_urlsafe(32)
+    async def rename_worker(self, worker_id: str, name: str) -> str | None:
+        """A name is only what people call it, so it can be corrected without
+        anything else changing: the id goes on working."""
+        name = check_worker_name(name)
         changed = await self.store._run(
-            "UPDATE workers SET token_hash = %s WHERE workspace = %s AND worker_id = %s",
-            (_hash(token), self.slug, worker_id))
-        return token if changed else None
+            "UPDATE workers SET name = %s WHERE workspace = %s AND worker_id = %s",
+            (name, self.slug, worker_id))
+        return name if changed else None
+
+    async def reissue_id(self, worker_id: str) -> dict[str, Any] | None:
+        """A new id for a worker whose id got out, keeping everything else: the
+        same name, the same channels, the same place in each of them.
+
+        Done as a new row the memberships are moved onto, because the id is
+        what they are keyed by. The old id stops working the moment this
+        returns, which is the point of asking for it.
+        """
+        row = await self.store._one(
+            "SELECT name, label, created_at FROM workers WHERE workspace = %s AND worker_id = %s",
+            (self.slug, worker_id))
+        if row is None:
+            return None
+        fresh = new_worker_id()
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO workers(workspace, worker_id, name, label, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (self.slug, fresh, row["name"], row["label"], row["created_at"]))
+                await conn.execute(
+                    "UPDATE members SET worker_id = %s WHERE workspace = %s AND worker_id = %s",
+                    (fresh, self.slug, worker_id))
+                await conn.execute(
+                    "UPDATE redeliveries SET worker_id = %s WHERE workspace = %s AND worker_id = %s",
+                    (fresh, self.slug, worker_id))
+                await conn.execute("DELETE FROM workers WHERE workspace = %s AND worker_id = %s",
+                                   (self.slug, worker_id))
+        return {"worker_id": fresh, "name": row["name"]}
 
     async def remove_worker(self, worker_id: str) -> bool:
         return await self.store._run("DELETE FROM workers WHERE workspace = %s AND worker_id = %s",
@@ -442,117 +530,126 @@ class WorkspaceStore:
         return await self.store._one("SELECT 1 FROM workers WHERE workspace = %s AND worker_id = %s",
                                      (self.slug, worker_id)) is not None
 
-    async def worker_for_token(self, token: str) -> str | None:
-        """The worker this token belongs to, but only if it is in this
-        workspace: a token from another one is no token at all here."""
-        found = await self.store.workspace_for_token(token)
-        return found[1] if found and found[0] == self.slug else None
+    async def name_of(self, worker_id: str) -> str:
+        """What to call a worker when showing it to a person. Falls back to the
+        id, which is all there is to say about a worker that has no name."""
+        row = await self.store._one(
+            "SELECT name FROM workers WHERE workspace = %s AND worker_id = %s",
+            (self.slug, worker_id))
+        return str(row["name"] or worker_id) if row else worker_id
+
+    async def authenticate(self, presented: str) -> str | None:
+        """The worker behind what arrived in the Authorization header.
+
+        Normally the id itself: it is the credential now, so a worker needs
+        nothing else to carry. A worker registered before ids existed is found
+        by its token instead, so a pipeline that was working did not stop the
+        day this changed. Scoped to this workspace, because the address already
+        says which workspace is being asked.
+        """
+        if not presented:
+            return None
+        row = await self.store._one(
+            "SELECT worker_id FROM workers "
+            " WHERE workspace = %s AND worker_id = %s AND token_hash IS NULL",
+            (self.slug, presented))
+        if row is not None:
+            return str(row["worker_id"])
+        row = await self.store._one(
+            "SELECT worker_id FROM workers WHERE workspace = %s AND token_hash = %s",
+            (self.slug, _hash(presented)))
+        return str(row["worker_id"]) if row else None
 
     async def touch_worker(self, worker_id: str) -> None:
         await self.store._run("UPDATE workers SET last_seen = %s WHERE workspace = %s AND worker_id = %s",
                               (time.time(), self.slug, worker_id))
 
     async def list_workers(self) -> list[dict[str, Any]]:
+        """Name first: it is what a person reads. The id comes too, because it
+        is what the worker was given and what it is identified by here."""
         rows = await self.store._all(
-            "SELECT worker_id, label, created_at, last_seen, "
+            "SELECT worker_id, name, label, created_at, last_seen, "
+            "       (token_hash IS NOT NULL) AS legacy, "
             "       (last_seen IS NOT NULL AND last_seen > %s) AS online "
-            "  FROM workers WHERE workspace = %s ORDER BY worker_id",
+            "  FROM workers WHERE workspace = %s ORDER BY name, worker_id",
             (time.time() - ONLINE_WINDOW, self.slug))
         channels: dict[str, list[str]] = {}
         for m in await self.store._all(
                 "SELECT worker_id, channel FROM members WHERE workspace = %s ORDER BY channel", (self.slug,)):
             channels.setdefault(m["worker_id"], []).append(m["channel"])
-        return [{**r, "channels": channels.get(r["worker_id"], [])} for r in rows]
+        return [{**r, "name": r["name"] or r["worker_id"],
+                 "channels": channels.get(r["worker_id"], [])} for r in rows]
 
-    # --- enrolment -------------------------------------------------------
-    # A worker arrives with no credentials anyone recognises. Rather than a
-    # person going to the server to mint a token and carrying it back, the
-    # worker proposes an id and a token it made itself, and a person approves
-    # it here. Nothing it sent works until they do.
-    async def request_worker(self, worker_id: str, token: str, label: str = "") -> str:
-        """Ask to join. Returns "pending". Raises if the id is taken by a
-        registered worker, which stops a newcomer claiming an existing name."""
-        check_name("worker", worker_id)
-        if not token:
-            raise ValueError("a token is required")
-        if await self.worker_exists(worker_id):
-            raise ValueError(f"worker {worker_id!r} is already registered")
-        # A token is the whole of a worker's identity: it is all that arrives
-        # with a request. Two workers holding one would be one worker to this
-        # server - the same channels, and one cursor between them, so whichever
-        # acknowledged first would quietly consume the other's messages.
-        taken = await self.store.workspace_for_token(token)
-        if taken is not None:
-            raise ValueError(
-                f"that token already belongs to worker {taken[1]!r}. Each worker needs its "
-                "own: a token is how this server tells one worker from another, and two "
-                "sharing one would each miss what the other collected")
-        # A repeat from the same worker replaces its own request: one that lost
-        # its token can ask again rather than being stuck pending for ever.
-        await self.store._run("""
-            INSERT INTO pending_workers(workspace, worker_id, token_hash, label, requested_at)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (workspace, worker_id)
-            DO UPDATE SET token_hash = EXCLUDED.token_hash,
-                          label = EXCLUDED.label,
-                          requested_at = EXCLUDED.requested_at""",
-            (self.slug, worker_id, _hash(token), label, time.time()))
-        return "pending"
+    # --- registering -----------------------------------------------------
+    # A worker arrives knowing nothing and holding nothing. It says what it is
+    # called; a person here says yes; the server gives it an id and that id is
+    # how it speaks from then on. Nobody copies a secret from one machine to
+    # another at any point, because there is never one to copy.
+    async def request_worker(self, name: str, label: str = "") -> dict[str, Any]:
+        """Ask to join. Returns the ticket to come back with, which is good for
+        one thing: asking what came of this request."""
+        name = check_worker_name(name)
+        ticket = secrets.token_urlsafe(32)
+        ref = secrets.token_hex(8)
+        await self.store._run(
+            "INSERT INTO registrations(workspace, ref, name, ticket_hash, label, requested_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (self.slug, ref, name, _hash(ticket), label, time.time()))
+        # An answered request is kept only so a worker that missed the answer
+        # can ask again. After a week it has either collected it or gone.
+        await self.store._run(
+            "DELETE FROM registrations WHERE workspace = %s AND granted_id IS NOT NULL "
+            "  AND requested_at < %s", (self.slug, time.time() - 7 * 86400))
+        return {"ref": ref, "ticket": ticket, "name": name}
 
-    async def is_pending(self, token: str) -> str | None:
-        """The worker id this token is waiting as, if it is waiting."""
-        if not token:
+    async def registration(self, ticket: str) -> dict[str, Any] | None:
+        """What came of a request, for the worker that made it."""
+        if not ticket:
             return None
-        row = await self.store._one(
-            "SELECT worker_id FROM pending_workers WHERE workspace = %s AND token_hash = %s",
-            (self.slug, _hash(token)))
-        return row["worker_id"] if row else None
+        return await self.store._one(
+            "SELECT ref, name, label, granted_id, requested_at FROM registrations "
+            " WHERE workspace = %s AND ticket_hash = %s", (self.slug, _hash(ticket)))
+
+    async def is_pending(self, ticket: str) -> str | None:
+        """The name a ticket is waiting as, if it is still waiting."""
+        found = await self.registration(ticket)
+        return None if found is None or found["granted_id"] else str(found["name"])
 
     async def list_pending(self) -> list[dict[str, Any]]:
         """What is waiting for a person. The fingerprint is the start of the
-        token's hash: the worker can print the same thing, so whoever approves
-        can check they are approving the machine in front of them."""
+        ticket's hash, which the worker prints too, so whoever approves can
+        check they are approving the machine in front of them rather than
+        whatever else happened to ask at the same moment."""
         rows = await self.store._all(
-            "SELECT worker_id, token_hash, label, requested_at FROM pending_workers "
-            "WHERE workspace = %s ORDER BY requested_at", (self.slug,))
-        return [{"worker_id": r["worker_id"], "label": r["label"],
-                 "requested_at": r["requested_at"], "fingerprint": r["token_hash"][:12]}
+            "SELECT ref, name, label, ticket_hash, requested_at FROM registrations "
+            " WHERE workspace = %s AND granted_id IS NULL ORDER BY requested_at", (self.slug,))
+        return [{"ref": r["ref"], "name": r["name"], "label": r["label"],
+                 "requested_at": r["requested_at"], "fingerprint": r["ticket_hash"][:12]}
                 for r in rows]
 
-    async def approve_worker(self, worker_id: str) -> bool:
-        """Turn a request into a worker, keeping the token it proposed, so the
-        work it was already trying to do simply starts succeeding."""
+    async def approve_worker(self, ref: str) -> dict[str, Any] | None:
+        """Say yes: the worker is registered and given its id. Approving twice
+        gives the same id rather than a second worker."""
         row = await self.store._one(
-            "SELECT token_hash, label FROM pending_workers WHERE workspace = %s AND worker_id = %s",
-            (self.slug, worker_id))
+            "SELECT name, label, granted_id FROM registrations WHERE workspace = %s AND ref = %s",
+            (self.slug, ref))
         if row is None:
-            return False
-        try:
-            await self.store._run(
-                "INSERT INTO workers(workspace, worker_id, token_hash, label, created_at) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (self.slug, worker_id, row["token_hash"], row["label"], time.time()))
-        except errors.UniqueViolation:
-            # Either the id was taken while this waited, or the token was. The
-            # difference matters to whoever is looking at the request, so the
-            # request is kept and the reason said out loud rather than the
-            # whole thing vanishing as "nothing waiting".
-            clash = await self.store._one(
-                "SELECT worker_id FROM workers WHERE token_hash = %s", (row["token_hash"],))
-            if clash is not None:
-                raise ValueError(
-                    f"{worker_id!r} offered the same token as worker {clash['worker_id']!r}. "
-                    "Give it a token of its own and ask again: a token is how this server "
-                    "tells one worker from another") from None
-            await self.reject_worker(worker_id)
-            return False
-        await self.reject_worker(worker_id)
-        return True
+            return None
+        if row["granted_id"]:
+            return {"worker_id": str(row["granted_id"]), "name": str(row["name"])}
+        worker_id = new_worker_id()
+        await self.store._run(
+            "INSERT INTO workers(workspace, worker_id, name, label, created_at) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (self.slug, worker_id, row["name"], row["label"], time.time()))
+        await self.store._run(
+            "UPDATE registrations SET granted_id = %s WHERE workspace = %s AND ref = %s",
+            (worker_id, self.slug, ref))
+        return {"worker_id": worker_id, "name": str(row["name"])}
 
-    async def reject_worker(self, worker_id: str) -> bool:
+    async def reject_worker(self, ref: str) -> bool:
         return await self.store._run(
-            "DELETE FROM pending_workers WHERE workspace = %s AND worker_id = %s",
-            (self.slug, worker_id)) > 0
+            "DELETE FROM registrations WHERE workspace = %s AND ref = %s", (self.slug, ref)) > 0
 
     # --- channels --------------------------------------------------------
     async def add_channel(self, name: str, description: str = "") -> None:
@@ -578,10 +675,16 @@ class WorkspaceStore:
                    (SELECT COUNT(*) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS messages,
                    (SELECT MAX(seq) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS last_seq
               FROM channels c WHERE c.workspace = %s ORDER BY c.name""", (self.slug,))
-        members: dict[str, list[str]] = {}
-        for m in await self.store._all(
-                "SELECT channel, worker_id FROM members WHERE workspace = %s ORDER BY worker_id", (self.slug,)):
-            members.setdefault(m["channel"], []).append(m["worker_id"])
+        # Each member as both of its names: the one a person reads, and the id
+        # every request about that member is made with.
+        members: dict[str, list[dict[str, Any]]] = {}
+        for m in await self.store._all("""
+                SELECT m.channel, m.worker_id, COALESCE(NULLIF(w.name, ''), m.worker_id) AS name
+                  FROM members m LEFT JOIN workers w
+                    ON w.workspace = m.workspace AND w.worker_id = m.worker_id
+                 WHERE m.workspace = %s ORDER BY name, m.worker_id""", (self.slug,)):
+            members.setdefault(m["channel"], []).append(
+                {"worker_id": m["worker_id"], "name": m["name"]})
         return [{**r, "members": members.get(r["name"], [])} for r in rows]
 
     # --- membership ------------------------------------------------------
@@ -614,10 +717,17 @@ class WorkspaceStore:
             "SELECT 1 FROM members WHERE workspace = %s AND channel = %s AND worker_id = %s",
             (self.slug, channel, worker_id)) is not None
 
-    async def members_of(self, channel: str) -> list[str]:
-        return [r["worker_id"] for r in await self.store._all(
-            "SELECT worker_id FROM members WHERE workspace = %s AND channel = %s ORDER BY worker_id",
-            (self.slug, channel))]
+    async def members_of(self, channel: str) -> list[dict[str, Any]]:
+        """Who is in a channel: the id each one is keyed by, and the name to
+        show for it. Both, because a person reads the name and every request
+        about a member is made with the id."""
+        return [{"worker_id": r["worker_id"], "name": r["name"] or r["worker_id"]}
+                for r in await self.store._all("""
+            SELECT m.worker_id, COALESCE(w.name, '') AS name
+              FROM members m LEFT JOIN workers w
+                ON w.workspace = m.workspace AND w.worker_id = m.worker_id
+             WHERE m.workspace = %s AND m.channel = %s
+             ORDER BY w.name, m.worker_id""", (self.slug, channel))]
 
     async def channels_of(self, worker_id: str) -> dict[str, int]:
         """channel -> acknowledged cursor, for every channel the worker is in."""
@@ -691,15 +801,17 @@ class WorkspaceStore:
         up to date. A count of what is still waiting separates them.
         """
         workers = await self.store._all("""
-            SELECT m.worker_id AS name, m.cursor,
+            SELECT m.worker_id, COALESCE(NULLIF(w.name, ''), m.worker_id) AS name,
+                   m.cursor,
                    (SELECT COUNT(*) FROM messages g
                      WHERE g.workspace = m.workspace AND g.channel = m.channel
                        AND g.seq > m.cursor AND g.sender <> m.worker_id) AS waiting
-              FROM members m
+              FROM members m LEFT JOIN workers w
+                ON w.workspace = m.workspace AND w.worker_id = m.worker_id
              WHERE m.workspace = %s AND m.channel = %s
-             ORDER BY m.worker_id""", (self.slug, channel))
+             ORDER BY w.name, m.worker_id""", (self.slug, channel))
         bots = await self.store._all("""
-            SELECT b.bot AS name, b.cursor,
+            SELECT b.bot AS worker_id, b.bot AS name, b.cursor,
                    (SELECT COUNT(*) FROM messages g
                      WHERE g.workspace = b.workspace AND g.channel = b.channel
                        AND g.seq > b.cursor) AS waiting

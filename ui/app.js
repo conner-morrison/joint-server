@@ -778,13 +778,14 @@ function renderChannelsList() {
   box.replaceChildren(h("div", { class: "table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {}, ["Channel", "Members", "Messages", ""].map((t) => h("th", {}, t)))),
     h("tbody", {}, state.channels.map((c) => {
-      const online = c.members.filter((m) => state.online.has(m)).length;
+      const online = c.members.filter((m) => state.online.has(m.worker_id)).length;
       return h("tr", {},
         h("td", {}, h("div", {},
           h("div", { class: "strong" }, h("span", { class: "hash" }, "#"), c.name),
           c.description && h("div", { class: "muted small" }, c.description))),
         h("td", {}, c.members.length
-          ? h("div", { class: "chips" }, c.members.map((m) => h("span", { class: "chip" }, dot(state.online.has(m)), m)))
+          ? h("div", { class: "chips" }, c.members.map((m) => h("span", { class: "chip", title: m.worker_id },
+            dot(state.online.has(m.worker_id)), m.name || m.worker_id)))
           : h("span", { class: "muted" }, "none")),
         h("td", { class: "muted nowrap" }, `${c.messages} retained`,
           c.members.length ? h("div", { class: "small" }, `${online}/${c.members.length} online`) : false),
@@ -861,21 +862,30 @@ function renderWorkersTable() {
           h("button", { class: "btn small danger", onclick: () => removeBot(b.name) }, "Remove")))),
       state.workers.map((w) => {
       const online = state.online.has(w.worker_id);
+      // The name is what this worker is called; the id is what it is. Both are
+      // shown, because the name is what you read and the id is what the
+      // server and the worker itself use.
       return h("tr", {},
         h("td", {}, h("div", { class: "who" }, dot(online),
-          h("div", {}, h("div", { class: "mono strong" }, w.worker_id), w.label && h("div", { class: "muted small" }, w.label)))),
+          h("div", {},
+            h("div", { class: "strong truncate" }, w.name || w.worker_id),
+            h("div", { class: "muted small mono truncate", title: w.worker_id }, w.worker_id),
+            w.label && h("div", { class: "muted small" }, w.label),
+            w.legacy && h("div", { class: "muted small" }, "signs in with its old token")))),
         h("td", {}, w.channels.length
           ? h("div", { class: "chips" }, w.channels.map((c) => h("a", { class: "chip", href: "#/channel/" + enc(c) }, "#" + c)))
           : h("span", { class: "muted" }, "none")),
         h("td", { class: "muted nowrap" }, online ? "online now" : ago(w.last_seen)),
         h("td", { class: "actions" },
-          h("button", { class: "btn small", onclick: () => rotateToken(w.worker_id) }, "New token"),
-          h("button", { class: "btn small danger", onclick: () => removeWorker(w.worker_id) }, "Remove")));
+          h("button", { class: "btn small", onclick: () => renameWorker(w.worker_id, w.name || "") }, "Rename"),
+          h("button", { class: "btn small", onclick: () => reissueId(w.worker_id, w.name || w.worker_id) }, "New id"),
+          h("button", { class: "btn small danger", onclick: () => removeWorker(w.worker_id, w.name || w.worker_id) }, "Remove")));
     })))));
 }
 
-// Workers that turned up on their own and are waiting for a person. Approving
-// keeps the token the worker chose, so it carries on with what it was doing.
+// Workers that turned up on their own and are waiting for a person. A request
+// brings a name and nothing else; saying yes is what creates the worker and
+// gives it the id it will use from then on.
 function renderPending() {
   if (!state.pending.length) return null;
   return h("div", { class: "pending" },
@@ -883,31 +893,31 @@ function renderPending() {
       h("strong", {}, state.pending.length === 1 ? "A worker is asking to join"
         : `${state.pending.length} workers are asking to join`),
       h("span", { class: "muted small" },
-        "Approve only what you recognise: the code below is the start of the token's fingerprint, "
-        + "which the worker can print too.")),
+        "Approve only what you recognise. A name proves nothing on its own, so compare the code "
+        + "below with the one the worker printed when it asked.")),
     state.pending.map((p) => h("div", { class: "pending-row" },
       h("div", { class: "grow" },
-        h("div", { class: "mono strong" }, p.worker_id),
+        h("div", { class: "strong truncate" }, p.name),
         h("div", { class: "muted small" },
           p.label ? p.label + " · " : "", "fingerprint ", h("code", {}, p.fingerprint),
           " · asked ", ago(p.requested_at))),
-      h("button", { class: "btn small primary", onclick: () => approveWorker(p.worker_id) }, "Approve"),
-      h("button", { class: "btn small danger", onclick: () => rejectWorker(p.worker_id) }, "Reject"))));
+      h("button", { class: "btn small primary", onclick: () => approveWorker(p.ref, p.name) }, "Approve"),
+      h("button", { class: "btn small danger", onclick: () => rejectWorker(p.ref, p.name) }, "Reject"))));
 }
 
-async function approveWorker(workerId) {
+async function approveWorker(ref, name) {
   try {
-    await api("POST", "/api/pending/" + enc(workerId));
-    toast(`${workerId} approved. Add it to the channels it should use.`);
+    const res = await api("POST", "/api/pending/" + enc(ref));
     await refreshAll();
+    showId(res.name, res.worker_id, "registered");
   } catch (err) { handleError(err); }
 }
 
-async function rejectWorker(workerId) {
-  if (!confirm(`Refuse ${workerId}?\n\nIts request is discarded and the token it chose stops working. `
+async function rejectWorker(ref, name) {
+  if (!confirm(`Refuse ${name}?\n\nIts request is discarded and it is given no id. `
     + "It can ask again.")) return;
   try {
-    await api("DELETE", "/api/pending/" + enc(workerId));
+    await api("DELETE", "/api/pending/" + enc(ref));
     await refreshAll();
   } catch (err) { handleError(err); }
 }
@@ -983,17 +993,18 @@ async function removeBotMember(channel, bot) {
 }
 
 function openNewWorker() {
-  const id = h("input", { type: "text", required: true, pattern: NAME_PATTERN, placeholder: "scout-1", autocomplete: "off", spellcheck: "false" });
-  const label = h("input", { type: "text", placeholder: "Office PC, 2nd floor" });
+  const name = h("input", { type: "text", required: true, maxLength: "64", placeholder: "Office PC", autocomplete: "off" });
+  const label = h("input", { type: "text", placeholder: "the scraper on the 2nd floor" });
   const err = h("p", { class: "error", hidden: true });
   openDialog("New worker",
-    [field("Worker ID", id, "Letters, digits, _ . - (up to 64)."), field("Label", label, "Optional note for yourself."), err],
+    [field("Name", name, "What you want to call it. Up to 64 characters, and it need not be unique."),
+     field("Label", label, "Optional note for yourself."), err],
     [cancel(), h("button", { class: "btn primary", type: "submit" }, "Create")],
     async (dlg) => {
       try {
-        const res = await api("POST", "/api/workers", { worker_id: id.value.trim(), label: label.value.trim() });
+        const res = await api("POST", "/api/workers", { name: name.value.trim(), label: label.value.trim() });
         dlg.close();
-        showToken(res.worker_id, res.token, false);
+        showId(res.name, res.worker_id, "registered");
         refreshAll();
       } catch (ex) {
         if (ex.status === 401) return handleError(ex);
@@ -1001,32 +1012,52 @@ function openNewWorker() {
         err.hidden = false;
       }
     });
-  id.focus();
+  name.focus();
 }
 
-function showToken(workerId, token, rotated) {
-  openDialog(rotated ? `New token for ${workerId}` : `${workerId} is registered`, [
-    h("p", {}, "Copy the token now. The server keeps only a hash of it, so it cannot be shown again."),
-    copyBlock(token),
-    rotated && h("p", { class: "muted small" }, "The old token has stopped working and the worker was disconnected."),
-    h("h3", {}, "Connect a worker with it"),
-    copyBlock(`client = RelayClient("${state.url}", "${token}")`),
+// The id is the whole of a worker's identity: it says which worker this is and
+// it is what lets it speak. So it is shown as something to be kept, not as a
+// label to be read out.
+function showId(name, workerId, how) {
+  openDialog(how === "reissued" ? `New id for ${name}` : `${name} is registered`, [
+    h("p", {}, "This is the id the server gave it. Treat it as a password: anything "
+      + "holding it is this worker. A worker that asked to join collects it by itself; "
+      + "copy it only if you are setting one up by hand."),
+    copyBlock(workerId),
+    how === "reissued"
+      && h("p", { class: "muted small" }, "The old id has stopped working. The worker keeps its "
+        + "name, its channels and its place in each of them."),
+    h("h3", {}, "How a worker uses it"),
+    copyBlock(`Authorization: Bearer ${workerId}`),
   ], [h("button", { class: "btn primary", type: "submit" }, "Done")]);
 }
 
-async function rotateToken(workerId) {
-  if (!confirm(`Issue a new token for ${workerId}?\n\nThe current token stops working immediately and the worker is disconnected until it uses the new one.`)) return;
+async function renameWorker(workerId, current) {
+  const name = prompt("What should this worker be called?", current);
+  if (name === null || !name.trim()) return;
   try {
-    const res = await api("POST", `/api/workers/${enc(workerId)}/token`);
-    showToken(workerId, res.token, true);
+    const res = await api("POST", `/api/workers/${enc(workerId)}/name`, { name: name.trim() });
+    toast(`Now called ${res.name}`);
+    refreshAll();
   } catch (err) { handleError(err); }
 }
 
-async function removeWorker(workerId) {
-  if (!confirm(`Remove worker ${workerId}?\n\nIts token stops working, it is disconnected, and it leaves every channel.`)) return;
+async function reissueId(workerId, name) {
+  if (!confirm(`Issue a new id for ${name}?\n\nThe current id stops working immediately, and the `
+    + "worker cannot reach the server until it is given the new one. It keeps its name and its "
+    + "channels.")) return;
+  try {
+    const res = await api("POST", `/api/workers/${enc(workerId)}/id`);
+    await refreshAll();
+    showId(res.name, res.worker_id, "reissued");
+  } catch (err) { handleError(err); }
+}
+
+async function removeWorker(workerId, name) {
+  if (!confirm(`Remove worker ${name}?\n\nIts id stops working, it is disconnected, and it leaves every channel.`)) return;
   try {
     await api("DELETE", `/api/workers/${enc(workerId)}`);
-    toast(`Removed ${workerId}`);
+    toast(`Removed ${name}`);
     refreshAll();
   } catch (err) { handleError(err); }
 }
@@ -1089,7 +1120,7 @@ function renderChannelHead() {
   const el = $("#channel-head");
   const ch = currentChannel();
   if (!el || !ch) return;
-  const online = ch.members.filter((w) => state.online.has(w)).length;
+  const online = ch.members.filter((m) => state.online.has(m.worker_id)).length;
   el.replaceChildren(
     h("div", { class: "grow" },
       h("h1", {}, h("span", { class: "hash" }, "#"), ch.name),
@@ -1101,7 +1132,8 @@ function renderMembers() {
   const el = $("#members");
   const ch = currentChannel();
   if (!el || !ch) return;
-  const others = state.workers.filter((w) => !ch.members.includes(w.worker_id));
+  const inAlready = new Set(ch.members.map((m) => m.worker_id));
+  const others = state.workers.filter((w) => !inAlready.has(w.worker_id));
   const inChannel = state.bots.filter((b) => (b.channels || []).includes(ch.name));
   const freeBots = state.bots.filter((b) => !(b.channels || []).includes(ch.name));
 
@@ -1112,7 +1144,8 @@ function renderMembers() {
     + `|${state.muted.map((m) => m.key).join(",")}`;
   if (el.dataset.shape === shape) return renderMemberList();
   el.dataset.shape = shape;
-  const select = h("select", { "aria-label": "Worker to add" }, others.map((w) => h("option", { value: w.worker_id }, w.worker_id)));
+  const select = h("select", { "aria-label": "Worker to add" },
+    others.map((w) => h("option", { value: w.worker_id }, w.name || w.worker_id)));
   const history = h("input", { type: "checkbox" });
 
   fill(el,
@@ -1211,9 +1244,19 @@ async function resendLast(channel, name, isBot) {
   } catch (err) { handleError(err); }
 }
 
-function waitingFor(name) {
-  const row = state.delivery.find((r) => r.name === name);
+// Matched on the id, which is what a member is addressed by. A bot's id is its
+// name, so the same lookup serves both.
+function waitingFor(id) {
+  const row = state.delivery.find((r) => r.worker_id === id);
   return row ? Number(row.waiting) || 0 : null;
+}
+
+// A worker's id says nothing to a person, so wherever one turns up in something
+// written for people - a message's sender, a dialog - it is shown by name.
+function workerName(id) {
+  if (!id || id === "@server") return id;
+  const found = state.workers.find((w) => w.worker_id === id);
+  return found ? (found.name || id) : id;
 }
 
 function mutedSection() {
@@ -1268,11 +1311,13 @@ function renderMemberList() {
   const ch = currentChannel();
   if (!el || !ch) return;
   el.replaceChildren(ch.members.length
-    ? h("ul", { class: "member-list" }, ch.members.map((id) => {
+    ? h("ul", { class: "member-list" }, ch.members.map((m) => {
+      const id = m.worker_id;
+      const shown = m.name || id;
       const waiting = waitingFor(id);
       return h("li", {},
         dot(state.online.has(id)),
-        h("span", { class: "mono truncate", title: id }, id),
+        h("span", { class: "truncate", title: id }, shown),
         waiting
           ? h("button", {
             class: "behind", title: `${waiting} waiting. Click to skip them and start from now.`,
@@ -1285,7 +1330,7 @@ function renderMemberList() {
               onclick: () => resendLast(ch.name, id, false),
             }, "\u2713")
             : false,
-        h("button", { class: "btn icon", title: `Remove ${id} from #${ch.name}`, "aria-label": `Remove ${id} from #${ch.name}`, onclick: () => removeMember(ch.name, id) }, "×"));
+        h("button", { class: "btn icon", title: `Remove ${shown} from #${ch.name}`, "aria-label": `Remove ${shown} from #${ch.name}`, onclick: () => removeMember(ch.name, id) }, "×"));
     }))
     : h("p", { class: "muted small" }, "No members yet. Only members can post here and receive what is posted."));
 }
@@ -1704,16 +1749,16 @@ function messageBody(body) {
 function sendAgain(m) {
   const ch = currentChannel();
   if (!ch) return;
-  const others = ch.members.filter((id) => id !== m.sender);
+  const others = ch.members.filter((member) => member.worker_id !== m.sender);
   if (!others.length) {
-    return toast(m.sender ? `Only ${m.sender} is in this channel, and it sent this.`
+    return toast(m.sender ? `Only ${workerName(m.sender)} is in this channel, and it sent this.`
       : "No workers in this channel yet.", true);
   }
   // One obvious recipient needs no question asked.
-  if (others.length === 1) return deliverAgain(ch.name, others[0], m);
+  if (others.length === 1) return deliverAgain(ch.name, others[0].worker_id, m);
 
   const pick = h("select", { "aria-label": "Worker to send to" },
-    others.map((id) => h("option", { value: id }, id)));
+    others.map((member) => h("option", { value: member.worker_id }, member.name || member.worker_id)));
   const err = h("p", { class: "error", hidden: true });
   openDialog(`Send #${m.seq} again`,
     [h("p", { class: "muted small" },
@@ -1735,14 +1780,15 @@ function sendAgain(m) {
 async function deliverAgain(channel, worker, m) {
   const done = await api("POST",
     `/api/channels/${enc(channel)}/send/${enc(worker)}?seq=${m.seq}`);
-  toast(`#${done.seq} sent to ${worker}`);
+  toast(`#${done.seq} sent to ${workerName(worker)}`);
   loadDelivery(channel);
 }
 
 function messageRow(m, replies) {
   return h("article", { class: "msg" },
     h("div", { class: "msg-meta" },
-      h("span", { class: "msg-sender" + (m.sender === "@server" ? " server" : "") }, m.sender),
+      h("span", { class: "msg-sender" + (m.sender === "@server" ? " server" : ""),
+                  title: m.sender }, workerName(m.sender)),
       h("span", {}, "#" + m.seq),
       h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts)),
       sourceTag(m.body),
@@ -1770,7 +1816,7 @@ function replyRow(m) {
     h("div", { class: "grow" },
       h("div", { class: "reply-said" },
         said ? h("span", { class: done ? "strong" : "" }, said) : h("span", { class: "muted" }, "replied"),
-        h("span", { class: "muted small" }, "\u00b7 " + m.sender),
+        h("span", { class: "muted small", title: m.sender }, "\u00b7 " + workerName(m.sender)),
         h("time", { class: "muted small", title: new Date(m.ts * 1000).toLocaleString() },
           "\u00b7 " + clock(m.ts))),
       links.length

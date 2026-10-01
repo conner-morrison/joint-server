@@ -176,6 +176,46 @@ DATABASE_URL=postgresql://localhost/relay uvicorn app:app --port 8000
 Without `DATABASE_URL` it still starts, and the first page says what is
 missing rather than failing obscurely.
 
+## Registering a worker
+
+A worker arrives knowing nothing and holding nothing. It says what it is
+called; a person approves it in the console; the server gives it an id, and
+that id is what it speaks with from then on. Nobody copies a secret from one
+machine to another at any point, because there is never one to copy.
+
+```
+worker  ->  POST /{ws}/enrol  {"name": "Office PC"}
+        <-  202 {"status": "pending", "ticket": "...", "poll": "/{ws}/enrol/..."}
+
+person  ->  approves it in the console, which shows the name and a fingerprint
+            the worker printed too, so the right machine gets approved
+
+worker  ->  GET /{ws}/enrol/{ticket}
+        <-  200 {"status": "registered", "worker_id": "w-9f3c…", "name": "Office PC"}
+
+worker  ->  everything after that, with Authorization: Bearer w-9f3c…
+```
+
+The id is the worker's identity and its credential at once, so it is random,
+128 bits of it, and it deserves the care a password does. The console shows it
+next to the name, because it is what every request about that worker is made
+with, but what a person reads is the name.
+
+A name is only what people call a worker. It need not be unique - two machines
+may both reasonably be called `gmail` - it can be corrected without the worker
+noticing, and nothing a worker says about itself decides which worker it is.
+Messages are stamped with the publisher's id for that reason; the console shows
+the name beside them.
+
+An id that gets out is replaced with **New id** in the console: the worker keeps
+its name, its channels and its place in each of them, and the old id stops
+working at once.
+
+Workers registered before this existed keep the token they have always used,
+because some of them are code that cannot be edited today, and a deploy is no
+time for a pipeline to stop. The console marks them. Nothing new is ever given
+a token.
+
 ## Deploying the relay
 
 The relay needs somewhere to run and a Postgres to talk to, reached through

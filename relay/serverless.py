@@ -23,7 +23,7 @@ import re
 import time
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg import Error as PgError
 from pydantic import BaseModel, field_validator
@@ -45,7 +45,7 @@ class WorkspaceIn(BaseModel):
 
 
 class WorkerIn(BaseModel):
-    worker_id: str
+    name: str
     label: str = ""
 
 
@@ -85,9 +85,14 @@ class PublishIn(BaseModel):
 
 
 class EnrolIn(BaseModel):
-    worker_id: str
-    token: str
+    """What a worker brings: what it is called, and nothing else. There is no
+    credential for it to invent and none for a person to carry anywhere."""
+    name: str
     label: str = ""
+
+
+class RenameIn(BaseModel):
+    name: str
 
 
 class MuteIn(BaseModel):
@@ -165,25 +170,25 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
 
     async def worker(ws: str = Depends(workspace),
                      authorization: str | None = Header(default=None)) -> tuple[WorkspaceStore, str]:
-        """A worker's own token.
+        """A worker's own id, which is what it was given when it was registered.
 
-        An unknown token is not simply refused: if it belongs to a request
-        already waiting, the answer says so, and otherwise the answer says how
-        to ask. A worker can therefore be pointed at a workspace and left to
-        sort itself out.
+        What arrives is not simply refused when it is unknown: if it is the
+        ticket of a request still waiting, the answer says so, and otherwise the
+        answer says how to ask. A worker can therefore be pointed at a workspace
+        and left to sort itself out.
         """
-        token = bearer(authorization)
+        presented = bearer(authorization)
         scoped = db().ws(ws)
-        worker_id = await scoped.worker_for_token(token)
+        worker_id = await scoped.authenticate(presented)
         if worker_id is not None:
             return scoped, worker_id
 
-        waiting = await scoped.is_pending(token)
+        waiting = await scoped.is_pending(presented)
         if waiting is not None:
-            raise HTTPException(403, {"status": "pending", "worker_id": waiting,
+            raise HTTPException(403, {"status": "pending", "name": waiting,
                                       "message": f"{waiting} is waiting to be approved in this workspace"})
         raise HTTPException(401, {"status": "unregistered", "enrol": f"/{ws}/enrol",
-                                  "message": "unknown token: POST a worker_id and token to the enrol path"})
+                                  "message": "unknown id: POST a name to the enrol path to ask to join"})
 
     # --- the deployment --------------------------------------------------
     @app.post("/api/workspaces", status_code=201)
@@ -214,16 +219,41 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
     # --- enrolment -------------------------------------------------------
     @app.post("/{ws}/enrol", status_code=202)
     async def enrol(body: EnrolIn, ws: str = Depends(workspace)) -> dict[str, Any]:
+        """Ask to join, with a name.
+
+        What comes back is a ticket, which is good for one thing: asking what
+        came of this request. The id a worker ends up using is the server's to
+        give, and it is given once a person has said yes.
+        """
         scoped = db().ws(ws)
-        # Already approved and using this very token: nothing to do, carry on.
-        if await scoped.worker_for_token(body.token) == body.worker_id:
-            return {"status": "registered", "worker_id": body.worker_id}
         try:
-            await scoped.request_worker(body.worker_id, body.token, body.label)
+            asked = await scoped.request_worker(body.name, body.label)
         except ValueError as exc:
-            raise HTTPException(409, str(exc)) from None
-        return {"status": "pending", "worker_id": body.worker_id,
+            raise HTTPException(400, str(exc)) from None
+        return {"status": "pending", "name": asked["name"], "ticket": asked["ticket"],
+                "poll": f"/{ws}/enrol/{asked['ticket']}",
                 "message": "waiting for someone to approve this worker in the console"}
+
+    @app.get("/{ws}/enrol/{ticket}")
+    async def enrolled(ticket: str, response: Response,
+                       ws: str = Depends(workspace)) -> dict[str, Any]:
+        """What came of a request. The worker asks until it is answered.
+
+        Answered once and then kept for a week, so a worker that lost the reply
+        on the way can ask again instead of registering all over again.
+        """
+        found = await db().ws(ws).registration(ticket)
+        if found is None:
+            raise HTTPException(404, {"status": "unknown",
+                                      "message": "no such request: it was declined, or it has expired. "
+                                                 "Ask again by name."})
+        if not found["granted_id"]:
+            response.status_code = 202
+            return {"status": "pending", "name": found["name"],
+                    "message": "waiting for someone to approve this worker in the console"}
+        return {"status": "registered", "worker_id": found["granted_id"], "name": found["name"],
+                "message": f"registered as {found['name']}. Send this id as the bearer token "
+                           "from now on, and keep it: it is how this server knows you."}
 
     @app.post("/{ws}/publish", status_code=201)
     async def publish(body: PublishIn,
@@ -290,18 +320,34 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
 
     @app.post("/{ws}/api/workers", status_code=201)
     async def add_worker(body: WorkerIn, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Register a worker without waiting for it to ask. The id comes back
+        once; it is what the worker authenticates with."""
         try:
-            token = await scoped.add_worker(body.worker_id, body.label)
+            return await scoped.add_worker(body.name, body.label)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
-        return {"worker_id": body.worker_id, "token": token}
 
-    @app.post("/{ws}/api/workers/{worker_id}/token")
-    async def new_token(worker_id: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
-        token = await scoped.rotate_token(worker_id)
-        if token is None:
+    @app.post("/{ws}/api/workers/{worker_id}/id")
+    async def new_id(worker_id: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """A new id for a worker whose id got out. It keeps its name, its
+        channels and its place in each of them; the old id stops working."""
+        fresh = await scoped.reissue_id(worker_id)
+        if fresh is None:
             raise HTTPException(404, f"no worker {worker_id!r}")
-        return {"worker_id": worker_id, "token": token}
+        return fresh
+
+    @app.post("/{ws}/api/workers/{worker_id}/name")
+    async def rename_worker(worker_id: str, body: RenameIn,
+                            scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """A name is only what people call it, so correcting one changes
+        nothing else."""
+        try:
+            name = await scoped.rename_worker(worker_id, body.name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        if name is None:
+            raise HTTPException(404, f"no worker {worker_id!r}")
+        return {"worker_id": worker_id, "name": name}
 
     @app.delete("/{ws}/api/workers/{worker_id}")
     async def remove_worker(worker_id: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
@@ -313,23 +359,20 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
     async def list_pending(scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
         return await scoped.list_pending()
 
-    @app.post("/{ws}/api/pending/{worker_id}")
-    async def approve(worker_id: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
-        try:
-            approved = await scoped.approve_worker(worker_id)
-        except ValueError as exc:
-            # The request is still there. Whoever is looking at it can reject
-            # it, or the worker can ask again with a token of its own.
-            raise HTTPException(409, str(exc)) from None
-        if not approved:
-            raise HTTPException(404, f"nothing waiting as {worker_id!r}")
-        return {"worker_id": worker_id, "approved": True}
+    @app.post("/{ws}/api/pending/{ref}")
+    async def approve(ref: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Say yes. The worker is registered and given its id, which it collects
+        the next time it asks what came of its request."""
+        approved = await scoped.approve_worker(ref)
+        if approved is None:
+            raise HTTPException(404, "nothing is waiting under that request")
+        return {**approved, "approved": True}
 
-    @app.delete("/{ws}/api/pending/{worker_id}")
-    async def reject(worker_id: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
-        if not await scoped.reject_worker(worker_id):
-            raise HTTPException(404, f"nothing waiting as {worker_id!r}")
-        return {"worker_id": worker_id, "rejected": True}
+    @app.delete("/{ws}/api/pending/{ref}")
+    async def reject(ref: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.reject_worker(ref):
+            raise HTTPException(404, "nothing is waiting under that request")
+        return {"rejected": True}
 
     @app.get("/{ws}/api/bots")
     async def list_bots(scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:

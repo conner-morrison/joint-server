@@ -9,8 +9,11 @@ neither end needs an address anyone can find, and no firewall has to be opened.
 
 Stdlib only, so it runs wherever python3 does, with nothing to install.
 
-On first run it invents a token, asks the relay to enrol, and waits: a person
-approves it once in the console and it carries on by itself from then on.
+On first run it asks the relay to join, giving only a name, and waits: a person
+approves it once in the console, the relay answers with the id it has been
+given, and it carries on by itself from then on. That id is its credential as
+well as its name here, so the state file holding it deserves the same care as a
+password.
 """
 from __future__ import annotations
 
@@ -18,7 +21,6 @@ import argparse
 import json
 import os
 import re
-import secrets
 import sys
 import time
 import urllib.error
@@ -159,22 +161,23 @@ def as_jd(body: Any) -> str:
 
 
 class Bridge:
+    """A worker is identified by an id the relay gives it.
+
+    Nothing is invented here and nothing is copied from the console: this says
+    what it is called, a person says yes, and the id that comes back is kept in
+    the state file and used from then on. Somewhere with no disk that survives -
+    a container - loses that file on every deploy and comes back as a stranger
+    asking again, which is why --id exists.
+    """
+
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.relay = args.relay.rstrip("/")
         self.state_path = Path(args.state)
         self.state = self._load_state()
-        self.token = args.token or self.state.get("token")
-        if not self.token:
-            # Somewhere with no disk that survives - a container - loses this
-            # file on every deploy and would come back as a stranger needing
-            # approval again. Saying so once is cheaper than that surprise.
-            self.token = secrets.token_urlsafe(32)
-            say("no token given, so one was made. To keep this worker's identity "
-                "across restarts, set RELAY_TOKEN to:")
-            say(f"    {self.token}")
-        self.state["token"] = self.token
-        self._save_state()
+        self.worker_id = args.id or self.state.get("worker_id") or ""
+        self.ticket = self.state.get("ticket") or ""
+        self.said_waiting = False
 
     def _load_state(self) -> dict[str, Any]:
         try:
@@ -188,18 +191,42 @@ class Bridge:
         tmp.replace(self.state_path)              # atomic: never a half-written file
 
     def enrol(self) -> None:
-        status, body = http("POST", f"{self.relay}/enrol", {
-            "worker_id": self.args.worker_id,
-            "token": self.token,
-            "label": self.args.label,
-        })
-        if status in (200, 202):
-            say(f"{body.get('status', 'pending')}: {body.get('message', '')}".strip(": "))
+        """Ask to join, or ask what came of asking.
+
+        Both halves live here because they are one conversation: the request is
+        made once, and from then on every pass asks whether it has been answered
+        yet. The ticket is kept so a restart carries on waiting rather than
+        joining the queue again under a second name.
+        """
+        if self.ticket:
+            status, body = http("GET", f"{self.relay}/enrol/{self.ticket}")
+            if status == 200 and body.get("worker_id"):
+                self.worker_id = str(body["worker_id"])
+                self.state["worker_id"] = self.worker_id
+                self.state.pop("ticket", None)
+                self._save_state()
+                say(f"registered as {body.get('name')}. Its id is kept in {self.state_path}; "
+                    "treat that file as a password.")
+                return
+            if status == 202:
+                if not self.said_waiting:
+                    say("waiting for someone to approve this worker in the console")
+                    self.said_waiting = True
+                return                            # asked again next pass
+            # Declined, or so old the relay has forgotten it. Ask afresh.
+            say("the request is gone; asking again")
+            self.ticket = ""
+            self.state.pop("ticket", None)
+
+        status, body = http("POST", f"{self.relay}/enrol",
+                            {"name": self.args.name, "label": self.args.label})
+        if status in (200, 202) and body.get("ticket"):
+            self.ticket = str(body["ticket"])
+            self.state["ticket"] = self.ticket
+            self._save_state()
+            say(f"asked to join as {body.get('name')}: {body.get('message', '')}")
             return
-        if status == 409:
-            sys.exit(f"the relay already has a worker called {self.args.worker_id!r}. "
-                     "Choose another --worker-id, or remove it in the console.")
-        sys.exit(f"could not enrol: {status} {body}")
+        sys.exit(f"could not ask to join: {status} {body}")
 
     def deliver(self, msg: dict[str, Any]) -> bool:
         """Hand one message to proposal-writer. False means try again later,
@@ -275,14 +302,14 @@ class Bridge:
 
     def run(self) -> None:
         watching = ", ".join(f"#{c}" for c in self.args.channel) or "every channel"
-        say(f"watching {watching} at {self.relay} as {self.args.worker_id}, "
+        say(f"watching {watching} at {self.relay} as {self.args.name}, "
             f"feeding {self.args.local}")
         waiting_since = 0.0
         while True:
             try:
                 status, body = http(
                     "GET", f"{self.relay}/messages?wait={self.args.wait}",
-                    token=self.token, timeout=self.args.wait + 20)
+                    token=self.worker_id, timeout=self.args.wait + 20)
             except OSError as exc:
                 say(f"relay unreachable ({exc}); retrying in 10s")
                 time.sleep(10)
@@ -317,7 +344,7 @@ class Bridge:
                 # Acknowledged only once it is somewhere else, so a crash in
                 # between means the job is seen again rather than lost.
                 http("POST", f"{self.relay}/ack",
-                     {"channel": msg["channel"], "seq": msg["seq"]}, token=self.token)
+                     {"channel": msg["channel"], "seq": msg["seq"]}, token=self.worker_id)
 
 
 def as_title(jd: str) -> str:
@@ -337,13 +364,15 @@ def main() -> None:
                    help="where proposal-writer is listening")
     p.add_argument("--channel", action="append", default=[],
                    help="a channel to watch; repeatable, and every channel when not given")
-    p.add_argument("--worker-id", default=os.environ.get("RELAY_WORKER", "proposal-writer"))
+    p.add_argument("--name", default=os.environ.get("RELAY_WORKER", "upwork-proposal-writer"),
+                   help="what to call this worker in the console")
     p.add_argument("--label", default="proposal-writer bridge")
     p.add_argument("--guide", default=os.environ.get("PROPOSAL_GUIDE", "general"))
     p.add_argument("--person", default=os.environ.get("PROPOSAL_PERSON", ""),
                    help="which profile writes the proposal")
-    p.add_argument("--token", default=os.environ.get("RELAY_TOKEN", ""),
-                   help="this worker's token; one is made and kept if not given")
+    p.add_argument("--id", default=os.environ.get("RELAY_ID", ""),
+                   help="the id the relay gave this worker; normally read from the state file, "
+                        "and needed only where that file does not survive a restart")
     p.add_argument("--state", default=os.environ.get("BRIDGE_STATE", "proposal-bridge.json"))
     p.add_argument("--wait", type=float, default=25, help="seconds to hold each poll open")
     p.add_argument("--retry", type=float, default=10)

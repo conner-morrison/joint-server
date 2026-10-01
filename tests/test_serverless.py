@@ -178,112 +178,176 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, body = await self.call("GET", f"/{ws}/messages", token="nobody-knows-this")
         self.assertEqual((status, body["status"]), (401, "unregistered"))
 
-    async def test_a_request_waits_and_the_token_does_not_work_yet(self) -> None:
+    # --- registering ------------------------------------------------------
+    # A worker arrives knowing nothing and holding nothing. It says what it is
+    # called, a person says yes, and the server gives it an id. Nobody copies a
+    # secret from one machine to another at any point.
+    async def enrol(self, ws: str, name: str, password: str = "hunter2") -> str:
+        """The whole handshake, as a worker and a person between them do it.
+        Returns the id the server gave out."""
+        status, asked = await self.call("POST", f"/{ws}/enrol", {"name": name})
+        self.assertEqual((status, asked["status"]), (202, "pending"), asked)
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token=password)
+        ref = next(r["ref"] for r in rows if r["name"] == name)
+        status, approved = await self.call("POST", f"/{ws}/api/pending/{ref}", token=password)
+        self.assertEqual(status, 200, approved)
+        status, got = await self.call("GET", f"/{ws}/enrol/{asked['ticket']}")
+        self.assertEqual((status, got["status"]), (200, "registered"), got)
+        return str(got["worker_id"])
+
+    async def test_a_request_waits_and_the_ticket_is_not_a_way_in(self) -> None:
         ws = await self.workspace()
         status, body = await self.call("POST", f"/{ws}/enrol",
-                                       {"worker_id": "scout-1", "token": "scout-token", "label": "Office PC"})
-        self.assertEqual((status, body["status"]), (202, "pending"))
+                                       {"name": "Office PC", "label": "scraper"})
+        self.assertEqual((status, body["status"], body["name"]), (202, "pending", "Office PC"))
+        self.assertTrue(body["ticket"])
 
-        # Still refused, but now with something it can wait on rather than retry.
-        status, body = await self.call("POST", f"/{ws}/publish",
-                                       {"channel": "jobs", "body": 1}, token="scout-token")
-        self.assertEqual((status, body["status"], body["worker_id"]), (403, "pending", "scout-1"))
+        # The request can be asked after, and says only that it is waiting.
+        status, waiting = await self.call("GET", f"/{ws}/enrol/{body['ticket']}")
+        self.assertEqual((status, waiting["status"]), (202, "pending"))
 
-    async def test_a_person_sees_the_request_with_a_fingerprint(self) -> None:
+        # Refused, but with something to wait on rather than retry blindly.
+        status, said = await self.call("POST", f"/{ws}/publish",
+                                       {"channel": "jobs", "body": 1}, token=body["ticket"])
+        self.assertEqual((status, said["status"], said["name"]), (403, "pending", "Office PC"))
+
+    async def test_a_person_sees_the_request_by_name_with_a_fingerprint(self) -> None:
         ws = await self.workspace()
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout-1", "token": "scout-token"})
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
         status, pending = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
         self.assertEqual(status, 200)
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["worker_id"], "scout-1")
+        self.assertEqual([r["name"] for r in pending], ["Office PC"])
         # Something the worker can print too, so a person can compare the two.
         self.assertEqual(len(pending[0]["fingerprint"]), 12)
-        self.assertNotIn("scout-token", json.dumps(pending))
+        self.assertNotIn(asked["ticket"], json.dumps(pending))
 
-    async def test_approval_makes_the_token_it_already_had_start_working(self) -> None:
-        """The whole point: nobody carries a credential anywhere."""
+    async def test_approval_gives_the_worker_an_id_it_comes_back_for(self) -> None:
+        """The whole point: nobody carries a credential anywhere. The worker
+        brings a name, and leaves with an id it did not choose."""
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout-1", "token": "scout-token"})
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
 
-        status, _ = await self.call("POST", f"/{ws}/api/pending/scout-1", token="hunter2")
-        self.assertEqual(status, 200)
-        status, _ = await self.call("PUT", f"/{ws}/api/channels/jobs/members/scout-1",
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        status, approved = await self.call("POST", f"/{ws}/api/pending/{rows[0]['ref']}",
+                                          token="hunter2")
+        self.assertEqual((status, approved["name"]), (200, "Office PC"))
+        worker_id = approved["worker_id"]
+        self.assertNotEqual(worker_id, "Office PC")
+        self.assertGreaterEqual(len(worker_id), 32)
+
+        # The worker asks again and is told, with the id and that it worked.
+        status, got = await self.call("GET", f"/{ws}/enrol/{asked['ticket']}")
+        self.assertEqual((status, got["status"], got["worker_id"], got["name"]),
+                         (200, "registered", worker_id, "Office PC"))
+        self.assertIn("registered", got["message"])
+
+        # And the id is what it speaks with from then on.
+        status, _ = await self.call("PUT", f"/{ws}/api/channels/jobs/members/{worker_id}",
                                     {"from_start": False}, token="hunter2")
         self.assertEqual(status, 200)
+        status, said = await self.call("POST", f"/{ws}/publish",
+                                       {"channel": "jobs", "body": {"n": 1}}, token=worker_id)
+        self.assertEqual((status, said["worker_id"]), (201, worker_id))
 
-        status, body = await self.call("POST", f"/{ws}/publish",
-                                       {"channel": "jobs", "body": {"n": 1}}, token="scout-token")
-        self.assertEqual((status, body["worker_id"]), (201, "scout-1"))
+    async def test_a_ticket_stops_being_a_way_in_once_it_is_answered(self) -> None:
+        """A ticket is for asking what came of a request, and is not the
+        credential: the id is. Presenting the ticket afterwards is presenting
+        nothing."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        await self.call("POST", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
+
+        status, body = await self.call("GET", f"/{ws}/messages", token=asked["ticket"])
+        self.assertEqual((status, body["status"]), (401, "unregistered"))
+
+    async def test_approving_twice_gives_the_same_id(self) -> None:
+        """A second click is a second click, not a second worker."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        _, first = await self.call("POST", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
+        _, again = await self.call("POST", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
+        self.assertEqual(first["worker_id"], again["worker_id"])
+        _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        self.assertEqual(len(workers), 1)
 
     async def test_a_rejected_request_leaves_nothing_behind(self) -> None:
         ws = await self.workspace()
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout-1", "token": "scout-token"})
-        status, _ = await self.call("DELETE", f"/{ws}/api/pending/scout-1", token="hunter2")
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        status, _ = await self.call("DELETE", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
         self.assertEqual(status, 200)
         _, pending = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
         self.assertEqual(pending, [])
-        status, body = await self.call("GET", f"/{ws}/messages", token="scout-token")
-        self.assertEqual((status, body["status"]), (401, "unregistered"))
+        # The worker asking after it is told plainly, so it can ask again.
+        status, body = await self.call("GET", f"/{ws}/enrol/{asked['ticket']}")
+        self.assertEqual((status, body["status"]), (404, "unknown"))
 
-    async def test_a_newcomer_cannot_claim_a_registered_name(self) -> None:
+    async def test_two_workers_may_be_called_the_same_thing(self) -> None:
+        """Two machines may both reasonably be called "gmail". The name is for
+        people; the id is what tells them apart, and nothing a worker says
+        about itself decides it."""
         ws = await self.workspace()
-        await self.call("POST", f"/{ws}/api/workers", {"worker_id": "scout-1"}, token="hunter2")
-        status, _ = await self.call("POST", f"/{ws}/enrol",
-                                    {"worker_id": "scout-1", "token": "an-impostor"})
-        self.assertEqual(status, 409)
+        first, second = await self.enrol(ws, "gmail"), await self.enrol(ws, "gmail")
+        self.assertNotEqual(first, second)
+        _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        self.assertEqual(sorted(w["name"] for w in workers), ["gmail", "gmail"])
+        self.assertEqual(len({w["worker_id"] for w in workers}), 2)
 
-    async def test_enrolling_again_with_the_same_token_is_harmless(self) -> None:
+    async def test_a_name_is_required_and_tidied(self) -> None:
         ws = await self.workspace()
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout-1", "token": "t"})
-        await self.call("POST", f"/{ws}/api/pending/scout-1", token="hunter2")
-        status, body = await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout-1", "token": "t"})
-        self.assertEqual((status, body["status"]), (202, "registered"))
+        for bad in ("", "   ", "a" * 65):
+            status, _ = await self.call("POST", f"/{ws}/enrol", {"name": bad})
+            self.assertEqual(status, 400, f"{bad!r} was accepted")
+        _, body = await self.call("POST", f"/{ws}/enrol", {"name": "  Office   PC  "})
+        self.assertEqual(body["name"], "Office PC")
+
+    async def test_a_name_can_be_corrected_without_touching_the_id(self) -> None:
+        ws = await self.workspace()
+        worker_id = await self.enrol(ws, "Ofice PC")
+        status, body = await self.call("POST", f"/{ws}/api/workers/{worker_id}/name",
+                                       {"name": "Office PC"}, token="hunter2")
+        self.assertEqual((status, body["name"]), (200, "Office PC"))
+        _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        self.assertEqual((workers[0]["name"], workers[0]["worker_id"]), ("Office PC", worker_id))
+
+    async def test_a_new_id_keeps_the_worker_and_retires_the_old_one(self) -> None:
+        """For an id that got out. It is the credential, so replacing it must
+        not cost the worker its channels or its place in them."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        old = await self.enrol(ws, "Office PC")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{old}", {}, token="hunter2")
+
+        status, body = await self.call("POST", f"/{ws}/api/workers/{old}/id", token="hunter2")
+        self.assertEqual(status, 200)
+        fresh = body["worker_id"]
+        self.assertNotEqual(fresh, old)
+        self.assertEqual(body["name"], "Office PC")
+
+        # The same worker, in the same channel, under a new id.
+        _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        self.assertEqual([(w["worker_id"], w["channels"]) for w in workers], [(fresh, ["jobs"])])
+        status, _ = await self.call("POST", f"/{ws}/publish",
+                                    {"channel": "jobs", "body": 1}, token=fresh)
+        self.assertEqual(status, 201)
+        status, said = await self.call("POST", f"/{ws}/publish",
+                                       {"channel": "jobs", "body": 1}, token=old)
+        self.assertEqual((status, said["status"]), (401, "unregistered"))
 
     async def test_a_request_is_confined_to_its_workspace(self) -> None:
         acme = await self.workspace("Acme", "acme-pass")
         upwork = await self.workspace("Upwork", "upwork-pass")
-        await self.call("POST", f"/{acme}/enrol", {"worker_id": "scout-1", "token": "shared-token"})
-        await self.call("POST", f"/{acme}/api/pending/scout-1", token="acme-pass")
+        worker_id = await self.enrol(acme, "scout", "acme-pass")
 
         _, pending = await self.call("GET", f"/{upwork}/api/pending", token="upwork-pass")
         self.assertEqual(pending, [])
-        # Approved in Acme, unknown in Upwork.
-        status, body = await self.call("GET", f"/{upwork}/messages", token="shared-token")
+        # Registered in Acme, nothing at all in Upwork.
+        status, body = await self.call("GET", f"/{upwork}/messages", token=worker_id)
         self.assertEqual((status, body["status"]), (401, "unregistered"))
-
-    async def test_two_workers_cannot_share_one_token(self) -> None:
-        """A token is the whole of a worker's identity: it is all that arrives
-        with a request. Two workers holding one would be one worker to this
-        server, sharing channels and a cursor, so whichever acknowledged first
-        would quietly consume the other's messages."""
-        ws = await self.workspace()
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "first", "token": "shared"})
-        await self.call("POST", f"/{ws}/api/pending/first", token="hunter2")
-
-        status, body = await self.call("POST", f"/{ws}/enrol",
-                                       {"worker_id": "second", "token": "shared"})
-        self.assertEqual(status, 409)
-        self.assertIn("first", body["detail"])
-        self.assertIn("own", body["detail"])
-
-    async def test_a_clash_at_approval_keeps_the_request_and_says_why(self) -> None:
-        """The token can be taken between asking and being approved. Silently
-        discarding the request then reads as "nothing waiting", which says
-        nothing about what to do."""
-        ws = await self.workspace()
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "second", "token": "shared"})
-        # The same token is registered to somebody else meanwhile.
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "first", "token": "shared2"})
-        await self.call("POST", f"/{ws}/api/pending/first", token="hunter2")
-        await self.call("DELETE", f"/{ws}/api/workers/first", token="hunter2")
-        await self.call("POST", f"/{ws}/api/workers", {"worker_id": "holder"}, token="hunter2")
-        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
-        self.assertEqual([r["worker_id"] for r in rows], ["second"])
-
-        # Approving the waiting one works, since nothing else holds its token.
-        status, _ = await self.call("POST", f"/{ws}/api/pending/second", token="hunter2")
-        self.assertEqual(status, 200)
 
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
@@ -291,19 +355,17 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         and a worker that has never called is not online however healthy it
         is elsewhere."""
         ws = await self.workspace()
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "quiet", "token": "quiet-token"})
-        await self.call("POST", f"/{ws}/api/pending/quiet", token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "busy", "token": "busy-token"})
-        await self.call("POST", f"/{ws}/api/pending/busy", token="hunter2")
+        await self.enrol(ws, "quiet")                 # registered and never heard from again
+        busy_id = await self.enrol(ws, "busy")
 
         _, before = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
-        self.assertEqual({w["worker_id"]: w["online"] for w in before},
+        self.assertEqual({w["name"]: w["online"] for w in before},
                          {"busy": False, "quiet": False})
 
         # Asking for messages is being in touch.
-        await self.call("GET", f"/{ws}/messages", token="busy-token")
+        await self.call("GET", f"/{ws}/messages", token=busy_id)
         _, after = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
-        seen = {w["worker_id"]: w["online"] for w in after}
+        seen = {w["name"]: w["online"] for w in after}
         self.assertTrue(seen["busy"], "a worker that just polled should be online")
         self.assertFalse(seen["quiet"], "a worker that never called should not be")
 
@@ -317,11 +379,10 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
             await self.call("POST", f"/{ws}/api/channels/github/messages", {"body": {"old": n}},
                             token="hunter2")
 
-        for who in ("late", "late-with-history"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
-        await self.call("PUT", f"/{ws}/api/channels/github/members/late", {}, token="hunter2")
-        await self.call("PUT", f"/{ws}/api/channels/github/members/late-with-history",
+        ids = {who: await self.enrol(ws, who) for who in ("late", "late-with-history")}
+        await self.call("PUT", f"/{ws}/api/channels/github/members/{ids['late']}", {},
+                        token="hunter2")
+        await self.call("PUT", f"/{ws}/api/channels/github/members/{ids['late-with-history']}",
                         {"from_start": True}, token="hunter2")
 
         _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
@@ -329,51 +390,48 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                          {"late": 0, "late-with-history": 5})
 
         # And it really is nothing, not merely nothing counted.
-        status, got = await self.call("GET", f"/{ws}/messages?wait=1", token="late-token")
+        status, got = await self.call("GET", f"/{ws}/messages?wait=1", token=ids["late"])
         self.assertEqual((status, got["messages"]), (200, []))
 
         # What is posted next does reach it.
         await self.call("POST", f"/{ws}/api/channels/github/messages", {"body": {"new": True}},
                         token="hunter2")
-        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="late-token")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["late"])
         self.assertEqual([m["body"] for m in got["messages"]], [{"new": True}])
 
     # --- delivery ---------------------------------------------------------
     async def test_a_worker_polls_acks_and_does_not_see_it_again(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "mailer", "token": "mailer-token"})
-        await self.call("POST", f"/{ws}/api/pending/mailer", token="hunter2")
-        await self.call("PUT", f"/{ws}/api/channels/jobs/members/mailer", {}, token="hunter2")
+        mailer_id = await self.enrol(ws, "mailer")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{mailer_id}", {}, token="hunter2")
         await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": {"n": 1}}, token="hunter2")
 
-        status, body = await self.call("GET", f"/{ws}/messages", token="mailer-token")
+        status, body = await self.call("GET", f"/{ws}/messages", token=mailer_id)
         self.assertEqual(status, 200)
         self.assertEqual([m["body"] for m in body["messages"]], [{"n": 1}])
 
         seq = body["messages"][0]["seq"]
-        await self.call("POST", f"/{ws}/ack", {"channel": "jobs", "seq": seq}, token="mailer-token")
-        _, body = await self.call("GET", f"/{ws}/messages", token="mailer-token")
+        await self.call("POST", f"/{ws}/ack", {"channel": "jobs", "seq": seq}, token=mailer_id)
+        _, body = await self.call("GET", f"/{ws}/messages", token=mailer_id)
         self.assertEqual(body["messages"], [])
 
     async def test_an_unacked_message_comes_back(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "mailer", "token": "t"})
-        await self.call("POST", f"/{ws}/api/pending/mailer", token="hunter2")
-        await self.call("PUT", f"/{ws}/api/channels/jobs/members/mailer", {}, token="hunter2")
+        mailer_id = await self.enrol(ws, "mailer")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{mailer_id}", {}, token="hunter2")
         await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": 1}, token="hunter2")
-        first, _ = await self.call("GET", f"/{ws}/messages", token="t")
-        second, body = await self.call("GET", f"/{ws}/messages", token="t")
+        first, _ = await self.call("GET", f"/{ws}/messages", token=mailer_id)
+        second, body = await self.call("GET", f"/{ws}/messages", token=mailer_id)
         self.assertEqual(first, 200)
         self.assertEqual(len(body["messages"]), 1)
 
     async def test_a_wait_returns_as_soon_as_something_arrives(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "mailer", "token": "t"})
-        await self.call("POST", f"/{ws}/api/pending/mailer", token="hunter2")
-        await self.call("PUT", f"/{ws}/api/channels/jobs/members/mailer", {}, token="hunter2")
+        mailer_id = await self.enrol(ws, "mailer")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{mailer_id}", {}, token="hunter2")
 
         async def post_soon() -> None:
             await asyncio.sleep(1.0)
@@ -381,7 +439,7 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
 
         started = time.monotonic()
         poster = asyncio.create_task(post_soon())
-        status, body = await self.call("GET", f"/{ws}/messages?wait=20", token="t")
+        status, body = await self.call("GET", f"/{ws}/messages?wait=20", token=mailer_id)
         took = time.monotonic() - started
         await poster
         self.assertEqual(status, 200)
@@ -396,11 +454,12 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         it querying for messages that are not its own."""
         acme = await self.workspace("Acme", "acme-pass")
         other = await self.workspace("Upwork", "upwork-pass")
+        scouts = {}
         for ws, password in ((acme, "acme-pass"), (other, "upwork-pass")):
             await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token=password)
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout", "token": f"{ws}-token"})
-            await self.call("POST", f"/{ws}/api/pending/scout", token=password)
-            await self.call("PUT", f"/{ws}/api/channels/jobs/members/scout", {}, token=password)
+            scouts[ws] = await self.enrol(ws, "scout", password)
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{scouts[ws]}", {},
+                            token=password)
 
         async def post_elsewhere() -> None:
             await asyncio.sleep(0.5)
@@ -408,7 +467,7 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                             {"body": "not yours"}, token="upwork-pass")
 
         poster = asyncio.create_task(post_elsewhere())
-        status, body = await self.call("GET", f"/{acme}/messages?wait=2", token=f"{acme}-token")
+        status, body = await self.call("GET", f"/{acme}/messages?wait=2", token=scouts[acme])
         await poster
         self.assertEqual((status, body["messages"]), (200, []))
 
@@ -420,21 +479,20 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         """
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("reporter", "builder", "notifier")}
         for who in ("reporter", "builder", "notifier"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
-            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{ids[who]}", {}, token="hunter2")
 
         async def publish_soon() -> None:
             await asyncio.sleep(0.5)
             await self.call("POST", f"/{ws}/publish",
                             {"channel": "github", "body": {"event": "push", "ref": "main"}},
-                            token="reporter-token")
+                            token=ids["reporter"])
 
         started = time.monotonic()
         poster = asyncio.create_task(publish_soon())
         # Both other members wait at the same time.
-        listeners = [self.call("GET", f"/{ws}/messages?wait=20", token=f"{who}-token")
+        listeners = [self.call("GET", f"/{ws}/messages?wait=20", token=ids[who])
                      for who in ("builder", "notifier")]
         answers = await asyncio.gather(*listeners)
         woken = time.monotonic() - started
@@ -445,11 +503,13 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([m["body"] for m in body["messages"]],
                              [{"event": "push", "ref": "main"}],
                              f"{body['worker_id']} did not get its own copy")
-            self.assertEqual(body["messages"][0]["sender"], "reporter")
+            # Stamped with the publisher's id, which is who it was. A name is
+            # for people and can be corrected; the log says which worker.
+            self.assertEqual(body["messages"][0]["sender"], ids["reporter"])
         self.assertLess(woken - 0.5, 1.0, f"woken {woken - 0.5:.2f}s after the publish")
 
         # The one that published is not told about its own message.
-        status, mine = await self.call("GET", f"/{ws}/messages?wait=1", token="reporter-token")
+        status, mine = await self.call("GET", f"/{ws}/messages?wait=1", token=ids["reporter"])
         self.assertEqual((status, mine["messages"]), (200, []))
 
     async def test_delivery_says_who_is_behind(self) -> None:
@@ -458,14 +518,12 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         and one that is asleep looks exactly like one that is up to date."""
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
-        for who in ("reporter", "listener", "stranger"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("reporter", "listener", "stranger")}
         for who in ("reporter", "listener"):
-            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{ids[who]}", {}, token="hunter2")
 
         await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": {"n": 1}},
-                        token="reporter-token")
+                        token=ids["reporter"])
         status, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
         self.assertEqual(status, 200)
         behind = {r["name"]: r["waiting"] for r in rows}
@@ -474,10 +532,10 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(behind, {"listener": 1, "reporter": 0})
 
         # Once it collects and acknowledges, it is caught up.
-        _, got = await self.call("GET", f"/{ws}/messages", token="listener-token")
+        _, got = await self.call("GET", f"/{ws}/messages", token=ids["listener"])
         await self.call("POST", f"/{ws}/ack",
                         {"channel": "github", "seq": got["messages"][0]["seq"]},
-                        token="listener-token")
+                        token=ids["listener"])
         _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
         self.assertEqual({r["name"]: r["waiting"] for r in rows}, {"listener": 0, "reporter": 0})
 
@@ -487,27 +545,26 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         the channel: the messages stay, and everyone else still gets them."""
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("reporter", "away", "other")}
         for who in ("reporter", "away", "other"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
-            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{ids[who]}", {}, token="hunter2")
 
         for n in range(8):
             await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": {"n": n}},
-                            token="reporter-token")
+                            token=ids["reporter"])
 
-        status, done = await self.call("POST", f"/{ws}/api/channels/github/skip/away",
+        status, done = await self.call("POST", f"/{ws}/api/channels/github/skip/{ids["away"]}",
                                        token="hunter2")
         self.assertEqual((status, done["skipped"]), (200, 8))
 
         # Nothing waiting for it, and nothing waiting is nothing delivered.
-        status, got = await self.call("GET", f"/{ws}/messages?wait=1", token="away-token")
+        status, got = await self.call("GET", f"/{ws}/messages?wait=1", token=ids["away"])
         self.assertEqual((status, got["messages"]), (200, []))
 
         # What is posted next does reach it.
         await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": {"n": "new"}},
-                        token="reporter-token")
-        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="away-token")
+                        token=ids["reporter"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["away"])
         self.assertEqual([m["body"] for m in got["messages"]], [{"n": "new"}])
 
         # The other member was not skipped, and the channel still holds all nine.
@@ -522,27 +579,26 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         and nobody else is touched."""
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("reporter", "listener", "other")}
         for who in ("reporter", "listener", "other"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
-            await self.call("PUT", f"/{ws}/api/channels/github/members/{who}", {}, token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{ids[who]}", {}, token="hunter2")
 
         for body in ({"n": 1}, {"jobId": "e5c5f515", "status": "done"}):
             await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": body},
-                            token="reporter-token")
-        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="listener-token")
+                            token=ids["reporter"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["listener"])
         await self.call("POST", f"/{ws}/ack",
                         {"channel": "github", "seq": got["messages"][-1]["seq"]},
-                        token="listener-token")
-        _, nothing = await self.call("GET", f"/{ws}/messages?wait=1", token="listener-token")
+                        token=ids["listener"])
+        _, nothing = await self.call("GET", f"/{ws}/messages?wait=1", token=ids["listener"])
         self.assertEqual(nothing["messages"], [])
 
-        status, again = await self.call("POST", f"/{ws}/api/channels/github/resend/listener",
+        status, again = await self.call("POST", f"/{ws}/api/channels/github/resend/{ids["listener"]}",
                                         token="hunter2")
         self.assertEqual((status, again["resending"]), (200, 1))
 
         # The last one, once, and it is the same message rather than a copy.
-        _, back = await self.call("GET", f"/{ws}/messages?wait=5", token="listener-token")
+        _, back = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["listener"])
         self.assertEqual([m["body"] for m in back["messages"]],
                          [{"jobId": "e5c5f515", "status": "done"}])
         self.assertEqual(back["messages"][0]["seq"], got["messages"][-1]["seq"])
@@ -559,31 +615,30 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         after it too; this hands over the one that was asked for."""
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("writer", "other")}
         for who in ("writer", "other"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
-            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{ids[who]}", {}, token="hunter2")
 
         seqs = []
         for n in range(3):
             _, said = await self.call("POST", f"/{ws}/api/channels/jobs/messages",
                                       {"body": {"n": n}}, token="hunter2")
             seqs.append(said["seq"])
-        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
         await self.call("POST", f"/{ws}/ack", {"channel": "jobs", "seq": seqs[-1]},
-                        token="writer-token")
-        _, nothing = await self.call("GET", f"/{ws}/messages?wait=1", token="writer-token")
+                        token=ids["writer"])
+        _, nothing = await self.call("GET", f"/{ws}/messages?wait=1", token=ids["writer"])
         self.assertEqual(nothing["messages"], [])
 
         # The middle one, and only it.
         status, done = await self.call(
-            "POST", f"/{ws}/api/channels/jobs/send/writer?seq={seqs[1]}", token="hunter2")
+            "POST", f"/{ws}/api/channels/jobs/send/{ids["writer"]}?seq={seqs[1]}", token="hunter2")
         self.assertEqual((status, done["seq"]), (200, seqs[1]))
-        _, again = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        _, again = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
         self.assertEqual([m["body"] for m in again["messages"]], [{"n": 1}])
 
         # Spent: it is not handed over a second time on the next poll.
-        _, after = await self.call("GET", f"/{ws}/messages?wait=1", token="writer-token")
+        _, after = await self.call("GET", f"/{ws}/messages?wait=1", token=ids["writer"])
         self.assertEqual(after["messages"], [])
 
         # And the other member's place was never touched.
@@ -593,19 +648,18 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
     async def test_sending_again_refuses_what_it_cannot_do(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "writer", "token": "writer-token"})
-        await self.call("POST", f"/{ws}/api/pending/writer", token="hunter2")
+        writer_id = await self.enrol(ws, "writer")
         _, said = await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": 1},
                                   token="hunter2")
 
         # Not a member of the channel.
         status, _ = await self.call(
-            "POST", f"/{ws}/api/channels/jobs/send/writer?seq={said['seq']}", token="hunter2")
+            "POST", f"/{ws}/api/channels/jobs/send/{writer_id}?seq={said['seq']}", token="hunter2")
         self.assertEqual(status, 404)
 
-        await self.call("PUT", f"/{ws}/api/channels/jobs/members/writer", {}, token="hunter2")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{writer_id}", {}, token="hunter2")
         # A message that is not in this channel.
-        status, _ = await self.call("POST", f"/{ws}/api/channels/jobs/send/writer?seq=9999",
+        status, _ = await self.call("POST", f"/{ws}/api/channels/jobs/send/{writer_id}?seq=9999",
                                     token="hunter2")
         self.assertEqual(status, 404)
 
@@ -617,25 +671,24 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         separately that they have seen it."""
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("gmail-bot", "writer")}
         for who in ("gmail-bot", "writer"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
-            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{ids[who]}", {}, token="hunter2")
 
         same = {"channel": "jobs", "id": "job:~021987abc"}
         first = await self.call("POST", f"/{ws}/publish",
                                 {**same, "body": {"source": "vollna", "title": "Scraper"}},
-                                token="gmail-bot-token")
+                                token=ids["gmail-bot"])
         # The same job again - and from a different publisher, which is still
         # the same job.
         again = await self.call("POST", f"/{ws}/publish",
                                 {**same, "body": {"source": "upwork-alert", "title": "Scraper"}},
-                                token="writer-token")
+                                token=ids["writer"])
         self.assertFalse(first[1]["duplicate"])
         self.assertTrue(again[1]["duplicate"])
         self.assertEqual(first[1]["seq"], again[1]["seq"])
 
-        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
         self.assertEqual(len(got["messages"]), 1, "delivered once, not once per arrival")
         _, history = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
         self.assertEqual(len(history), 1, "stored once, so the console shows one job")
@@ -646,10 +699,9 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         to be explained away."""
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("gmail-bot", "writer")}
         for who in ("gmail-bot", "writer"):
-            await self.call("POST", f"/{ws}/enrol", {"worker_id": who, "token": f"{who}-token"})
-            await self.call("POST", f"/{ws}/api/pending/{who}", token="hunter2")
-            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{ids[who]}", {}, token="hunter2")
 
         # Muted by its link; the publisher names it by its id. They must agree.
         status, done = await self.call(
@@ -663,12 +715,12 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
             {"channel": "jobs", "id": "job:~021987abc",
              "body": {"title": "Build a scraper",
                       "upworkUrl": "https://www.upwork.com/jobs/~021987abc?ref=vollna"}},
-            token="gmail-bot-token")
+            token=ids["gmail-bot"])
         self.assertEqual((status, said["muted"], said["seq"]), (200, True, None))
 
         _, history = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
         self.assertEqual(history, [], "a muted job is not in the channel")
-        _, got = await self.call("GET", f"/{ws}/messages?wait=1", token="writer-token")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=1", token=ids["writer"])
         self.assertEqual(got["messages"], [], "and reaches no worker")
 
         # Unmuted, it comes through as any other job would.
@@ -676,9 +728,9 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, said = await self.call(
             "POST", f"/{ws}/publish",
             {"channel": "jobs", "id": "job:~021987abc", "body": {"title": "Build a scraper"}},
-            token="gmail-bot-token")
+            token=ids["gmail-bot"])
         self.assertIsNotNone(said["seq"])
-        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token="writer-token")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
         self.assertEqual([m["body"]["title"] for m in got["messages"]], ["Build a scraper"])
 
     async def test_muting_needs_something_to_go_on(self) -> None:
@@ -688,31 +740,28 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_wait_with_nothing_to_say_ends_empty(self) -> None:
         ws = await self.workspace()
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "idle", "token": "t"})
-        await self.call("POST", f"/{ws}/api/pending/idle", token="hunter2")
+        idle_id = await self.enrol(ws, "idle")
         started = time.monotonic()
-        status, body = await self.call("GET", f"/{ws}/messages?wait=2", token="t")
+        status, body = await self.call("GET", f"/{ws}/messages?wait=2", token=idle_id)
         self.assertEqual((status, body["messages"]), (200, []))
         self.assertGreaterEqual(time.monotonic() - started, 1.5)
 
     async def test_a_publisher_cannot_reach_a_channel_it_is_not_in(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "secret"}, token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "scout", "token": "t"})
-        await self.call("POST", f"/{ws}/api/pending/scout", token="hunter2")
-        missing, _ = await self.call("POST", f"/{ws}/publish", {"channel": "nope", "body": 1}, token="t")
-        not_member, _ = await self.call("POST", f"/{ws}/publish", {"channel": "secret", "body": 1}, token="t")
+        scout_id = await self.enrol(ws, "scout")
+        missing, _ = await self.call("POST", f"/{ws}/publish", {"channel": "nope", "body": 1}, token=scout_id)
+        not_member, _ = await self.call("POST", f"/{ws}/publish", {"channel": "secret", "body": 1}, token=scout_id)
         self.assertEqual((missing, not_member), (403, 403))
 
     async def test_a_retried_publish_is_stored_once(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
-        await self.call("POST", f"/{ws}/enrol", {"worker_id": "bot", "token": "t"})
-        await self.call("POST", f"/{ws}/api/pending/bot", token="hunter2")
-        await self.call("PUT", f"/{ws}/api/channels/jobs/members/bot", {}, token="hunter2")
+        bot_id = await self.enrol(ws, "bot")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{bot_id}", {}, token="hunter2")
         msg = {"channel": "jobs", "id": "gmail-1:0", "body": {"n": 1}}
-        _, first = await self.call("POST", f"/{ws}/publish", msg, token="t")
-        _, retry = await self.call("POST", f"/{ws}/publish", msg, token="t")
+        _, first = await self.call("POST", f"/{ws}/publish", msg, token=bot_id)
+        _, retry = await self.call("POST", f"/{ws}/publish", msg, token=bot_id)
         self.assertFalse(first["duplicate"])
         self.assertTrue(retry["duplicate"])
         self.assertEqual(first["seq"], retry["seq"])
