@@ -167,6 +167,8 @@ CREATE TABLE IF NOT EXISTS messages (
     sender      TEXT NOT NULL,              -- a worker id, or @server; not a foreign key so history survives
     client_id   TEXT,                       -- the publisher's id for this message, used to drop resends
     job_key     TEXT,                       -- the job this is about, read from its own link
+                                            -- (its index is made alongside the column, in a
+                                            -- migration: an older table has neither)
     body        JSONB NOT NULL,
     ts          DOUBLE PRECISION NOT NULL,
     -- Deleting a channel takes its messages, as it always has.
@@ -174,8 +176,6 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_channel_seq ON messages(workspace, channel, seq);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
--- One job per channel, whoever posted it and whatever they called it.
-CREATE INDEX IF NOT EXISTS messages_job ON messages(workspace, channel, job_key);
 -- One message per id in a workspace, whoever published it. The same job can
 -- reach two different workers - a mail parser and a webhook, say - and it is
 -- still one job; scoping this to the sender would let each of them store its
@@ -400,12 +400,20 @@ class PgStore:
 
         Never at the cost of starting.
         """
+        # The column and its index first, in their own transaction: a table made
+        # before this existed has neither, and nothing below may be allowed to
+        # roll back the one thing that stops every write failing.
         try:
             async with self.pool.connection() as conn:
-                # A table made before this existed has no such column.
                 await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS job_key TEXT")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_job "
                                    "ON messages(workspace, channel, job_key)")
+        except Exception as exc:                 # noqa: BLE001 - reported, never fatal
+            log.warning("could not add the job column (%s); jobs will not be deduplicated "
+                        "by their link", type(exc).__name__)
+            return
+        try:
+            async with self.pool.connection() as conn:
                 missing = await (await conn.execute(
                     "SELECT seq, body FROM messages WHERE job_key IS NULL")).fetchall()
                 read = [(job_of(row["body"]), row["seq"]) for row in missing]

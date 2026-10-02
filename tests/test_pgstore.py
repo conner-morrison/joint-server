@@ -264,9 +264,21 @@ class MigrationTest(unittest.IsolatedAsyncioTestCase):
                 worker_id TEXT NOT NULL, token_hash TEXT NOT NULL,
                 label TEXT NOT NULL DEFAULT '', requested_at DOUBLE PRECISION NOT NULL,
                 PRIMARY KEY (workspace, worker_id));
+            CREATE TABLE channels (
+                workspace TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
+                name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                created_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (workspace, name));
+            CREATE TABLE messages (
+                seq BIGSERIAL PRIMARY KEY, workspace TEXT NOT NULL, channel TEXT NOT NULL,
+                sender TEXT NOT NULL, client_id TEXT, body JSONB NOT NULL,
+                ts DOUBLE PRECISION NOT NULL);
             INSERT INTO workspaces VALUES ('upwork', 'Upwork', 'x', 1.0);
             INSERT INTO workers VALUES ('upwork', 'gmail', 'hash-of-a-token', '', 1.0, NULL);
             INSERT INTO pending_workers VALUES ('upwork', 'hopeful', 'hash-2', '', 1.0);
+            INSERT INTO channels VALUES ('upwork', 'jobs', '', 1.0);
+            INSERT INTO messages(workspace, channel, sender, body, ts) VALUES
+              ('upwork', 'jobs', '@server',
+               '{"title":"A job","upworkUrl":"https://www.upwork.com/jobs/~0221"}', 1.0);
         """)
         self.db = PgStore(_server.get_uri(), min_size=1, max_size=4)
         await self.db.open()
@@ -288,6 +300,27 @@ class MigrationTest(unittest.IsolatedAsyncioTestCase):
         row = await self.db._one("SELECT token_hash FROM workers WHERE worker_id = %s",
                                  (made["worker_id"],))
         self.assertIsNone(row["token_hash"])
+
+    async def test_a_table_made_before_the_job_column_still_starts(self) -> None:
+        """What a column added to the schema costs. CREATE TABLE IF NOT EXISTS
+        adds nothing to a table that is already there, so anything in the
+        schema that depends on a new column fails on exactly the databases that
+        matter - the ones with data in them - and takes the whole schema, and
+        the deployment, down with it. The column is added by migration, and the
+        setUp here has a messages table so that is actually exercised."""
+        row = await self.db._one(
+            "SELECT column_name FROM information_schema.columns "
+            " WHERE table_name = 'messages' AND column_name = 'job_key'")
+        self.assertIsNotNone(row, "the job column was never added")
+
+    async def test_jobs_stored_before_the_column_are_read(self) -> None:
+        """Otherwise the first repeat of every job already in a channel gets
+        through, which is the whole of what this was meant to stop."""
+        seq, duplicate = await self.db.ws("upwork").append(
+            "jobs", "@server",
+            {"title": "The same job again", "upworkUrl": "https://www.upwork.com/jobs/~0221"})
+        self.assertTrue(duplicate)
+        self.assertEqual(seq, 1)
 
     async def test_requests_from_the_old_flow_are_gone(self) -> None:
         """Their whole premise was a token the worker brought, so they cannot be
