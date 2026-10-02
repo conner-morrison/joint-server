@@ -82,6 +82,11 @@ def labelled(text: Any) -> dict[str, Any] | None:
     """
     if not isinstance(text, str) or ":" not in text:
         return None
+    # A worker that encoded its text once too often sends the newlines as two
+    # characters, so the whole job is one line and none of the labels after the
+    # first can be seen. Reading it as it was meant costs one replacement.
+    if "\n" not in text and "\\n" in text:
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
     found: dict[str, Any] = {}
     lead: list[str] = []
     current: str | None = None
@@ -261,6 +266,14 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
     """
     # A job sent as labelled text is a job. Read it into fields and it is shown
     # the way every other job is, rather than as a wall of escaped newlines.
+    if isinstance(body, str):
+        # A body encoded twice arrives as the text of some JSON rather than as
+        # the thing it describes. What was meant is inside it.
+        if body[:1] in ('"', "{"):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                pass
     if isinstance(body, str):
         body = labelled(body) or body
     elif isinstance(body, dict) and not title_of(body):

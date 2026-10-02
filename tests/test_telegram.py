@@ -184,6 +184,21 @@ class LabelledTextTest(unittest.TestCase):
         self.assertIn("Name: Comunicazione (named in 1 feedback)", said)
         self.assertIn("PopsPhone is a newly launched Android launcher.", said)
 
+    def test_a_body_encoded_twice_is_still_read(self) -> None:
+        """A worker that ran its text through an encoder once too often sends
+        the newlines as two characters, or the whole job as the text of some
+        JSON. Both arrive as one unreadable line, which is the one shape a
+        person cannot do anything about from their end."""
+        import json as _json
+
+        for described, body in (
+                ("newlines as two characters", self.RAW.replace("\n", "\\n")),
+                ("the whole thing encoded again", _json.dumps(self.RAW)),
+        ):
+            said = "\n".join(render(body, channel="jobs", source="general-vollna-search"))
+            self.assertIn("Decision: <b>manual check</b>", said, described)
+            self.assertIn("Community Manager", said, described)
+
     def test_text_that_is_not_labelled_is_left_alone(self) -> None:
         """Only a job written this way is read this way. Ordinary prose, and a
         single stray colon, must not be mistaken for fields."""

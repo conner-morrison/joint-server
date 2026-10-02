@@ -1464,6 +1464,12 @@ const LABEL_MAX = 24;                     // characters before the colon
 
 function labelled(text) {
   if (typeof text !== "string" || !text.includes(":")) return null;
+  // A worker that encoded its text once too often sends the newlines as two
+  // characters, so the whole job is one line and none of the labels after the
+  // first can be seen. Reading it as it was meant costs one replacement.
+  if (!text.includes("\n") && text.includes("\\n")) {
+    text = text.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n");
+  }
   const found = {};
   const lead = [];
   let current = null;
@@ -1800,6 +1806,13 @@ function sourceTag(body) {
 function messageBody(body) {
   // A job sent as labelled text is a job. Read into fields it is shown the way
   // every other job is, rather than as a wall of escaped newlines.
+  if (typeof body === "string") {
+    // A body encoded twice arrives as the text of some JSON rather than as the
+    // thing it describes. What was meant is inside it.
+    if (body[0] === '"' || body[0] === "{") {
+      try { body = JSON.parse(body); } catch { /* it only looked like JSON */ }
+    }
+  }
   if (typeof body === "string") {
     const read = labelled(body);
     if (read) return jobCard(read);
