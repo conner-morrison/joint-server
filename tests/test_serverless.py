@@ -1175,6 +1175,40 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         # The id is what the server knows it by, and is no use to a reader.
         self.assertNotIn(who, said)
 
+    async def test_one_message_can_be_sent_to_a_chat_by_hand(self) -> None:
+        """How a person checks what a message actually looks like on a phone.
+        It goes there and then, and the chat's place in the channel is left
+        alone: this is for looking at one message again, not for rewinding
+        everything the chat has already been told."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        _, first = await self.call("POST", "/acme/api/channels/jobs/messages",
+                                   {"body": {"title": "One"}}, token="p")
+        await self.call("POST", "/acme/api/channels/jobs/messages",
+                        {"body": {"title": "Two"}}, token="p")
+        await self.eventually(2)
+        self.telegram.sent.clear()
+
+        status, done = await self.call(
+            "POST", f"/acme/api/channels/jobs/send/phone?seq={first['seq']}&bot=true", token="p")
+        self.assertEqual((status, done["sent"]), (200, True))
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn("One", self.telegram.sent[0]["text"])
+
+        # And nothing else came with it: the cursor did not move.
+        await asyncio.sleep(1.0)
+        self.assertEqual(len(self.telegram.sent), 1)
+
+    async def test_sending_to_a_chat_refuses_what_it_cannot_do(self) -> None:
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        _, said = await self.call("POST", "/acme/api/channels/jobs/messages",
+                                  {"body": {"title": "One"}}, token="p")
+        for path in (f"/acme/api/channels/jobs/send/nobody?seq={said['seq']}&bot=true",
+                     "/acme/api/channels/jobs/send/phone?seq=9999&bot=true"):
+            status, _ = await self.call("POST", path, token="p")
+            self.assertEqual(status, 404, path)
+
     async def test_bots_belong_to_their_channel(self) -> None:
         await self.ready()
         await self.call("POST", "/acme/api/channels", {"name": "quiet"}, token="p")
@@ -1243,4 +1277,5 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"Paragraph {n}:", arrived, f"paragraph {n} never arrived")
         for part in self.telegram.sent:
             self.assertLessEqual(len(part["text"]), LIMIT)
+
 

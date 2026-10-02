@@ -73,6 +73,27 @@ class BotSender:
             sent += await self.deliver(bot)
         return sent
 
+    async def send_one(self, workspace: str, channel: str, bot: str, seq: int) -> int:
+        """Send one message to one chat now, by hand.
+
+        The cursor is left where it is: this is for looking at a message again,
+        not for rewinding what the chat has had. Returns how many Telegram
+        messages it took, which is more than one only for a long description.
+        """
+        scoped = self.store.ws(workspace)
+        registered = await scoped.bot_member(channel, bot)
+        if registered is None:
+            raise LookupError(f"{bot!r} is not in channel {channel!r}")
+        message = await scoped.message_at(channel, seq)
+        if message is None:
+            raise LookupError(f"no message {seq} in channel {channel!r}")
+        sender = str(message.get("sender") or "")
+        source = sender if sender.startswith("@") else await scoped.name_of(sender)
+        parts = telegram.render(message["body"], channel=channel, source=source)
+        for part in parts:
+            await telegram.send(registered["bot_token"], registered["chat_id"], part, api=self.api)
+        return len(parts)
+
     async def deliver(self, bot: dict) -> int:
         scoped = self.store.ws(bot["workspace"])
         waiting = await scoped.messages_after(bot["channel"], int(bot["cursor"]), limit=20)

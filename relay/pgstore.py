@@ -1037,6 +1037,22 @@ class WorkspaceStore:
              ORDER BY m.seq LIMIT %s""", (self.slug, worker_id, worker_id, limit))
         return [_message(r) for r in rows]
 
+    async def bot_member(self, channel: str, bot: str) -> dict[str, Any] | None:
+        """One bot's place in a channel, with what is needed to send to it."""
+        return await self.store._one("""
+            SELECT m.bot AS name, m.channel, b.kind, b.chat_id, b.bot_token
+              FROM bot_members m JOIN bots b
+                ON b.workspace = m.workspace AND b.name = m.bot
+             WHERE m.workspace = %s AND m.channel = %s AND m.bot = %s""",
+            (self.slug, channel, bot))
+
+    async def message_at(self, channel: str, seq: int) -> dict[str, Any] | None:
+        """One message, by where it sits in its channel."""
+        row = await self.store._one(
+            "SELECT seq, channel, sender, body, ts FROM messages "
+            " WHERE workspace = %s AND channel = %s AND seq = %s", (self.slug, channel, seq))
+        return _message(row) if row else None
+
     async def send_again(self, channel: str, worker_id: str, seq: int) -> bool:
         """Ask for one message to be delivered to one member again."""
         if not await self.is_member(channel, worker_id):

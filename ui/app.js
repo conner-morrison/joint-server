@@ -1777,26 +1777,37 @@ function messageBody(body) {
 function sendAgain(m) {
   const ch = currentChannel();
   if (!ch) return;
-  const others = ch.members.filter((member) => member.worker_id !== m.sender);
+  // Workers and chats both. A chat is where a person checks what a message
+  // actually looks like, which is most of what sending one by hand is for.
+  const others = [
+    ...ch.members
+      .filter((member) => member.worker_id !== m.sender)
+      .map((member) => ({ to: member.worker_id, label: member.name || member.worker_id, bot: false })),
+    ...state.bots
+      .filter((b) => (b.channels || []).includes(ch.name))
+      .map((b) => ({ to: b.name, label: `${b.name} (Telegram)`, bot: true })),
+  ];
   if (!others.length) {
     return toast(m.sender ? `Only ${workerName(m.sender)} is in this channel, and it sent this.`
-      : "No workers in this channel yet.", true);
+      : "Nothing is in this channel to send it to yet.", true);
   }
   // One obvious recipient needs no question asked.
-  if (others.length === 1) return deliverAgain(ch.name, others[0].worker_id, m);
+  if (others.length === 1) return deliverAgain(ch.name, others[0].to, m, others[0].bot);
 
-  const pick = h("select", { "aria-label": "Worker to send to" },
-    others.map((member) => h("option", { value: member.worker_id }, member.name || member.worker_id)));
+  const pick = h("select", { "aria-label": "Where to send it" },
+    others.map((o) => h("option", { value: (o.bot ? "bot:" : "worker:") + o.to }, o.label)));
   const err = h("p", { class: "error", hidden: true });
   openDialog(`Send #${m.seq} again`,
     [h("p", { class: "muted small" },
-      "It is delivered again to the worker you choose, whether or not it already had it. "
+      "Delivered again to whatever you choose, whether or not it already had it. "
+      + "A Telegram chat gets it straight away; a worker gets it on its next poll. "
       + "Nothing is added to the channel."),
-     field("Worker", pick), err],
+     field("Send to", pick), err],
     [cancel(), h("button", { class: "btn primary", type: "submit" }, "Send")],
     async (dlg) => {
       try {
-        await deliverAgain(ch.name, pick.value, m);
+        const [kind, ...rest] = pick.value.split(":");
+        await deliverAgain(ch.name, rest.join(":"), m, kind === "bot");
         dlg.close();
       } catch (ex) {
         err.textContent = ex.message;
@@ -1805,10 +1816,11 @@ function sendAgain(m) {
     });
 }
 
-async function deliverAgain(channel, worker, m) {
+async function deliverAgain(channel, worker, m, isBot) {
   const done = await api("POST",
-    `/api/channels/${enc(channel)}/send/${enc(worker)}?seq=${m.seq}`);
-  toast(`#${done.seq} sent to ${workerName(worker)}`);
+    `/api/channels/${enc(channel)}/send/${enc(worker)}?seq=${m.seq}${isBot ? "&bot=true" : ""}`);
+  // A chat has it already; a worker has it waiting for its next poll.
+  toast(isBot ? `#${done.seq} sent to ${worker}` : `#${done.seq} queued for ${workerName(worker)}`);
   loadDelivery(channel);
 }
 
@@ -1821,8 +1833,8 @@ function messageRow(m, replies) {
       h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts)),
       sourceTag(m.body),
       h("button", {
-        class: "btn icon send-again", title: "Send this to a worker again",
-        "aria-label": "Send this to a worker again", onclick: () => sendAgain(m),
+        class: "btn icon send-again", title: "Send this again, to a worker or a chat",
+        "aria-label": "Send this again, to a worker or a chat", onclick: () => sendAgain(m),
       }, "\u2192")),
     messageBody(m.body),
     replies && replies.length

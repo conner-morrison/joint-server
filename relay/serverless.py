@@ -493,9 +493,25 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         return {"skipped": skipped}
 
     @app.post("/{ws}/api/channels/{name}/send/{who}")
-    async def send_one(name: str, who: str, seq: int,
+    async def send_one(name: str, who: str, seq: int, bot: bool = False,
                        scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
-        """Hand one message to one member again, whatever it has already had."""
+        """Hand one message to one member again, whatever it has already had.
+
+        A chat is sent to there and then rather than queued, because nothing is
+        coming to collect it, and its place in the channel is left alone: this
+        is for looking at one message again, not for rewinding what the chat
+        has already been told.
+        """
+        if bot:
+            if sender is None:
+                raise HTTPException(503, "this deployment is not sending to chats")
+            try:
+                parts = await sender.send_one(scoped.slug, name, who, seq)
+            except LookupError as exc:
+                raise HTTPException(404, str(exc)) from None
+            except telegram.TelegramError as exc:
+                raise HTTPException(502, f"Telegram would not take it: {exc}") from None
+            return {"sent": True, "seq": seq, "bot": who, "messages": parts}
         try:
             await scoped.send_again(name, who, seq)
         except LookupError as exc:
