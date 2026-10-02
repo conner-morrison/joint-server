@@ -25,18 +25,29 @@ log = logging.getLogger("relay.telegram")
 API = "https://api.telegram.org"
 LIMIT = 4096                              # characters Telegram accepts in one message
 MIN_JD = 320                              # too little room left to begin a description in
-FACTS = [("Budget", "budget"), ("Terms", "terms"), ("Published", "published"),
+# Decision first: where a worker has judged a job, that judgement is what the
+# notification is for.
+FACTS = [("Decision", "decision"), ("Verdict", "verdict"),
+         ("Budget", "budget"), ("Terms", "terms"), ("Published", "published"),
          ("Posted", "posted")]
-CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment", "paymentVerified"),
+CLIENT_FIELDS = [("Name", "name"), ("Rank", "rank"), ("Rating", "rating"),
+                 ("Payment", "paymentVerified"),
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
 NAMED_LINKS = (("published", "Published"), ("deployed", "Published"), ("live", "Published"),
                ("demo", "Demo"), ("source", "Source"), ("repo", "Source"),
                ("repository", "Source"), ("homepage", "Homepage"),
-               ("upworkUrl", "Upwork"), ("inviteUrl", "Invitation"),
+               ("upworkUrl", "Upwork"), ("job_url", "Upwork"), ("jobUrl", "Upwork"),
+               ("jobLink", "Upwork"), ("inviteUrl", "Invitation"),
                ("html_url", "Link"), ("htmlUrl", "Link"), ("url", "Link"), ("link", "Link"))
 LINK_KEYS = tuple(key for key, _ in NAMED_LINKS)
-JD_KEYS = ("description", "jobDescription", "jd", "snippet", "summary", "details", "text")
+JD_KEYS = ("description", "jobDescription", "job_description", "jd", "snippet", "summary",
+           "details", "text")
+# What a worker called the job. Each writes what is natural to it, and one that
+# spells it job_title is not sending something less worth reading.
+TITLE_KEYS = ("title", "job_title", "jobTitle", "jobName", "job_name", "heading", "name",
+              "subject", "emailSubject")
+CLIENT_NAME_KEYS = ("client_name", "clientName", "company", "buyer")
 INVITATION_WORDS = ("invit", "interview", "asked you to apply", "wants to interview")
 
 # Sent when a bot is registered. It is the test as well as the greeting: if
@@ -149,7 +160,36 @@ def fit(text: str, budget: int) -> tuple[str, str]:
     return text[:at].rstrip(), text[at:].lstrip()
 
 
-def render(body: Any, channel: str = "") -> list[str]:
+def title_of(body: dict[str, Any]) -> str:
+    for key in TITLE_KEYS:
+        said = body.get(key)
+        if isinstance(said, str) and said.strip():
+            return said.strip()
+    return ""
+
+
+def client_of(body: dict[str, Any]) -> dict[str, Any]:
+    """The client, whether it arrived nested or as flat clientRank-style keys.
+    A plain string under `client` is a name, which is the one field a worker
+    that knows little else about a client still tends to have."""
+    nested = body.get("client") if isinstance(body.get("client"), dict) else {}
+    found: dict[str, Any] = {}
+    for _, key in CLIENT_FIELDS:
+        value = nested.get(key, body.get("client" + key[0].upper() + key[1:]))
+        if value not in (None, ""):
+            found[key] = value
+    if isinstance(body.get("client"), str) and body["client"].strip():
+        found["name"] = body["client"].strip()
+    if not found.get("name"):
+        for key in CLIENT_NAME_KEYS:
+            said = body.get(key)
+            if isinstance(said, str) and said.strip():
+                found["name"] = said.strip()
+                break
+    return found
+
+
+def render(body: Any, channel: str = "", source: str = "") -> list[str]:
     """One job as one message: what it is, what it pays, who is asking, and a
     way in, with the description under it.
 
@@ -167,12 +207,16 @@ def render(body: Any, channel: str = "") -> list[str]:
     # Two notifications for one job are two channels carrying it, or two bots
     # sending from one - and a line that says which turns that from a mystery
     # into something a person can see and fix.
+    # Who published it is part of what it is: two workers watch the same job
+    # boards with different rules, and which one found this decides how much
+    # the decision on it is worth.
     where = "  ·  ".join(part for part in (
-        source_tag(body), f"#{esc(channel)}" if channel else "") if part)
+        source_tag(body), esc(source) if source else "",
+        f"#{esc(channel)}" if channel else "") if part)
     if where:
         lines.append(where)
 
-    title = esc(body.get("title") or body.get("emailSubject") or "New message")
+    title = esc(title_of(body) or "New message")
     links = links_of(body)
     link = links[0][0] if links else None
     lines.append(f'<b><a href="{esc(link)}">{title}</a></b>' if link else f"<b>{title}</b>")
@@ -191,10 +235,10 @@ def render(body: Any, channel: str = "") -> list[str]:
     if facts:
         lines.append(" · ".join(facts))
 
-    client = body.get("client") if isinstance(body.get("client"), dict) else {}
+    client = client_of(body)
     about = []
     for label, key in CLIENT_FIELDS:
-        value = client.get(key, body.get("client" + key[0].upper() + key[1:]))
+        value = client.get(key)
         if value in (None, ""):
             continue
         if key == "paymentVerified":

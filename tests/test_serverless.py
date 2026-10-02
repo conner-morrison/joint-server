@@ -1150,6 +1150,31 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
                                        token="p")
         self.assertEqual((status, "phone" in body["detail"]), (409, True))
 
+    async def test_a_notification_says_which_worker_published_it(self) -> None:
+        """Two workers watch the same job boards under different rules, so on a
+        phone the useful question about a job is not only what it is but who
+        found it. The server knows, and the worker never has to say."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        await self.call("POST", "/acme/enrol", {"name": "general-vollna-search"})
+        _, rows = await self.call("GET", "/acme/api/pending", token="p")
+        _, approved = await self.call("POST", f"/acme/api/pending/{rows[0]['ref']}", token="p")
+        who = approved["worker_id"]
+        await self.call("PUT", f"/acme/api/channels/jobs/members/{who}", {}, token="p")
+
+        await self.call("POST", "/acme/publish",
+                        {"channel": "jobs",
+                         "body": {"job_title": "Looker Studio dashboard", "decision": "apply",
+                                  "client_name": "Northwind Analytics"}}, token=who)
+        await self.eventually(1)
+        said = self.telegram.sent[0]["text"]
+        self.assertIn("general-vollna-search", said)
+        self.assertIn("Looker Studio dashboard", said)
+        self.assertIn("Decision: <b>apply</b>", said)
+        self.assertIn("Northwind Analytics", said)
+        # The id is what the server knows it by, and is no use to a reader.
+        self.assertNotIn(who, said)
+
     async def test_bots_belong_to_their_channel(self) -> None:
         await self.ready()
         await self.call("POST", "/acme/api/channels", {"name": "quiet"}, token="p")

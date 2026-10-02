@@ -76,6 +76,58 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Use &lt;b&gt;React&lt;/b&gt; &amp; Redux", sent[0])
 
 
+class RoughBodyTest(unittest.TestCase):
+    """A worker writes what is natural to it.
+
+    One spells it job_title and client_name and puts its judgement in decision;
+    another sends title, upworkUrl and a nested client. Neither is sending
+    something less worth reading, so both read the same way on a phone.
+    """
+
+    ROUGH = {"job_title": "Looker Studio dashboard", "job_url": "https://www.upwork.com/jobs/~0221",
+             "job_description": "Connect and blend the sources.", "decision": "apply",
+             "client_name": "Northwind Analytics"}
+
+    def test_every_field_arrives(self) -> None:
+        sent = render(self.ROUGH, channel="jobs", source="general-vollna-search")
+        said = "\n".join(sent)
+        self.assertIn("Looker Studio dashboard", said)
+        self.assertIn("https://www.upwork.com/jobs/~0221", said)
+        self.assertIn("Decision: <b>apply</b>", said)
+        self.assertIn("Name: Northwind Analytics", said)
+        self.assertIn("Connect and blend the sources.", said)
+
+    def test_the_publisher_is_named(self) -> None:
+        """Two workers watch the same boards under different rules, so which one
+        found a job decides what its decision is worth."""
+        sent = render(self.ROUGH, channel="jobs", source="general-vollna-search")
+        self.assertIn("general-vollna-search", sent[0].splitlines()[0])
+        self.assertIn("#jobs", sent[0].splitlines()[0])
+
+    def test_it_reads_the_same_as_the_tidier_shape(self) -> None:
+        tidy = {"source": "vollna", "type": "job", "title": "Looker Studio dashboard",
+                "upworkUrl": "https://www.upwork.com/jobs/~0221", "decision": "apply",
+                "client": {"name": "Northwind Analytics"},
+                "description": "Connect and blend the sources."}
+        rough = render(self.ROUGH, channel="jobs", source="a")[0].splitlines()
+        same = render(tidy, channel="jobs", source="a")[0].splitlines()
+        # Line for line the same message, bar the source tag the tidy one earns
+        # by saying where it came from in its body.
+        self.assertEqual([x for x in rough if not x.startswith("a  ·")][1:],
+                         [x for x in same if not x.startswith("\U0001f50e")][1:])
+
+    def test_a_title_is_found_wherever_it_was_put(self) -> None:
+        for key in ("title", "job_title", "jobTitle", "job_name", "heading", "name"):
+            sent = render({key: "Build a dashboard"}, channel="jobs")
+            self.assertIn("Build a dashboard", sent[0], f"{key} was not read as the title")
+
+    def test_a_client_name_is_found_wherever_it_was_put(self) -> None:
+        for body in ({"client_name": "Acme"}, {"clientName": "Acme"}, {"client": "Acme"},
+                     {"client": {"name": "Acme"}}, {"company": "Acme"}):
+            sent = render({**body, "title": "A job"}, channel="jobs")
+            self.assertIn("Name: Acme", "\n".join(sent), f"{body} lost the client's name")
+
+
 class FitTest(unittest.TestCase):
     def test_text_that_fits_is_left_alone(self) -> None:
         self.assertEqual(fit("short", 100), ("short", ""))

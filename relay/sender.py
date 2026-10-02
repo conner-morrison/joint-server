@@ -77,12 +77,22 @@ class BotSender:
         scoped = self.store.ws(bot["workspace"])
         waiting = await scoped.messages_after(bot["channel"], int(bot["cursor"]), limit=20)
         sent = 0
+        # Which worker published something is part of the notification: two
+        # workers may watch the same job boards under different rules. Looked up
+        # once per worker per round, because a round is usually one worker's
+        # messages and the name does not change inside it.
+        names: dict[str, str] = {}
         for message in waiting:
             # Usually one. A job whose description is longer than Telegram will
             # carry is rendered as a message and its continuation, and the
             # cursor waits for the last part: half a job description delivered
             # and then forgotten would be worse than delivering it again.
-            parts = telegram.render(message["body"], channel=bot["channel"])
+            sender = str(message.get("sender") or "")
+            if sender and sender not in names:
+                names[sender] = (sender if sender.startswith("@")
+                                 else await scoped.name_of(sender))
+            parts = telegram.render(message["body"], channel=bot["channel"],
+                                    source=names.get(sender, ""))
             try:
                 for part in parts:
                     await telegram.send(bot["bot_token"], bot["chat_id"], part, api=self.api)

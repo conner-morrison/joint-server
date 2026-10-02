@@ -1432,6 +1432,20 @@ async function loadOlder() {
 // Whoever mentions it first is the thing being answered.
 const JOB_ID_KEYS = ["jobId", "job_id", "job", "proposalId", "proposal_id"];
 
+// What a worker called the job. Each worker writes what is natural to it, and
+// one that spells it job_title is not sending something less worth showing, so
+// the aliases are read rather than the item falling back to punctuation.
+const TITLE_KEYS = ["title", "job_title", "jobTitle", "jobName", "job_name",
+                    "heading", "name", "subject", "emailSubject"];
+
+function titleOf(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return "";
+  for (const key of TITLE_KEYS) {
+    if (typeof body[key] === "string" && body[key].trim()) return body[key].trim();
+  }
+  return "";
+}
+
 function jobIdOf(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   for (const key of JOB_ID_KEYS) {
@@ -1479,17 +1493,21 @@ function renderFeed(stick) {
 // Bodies are written by workers and the server never looks inside them, so a
 // link made from one is a link chosen by whoever published it. Only http and
 // https become links: anything else, `javascript:` above all, stays as text.
+// Only something that says it is a URL. Resolving against the page turned
+// every plain word into one - "apply" became a link to /apply on this host -
+// and the damage was quiet: a fact that looked like a URL was dropped as a
+// duplicate of a link, so budgets, decisions and dates simply stopped
+// appearing, and a source of "vollna" arrived as a link chip.
 function httpUrl(value) {
-  if (typeof value !== "string" || !value.trim()) return null;
-  try {
-    const url = new URL(value, location.href);
-    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
-  } catch {
-    return null;
-  }
+  if (typeof value !== "string") return null;
+  const said = value.trim();
+  return /^https?:\/\/\S/i.test(said) ? said : null;
 }
 
-const FACTS = [["Budget", "budget"], ["Terms", "terms"], ["Published", "published"],
+// Decision first: where a worker has judged a job, that judgement is the thing
+// a person is reading the card for.
+const FACTS = [["Decision", "decision"], ["Verdict", "verdict"],
+               ["Budget", "budget"], ["Terms", "terms"], ["Published", "published"],
                ["Posted", "posted"], ["Skills", "skills"]];
 
 // Every field a publisher might put a link in. An invitation carries its own,
@@ -1497,6 +1515,7 @@ const FACTS = [["Budget", "budget"], ["Terms", "terms"], ["Published", "publishe
 // Named links, with what to call each. A reply from a worker says where the
 // work was published and where its source is; both are worth their names.
 const NAMED_LINKS = [["published", "Published"], ["deployed", "Published"], ["live", "Published"],
+                     ["job_url", "Upwork"], ["jobUrl", "Upwork"], ["jobLink", "Upwork"],
                      ["demo", "Demo"], ["source", "Source"], ["repo", "Source"],
                      ["repository", "Source"], ["homepage", "Homepage"],
                      ["upworkUrl", "Upwork"], ["inviteUrl", "Invitation"],
@@ -1544,6 +1563,7 @@ function linksOf(body) {
 // reading. A field the publisher did not send is simply absent: none of this
 // is invented for a message that does not carry it.
 const CLIENT_FIELDS = [
+  ["Name", "name"],
   ["Rank", "rank"],
   ["Rating", "rating"],
   ["Payment", "paymentVerified"],
@@ -1556,10 +1576,12 @@ const CLIENT_FIELDS = [
 ];
 
 // Where a job description might be called home, most specific first.
-const JD_KEYS = ["description", "jobDescription", "jd", "snippet", "summary", "details", "text"];
+const JD_KEYS = ["description", "jobDescription", "job_description", "jd", "snippet",
+                 "summary", "details", "text"];
 
 const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, ...LINK_KEYS,
-                       ...JOB_ID_KEYS, "links", "urls", "title",
+                       ...JOB_ID_KEYS, ...TITLE_KEYS, "links", "urls",
+                       "client_name", "clientName",
                        "type", "source", "index", "emailId", "receivedAt",
                        "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
 
@@ -1583,6 +1605,11 @@ function clientOf(body) {
   }
   // A plain string under `client` is a name, which is still worth showing.
   if (typeof body.client === "string" && body.client.trim()) found.name = body.client.trim();
+  if (!found.name) {
+    for (const key of ["client_name", "clientName", "company", "buyer"]) {
+      if (typeof body[key] === "string" && body[key].trim()) { found.name = body[key].trim(); break; }
+    }
+  }
   return found;
 }
 
@@ -1602,7 +1629,8 @@ function clientValue(key, value) {
 function clientBlock(body) {
   const client = clientOf(body);
   const rows = CLIENT_FIELDS
-    .filter(([, key]) => client[key] !== undefined)
+    // The name is the heading of this block, so it is not also a row in it.
+    .filter(([, key]) => key !== "name" && client[key] !== undefined)
     .map(([label, key]) => h("div", { class: "client-row" },
       h("dt", {}, label), h("dd", {}, clientValue(key, client[key]))));
   if (!rows.length && !client.name) return null;
@@ -1616,8 +1644,7 @@ function clientBlock(body) {
 // arranged even slightly differently - an invitation, say - arrived as
 // punctuation, which is the one presentation nobody wants.
 function looksLikeJob(body) {
-  return Boolean(body && typeof body === "object" && !Array.isArray(body)
-    && typeof body.title === "string" && body.title.trim());
+  return Boolean(titleOf(body));
 }
 
 function when(value) {
@@ -1663,10 +1690,11 @@ function jobCard(body) {
   // but never dropped: a body is the worker's, not the console's, to decide.
   const rest = Object.fromEntries(Object.entries(body).filter(([key]) => !SHOWN.has(key)));
 
+  const title = titleOf(body);
   return h("div", { class: "job" },
     link
-      ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, body.title)
-      : h("div", { class: "job-title" }, body.title),
+      ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, title)
+      : h("div", { class: "job-title" }, title),
     facts.length ? h("div", { class: "job-facts" }, facts) : false,
     shortJd ? h("p", { class: "msg-text" }, shortJd) : false,
     listed.length
