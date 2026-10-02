@@ -1438,6 +1438,58 @@ const JOB_ID_KEYS = ["jobId", "job_id", "job", "proposalId", "proposal_id"];
 const TITLE_KEYS = ["title", "job_title", "jobTitle", "jobName", "job_name",
                     "heading", "name", "subject", "emailSubject"];
 
+// A worker may send a job as a block of labelled text rather than as fields:
+// "Job title: …" on one line, "Job description:" and then the posting. It is
+// the same job, said differently, and reading the labels is all it takes to
+// show it the way any other job is shown.
+//
+// Only these labels start a field. A job description is full of lines like
+// "Community Engagement: identify niche communities", and treating every colon
+// as a label would chop the description into nonsense.
+const LABELS = [
+  [["job title", "title"], "title"],
+  [["job link", "job url", "link", "url"], "url"],
+  [["job description", "description", "jd"], "description"],
+  [["client name", "client"], "clientName"],
+  [["decision"], "decision"],
+  [["reason", "why"], "reason"],
+  [["project id", "projectid"], "projectId"],
+  [["job id", "jobid"], "jobId"],
+  [["budget", "rate"], "budget"],
+  [["published"], "published"],
+  [["posted"], "posted"],
+];
+const LABEL_OF = new Map(LABELS.flatMap(([names, key]) => names.map((n) => [n, key])));
+const LABEL_MAX = 24;                     // characters before the colon
+
+function labelled(text) {
+  if (typeof text !== "string" || !text.includes(":")) return null;
+  const found = {};
+  const lead = [];
+  let current = null;
+  for (const line of text.split(/\r?\n/)) {
+    const at = line.indexOf(":");
+    // A label counts the first time it appears and not after: a description
+    // that happens to say "Reason:" partway through is still the description.
+    let key = at > 0 && at <= LABEL_MAX ? LABEL_OF.get(line.slice(0, at).trim().toLowerCase()) : null;
+    if (key && found[key] !== undefined) key = null;
+    if (key) {
+      current = key;
+      found[key] = line.slice(at + 1).trim();
+    } else if (current) {
+      found[current] += "\n" + line;
+    } else {
+      lead.push(line);
+    }
+  }
+  if (Object.keys(found).length < 2) return null;
+  for (const key of Object.keys(found)) found[key] = found[key].trim();
+  // Anything said before the first label is the posting speaking for itself.
+  const said = lead.join("\n").trim();
+  if (said && !found.description) found.description = said;
+  return found;
+}
+
 function titleOf(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "";
   for (const key of TITLE_KEYS) {
@@ -1506,9 +1558,9 @@ function httpUrl(value) {
 
 // Decision first: where a worker has judged a job, that judgement is the thing
 // a person is reading the card for.
-const FACTS = [["Decision", "decision"], ["Verdict", "verdict"],
+const FACTS = [["Decision", "decision"], ["Verdict", "verdict"], ["Reason", "reason"],
                ["Budget", "budget"], ["Terms", "terms"], ["Published", "published"],
-               ["Posted", "posted"], ["Skills", "skills"]];
+               ["Posted", "posted"], ["Project", "projectId"], ["Skills", "skills"]];
 
 // Every field a publisher might put a link in. An invitation carries its own,
 // and `links` holds however many an item has.
@@ -1746,6 +1798,17 @@ function sourceTag(body) {
 }
 
 function messageBody(body) {
+  // A job sent as labelled text is a job. Read into fields it is shown the way
+  // every other job is, rather than as a wall of escaped newlines.
+  if (typeof body === "string") {
+    const read = labelled(body);
+    if (read) return jobCard(read);
+  } else if (body && typeof body === "object" && !Array.isArray(body) && !titleOf(body)) {
+    for (const key of ["text", "message", "raw"]) {
+      const read = labelled(body[key]);
+      if (read) return jobCard({ ...body, ...read });
+    }
+  }
   if (looksLikeJob(body)) return jobCard(body);
   const isPlain = body && typeof body === "object" && !Array.isArray(body)
     && typeof body.text === "string";

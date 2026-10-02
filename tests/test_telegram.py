@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import unittest
 
-from relay.telegram import LIMIT, fit, render
+from relay.telegram import LIMIT, fit, labelled, render
 
 
 def body(**extra: object) -> dict[str, object]:
@@ -126,6 +126,75 @@ class RoughBodyTest(unittest.TestCase):
                      {"client": {"name": "Acme"}}, {"company": "Acme"}):
             sent = render({**body, "title": "A job"}, channel="jobs")
             self.assertIn("Name: Acme", "\n".join(sent), f"{body} lost the client's name")
+
+
+class LabelledTextTest(unittest.TestCase):
+    """A job sent as a block of labelled text rather than as fields.
+
+    It is the same job, said differently. Read it and it is shown the way any
+    other job is; leave it and it arrives as a wall of escaped newlines, which
+    is how this one turned up.
+    """
+
+    RAW = ("Decision: manual check\n"
+           "Reason: spent $3198 (< $100K) and pays $17.03/hr (> $10)\n"
+           "Project id: 75319257\n\n"
+           "Job title: Community Manager & Content Marketer for Indie Android App\n"
+           "Job link: https://www.upwork.com/jobs/~02210583609411881381\n"
+           "Client name: Comunicazione (named in 1 feedback)\n\n"
+           "Job description:\n"
+           "PopsPhone is a newly launched Android launcher.\n"
+           "Key Responsibilities (Phase 1)\n"
+           "Community Engagement: Identify and engage with niche communities.\n"
+           "PR & Blog Outreach: Research relevant tech blogs.\n"
+           "Reason: this line is prose, not a second label.")
+
+    def test_every_label_is_read(self) -> None:
+        read = labelled(self.RAW)
+        self.assertEqual(read["decision"], "manual check")
+        self.assertEqual(read["reason"], "spent $3198 (< $100K) and pays $17.03/hr (> $10)")
+        self.assertEqual(read["projectId"], "75319257")
+        self.assertEqual(read["title"], "Community Manager & Content Marketer for Indie Android App")
+        self.assertEqual(read["url"], "https://www.upwork.com/jobs/~02210583609411881381")
+        self.assertEqual(read["clientName"], "Comunicazione (named in 1 feedback)")
+
+    def test_the_description_keeps_its_own_colons(self) -> None:
+        """The reason only known labels start a field. A posting is full of
+        lines like "Community Engagement: …", and treating every colon as a
+        label would chop the description into nonsense."""
+        read = labelled(self.RAW)
+        self.assertIn("Community Engagement: Identify and engage with niche communities.",
+                      read["description"])
+        self.assertIn("PR & Blog Outreach: Research relevant tech blogs.", read["description"])
+        self.assertIn("Key Responsibilities (Phase 1)", read["description"])
+
+    def test_a_label_counts_once(self) -> None:
+        """A description that says "Reason:" partway through is still the
+        description, not a correction to the reason."""
+        read = labelled(self.RAW)
+        self.assertEqual(read["reason"], "spent $3198 (< $100K) and pays $17.03/hr (> $10)")
+        self.assertIn("this line is prose, not a second label", read["description"])
+
+    def test_it_renders_as_any_other_job_does(self) -> None:
+        sent = render(self.RAW, channel="jobs", source="general-vollna-search")
+        said = "\n".join(sent)
+        self.assertIn("general-vollna-search", sent[0].splitlines()[0])
+        self.assertIn('<a href="https://www.upwork.com/jobs/~02210583609411881381">', said)
+        self.assertIn("Decision: <b>manual check</b>", said)
+        self.assertIn("Name: Comunicazione (named in 1 feedback)", said)
+        self.assertIn("PopsPhone is a newly launched Android launcher.", said)
+
+    def test_text_that_is_not_labelled_is_left_alone(self) -> None:
+        """Only a job written this way is read this way. Ordinary prose, and a
+        single stray colon, must not be mistaken for fields."""
+        self.assertIsNone(labelled("just some words"))
+        self.assertIsNone(labelled("Note: nothing else here"))
+        self.assertIsNone(labelled(""))
+        self.assertIsNone(labelled(None))
+
+    def test_a_posting_with_no_leading_label_keeps_its_words(self) -> None:
+        read = labelled("A job nobody labelled.\nDecision: skip\nReason: too cheap")
+        self.assertEqual(read["description"], "A job nobody labelled.")
 
 
 class FitTest(unittest.TestCase):

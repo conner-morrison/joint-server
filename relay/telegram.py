@@ -27,9 +27,9 @@ LIMIT = 4096                              # characters Telegram accepts in one m
 MIN_JD = 320                              # too little room left to begin a description in
 # Decision first: where a worker has judged a job, that judgement is what the
 # notification is for.
-FACTS = [("Decision", "decision"), ("Verdict", "verdict"),
+FACTS = [("Decision", "decision"), ("Verdict", "verdict"), ("Reason", "reason"),
          ("Budget", "budget"), ("Terms", "terms"), ("Published", "published"),
-         ("Posted", "posted")]
+         ("Posted", "posted"), ("Project", "projectId")]
 CLIENT_FIELDS = [("Name", "name"), ("Rank", "rank"), ("Rating", "rating"),
                  ("Payment", "paymentVerified"),
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
@@ -48,6 +48,66 @@ JD_KEYS = ("description", "jobDescription", "job_description", "jd", "snippet", 
 TITLE_KEYS = ("title", "job_title", "jobTitle", "jobName", "job_name", "heading", "name",
               "subject", "emailSubject")
 CLIENT_NAME_KEYS = ("client_name", "clientName", "company", "buyer")
+
+# A worker may send a job as a block of labelled text rather than as fields:
+# "Job title: …" on one line, "Job description:" and then the posting. It is
+# the same job, said differently, and reading the labels is all it takes to
+# show it the way any other job is shown.
+#
+# Only these labels start a field. A job description is full of lines like
+# "Community Engagement: identify niche communities", and treating every
+# colon as a label would chop the description into nonsense.
+LABELS = (
+    (("job title", "title"), "title"),
+    (("job link", "job url", "link", "url"), "url"),
+    (("job description", "description", "jd"), "description"),
+    (("client name", "client"), "clientName"),
+    (("decision",), "decision"),
+    (("reason", "why"), "reason"),
+    (("project id", "projectid"), "projectId"),
+    (("job id", "jobid"), "jobId"),
+    (("budget", "rate"), "budget"),
+    (("published",), "published"),
+    (("posted",), "posted"),
+)
+LABEL_OF = {said: key for names, key in LABELS for said in names}
+LABEL_MAX = 24                            # characters before the colon
+
+
+def labelled(text: Any) -> dict[str, Any] | None:
+    """A job written as labelled lines, read back as fields.
+
+    A label only counts the first time it appears: a description that happens
+    to say "Reason:" partway through is still the description.
+    """
+    if not isinstance(text, str) or ":" not in text:
+        return None
+    found: dict[str, Any] = {}
+    lead: list[str] = []
+    current: str | None = None
+    for line in text.splitlines():
+        at = line.find(":")
+        key = None
+        if 0 < at <= LABEL_MAX:
+            key = LABEL_OF.get(line[:at].strip().lower())
+            if key in found:
+                key = None                # said once; after that it is prose
+        if key:
+            current = key
+            found[key] = line[at + 1:].strip()
+        elif current:
+            found[current] = f"{found[current]}\n{line}"
+        else:
+            lead.append(line)
+    if len(found) < 2:
+        return None
+    for key in found:
+        found[key] = found[key].strip()
+    # Anything said before the first label is the posting speaking for itself.
+    said = "\n".join(lead).strip()
+    if said and not found.get("description"):
+        found["description"] = said
+    return found
 INVITATION_WORDS = ("invit", "interview", "asked you to apply", "wants to interview")
 
 # Sent when a bot is registered. It is the test as well as the greeting: if
@@ -199,6 +259,16 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
     a long description continues into the message after it. Everything a job
     says arrives; only rarely in one piece.
     """
+    # A job sent as labelled text is a job. Read it into fields and it is shown
+    # the way every other job is, rather than as a wall of escaped newlines.
+    if isinstance(body, str):
+        body = labelled(body) or body
+    elif isinstance(body, dict) and not title_of(body):
+        for key in ("text", "message", "raw"):
+            read = labelled(body.get(key))
+            if read:
+                body = {**body, **read}
+                break
     if not isinstance(body, dict):
         return [f"<pre>{esc(json.dumps(body, indent=2, ensure_ascii=False)[:1000])}</pre>"]
 
