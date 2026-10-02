@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS messages (
     channel     TEXT NOT NULL,
     sender      TEXT NOT NULL,              -- a worker id, or @server; not a foreign key so history survives
     client_id   TEXT,                       -- the publisher's id for this message, used to drop resends
+    job_key     TEXT,                       -- the job this is about, read from its own link
     body        JSONB NOT NULL,
     ts          DOUBLE PRECISION NOT NULL,
     -- Deleting a channel takes its messages, as it always has.
@@ -173,6 +174,8 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_channel_seq ON messages(workspace, channel, seq);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
+-- One job per channel, whoever posted it and whatever they called it.
+CREATE INDEX IF NOT EXISTS messages_job ON messages(workspace, channel, job_key);
 -- One message per id in a workspace, whoever published it. The same job can
 -- reach two different workers - a mail parser and a webhook, say - and it is
 -- still one job; scoping this to the sender would let each of them store its
@@ -231,6 +234,51 @@ def new_worker_id() -> str:
     it is safe in an address, because it travels in one.
     """
     return "w-" + secrets.token_hex(16)
+
+
+UPWORK_JOB_URL = re.compile(r"upwork\.com/jobs/(~[0-9a-z]+)", re.I)
+# Where a publisher puts the job's own link. Looked at first, so a job
+# mentioned inside a description does not decide what the message is about.
+JOB_LINK_KEYS = ("upworkUrl", "upwork_url", "job_url", "jobUrl", "jobLink", "url", "link")
+
+
+def job_of(body: Any) -> str | None:
+    """The job a message is about, from the job's own link.
+
+    The publisher's id is what normally keeps a repeat from being stored, but
+    that only works for a publisher that sends one. Reading the link instead
+    means two workers watching the same board - or one worker reading the same
+    job out of two emails - post a job once between them, whatever either of
+    them chose to call it.
+    """
+    def found(value: Any) -> str | None:
+        if isinstance(value, str):
+            seen = UPWORK_JOB_URL.search(value)
+            return f"job:{seen.group(1).lower()}" if seen else None
+        if isinstance(value, dict):
+            for item in value.values():
+                got = found(item)
+                if got:
+                    return got
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                got = found(item)
+                if got:
+                    return got
+        return None
+
+    if isinstance(body, dict):
+        for key in JOB_LINK_KEYS:
+            got = found(body.get(key))
+            if got:
+                return got
+        for key in ("links", "urls"):
+            got = found(body.get(key))
+            if got:
+                return got
+    # Nothing under a name this server knows. A job written as labelled text
+    # carries its link in the text, so the whole body is worth one look.
+    return found(body if isinstance(body, str) else json.dumps(body, default=str))
 
 
 def job_key(url_or_key: str) -> str:
@@ -303,6 +351,7 @@ class PgStore:
                 pass
         await self._widen_dedupe()
         await self._retire_tokens()
+        await self._read_job_links()
 
     async def _widen_dedupe(self) -> None:
         """Move an existing database from per-sender dedupe to per-workspace.
@@ -340,6 +389,35 @@ class PgStore:
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
             log.warning("could not widen dedupe (%s); the old rule still applies",
                         type(exc).__name__)
+
+    async def _read_job_links(self) -> None:
+        """Give the messages already stored the job key they would get now.
+
+        Without this, a job posted before this existed is not recognised when
+        it is posted again, and the first repeat of every job already in a
+        channel gets through. Reading them once at startup costs one pass over
+        a few hundred rows and saves every one of those.
+
+        Never at the cost of starting.
+        """
+        try:
+            async with self.pool.connection() as conn:
+                # A table made before this existed has no such column.
+                await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS job_key TEXT")
+                await conn.execute("CREATE INDEX IF NOT EXISTS messages_job "
+                                   "ON messages(workspace, channel, job_key)")
+                missing = await (await conn.execute(
+                    "SELECT seq, body FROM messages WHERE job_key IS NULL")).fetchall()
+                read = [(job_of(row["body"]), row["seq"]) for row in missing]
+                found = [pair for pair in read if pair[0]]
+                for key, seq in found:
+                    await conn.execute("UPDATE messages SET job_key = %s WHERE seq = %s",
+                                       (key, seq))
+                if found:
+                    log.info("read the job link of %d stored messages", len(found))
+        except Exception as exc:                 # noqa: BLE001 - reported, never fatal
+            log.warning("could not read job links from stored messages (%s); a job posted "
+                        "before now may get through once more", type(exc).__name__)
 
     async def _retire_tokens(self) -> None:
         """Move an existing database to workers identified by an id.
@@ -948,14 +1026,30 @@ class WorkspaceStore:
 
         A publisher that lost its connection before hearing back resends with
         the same client_id; that resend returns the original seq instead of
-        storing the message twice."""
+        storing the message twice.
+
+        A job already in this channel is a duplicate too, however it arrived.
+        The id a publisher chooses only works for a publisher that chooses one,
+        and two workers watching the same board choose differently - so the
+        job's own link decides, and the channel keeps the first telling of it.
+        """
         await self.store.ready()
+        key = job_of(body)
         async with self.store.pool.connection() as conn:
             try:
+                if key is not None:
+                    # Inside the transaction that would store it, so the answer
+                    # cannot be made stale by something committing meanwhile.
+                    seen = await (await conn.execute(
+                        "SELECT seq FROM messages "
+                        " WHERE workspace = %s AND channel = %s AND job_key = %s "
+                        " ORDER BY seq LIMIT 1", (self.slug, channel, key))).fetchone()
+                    if seen is not None:
+                        return int(seen["seq"]), True
                 cur = await conn.execute(
-                    "INSERT INTO messages(workspace, channel, sender, client_id, body, ts) "
-                    "VALUES (%s, %s, %s, %s, %s, %s) RETURNING seq",
-                    (self.slug, channel, sender, client_id, json.dumps(body),
+                    "INSERT INTO messages(workspace, channel, sender, client_id, job_key, body, ts) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING seq",
+                    (self.slug, channel, sender, client_id, key, json.dumps(body),
                      time.time() if ts is None else ts))
                 row = await cur.fetchone()
                 await self._trim(conn, channel)

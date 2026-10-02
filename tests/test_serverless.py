@@ -379,6 +379,73 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         status, body = await self.call("GET", f"/{upwork}/messages", token=worker_id)
         self.assertEqual((status, body["status"]), (401, "unregistered"))
 
+    async def test_one_job_is_posted_once_however_it_arrives(self) -> None:
+        """Two workers watch the same boards, and one worker reads the same job
+        out of two emails. The id a publisher chooses only keeps a repeat out
+        when the publisher chooses one, so the job's own link decides and the
+        channel keeps the first telling of it."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("zachary", "general")}
+        for who in ("zachary", "general"):
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{ids[who]}", {},
+                            token="hunter2")
+
+        url = "https://www.upwork.com/jobs/~02210583609411881381"
+        _, first = await self.call("POST", f"/{ws}/publish",
+                                   {"channel": "jobs", "id": "a",
+                                    "body": {"title": "Community Manager", "upworkUrl": url}},
+                                   token=ids["zachary"])
+        self.assertFalse(first.get("duplicate"))
+
+        # The same job, another publisher, another id, and written differently.
+        _, again = await self.call(
+            "POST", f"/{ws}/publish",
+            {"channel": "jobs", "id": "b",
+             "body": f"Decision: apply\nJob title: Community Manager\nJob link: {url}"},
+            token=ids["general"])
+        self.assertTrue(again.get("duplicate"))
+        self.assertEqual(again["seq"], first["seq"])
+
+        _, stored = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
+        self.assertEqual(len(stored), 1)
+
+    async def test_a_different_job_is_not_mistaken_for_it(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        for job in ("~0221058360941188138", "~0221058360941188139"):
+            await self.call("POST", f"/{ws}/api/channels/jobs/messages",
+                            {"body": {"title": "A job",
+                                      "upworkUrl": f"https://www.upwork.com/jobs/{job}"}},
+                            token="hunter2")
+        _, stored = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
+        self.assertEqual(len(stored), 2)
+
+    async def test_a_reply_about_a_job_is_not_the_job(self) -> None:
+        """A worker answering about a job carries its id, not its link, and the
+        answer belongs in the channel beside the thing it answers."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        for body in ({"title": "Build it", "jobId": "~0221", "source": "https://github.com/a/b"},
+                     {"jobId": "~0221", "status": "done",
+                      "published": "https://example.com/live"}):
+            await self.call("POST", f"/{ws}/api/channels/github/messages", {"body": body},
+                            token="hunter2")
+        _, stored = await self.call("GET", f"/{ws}/api/channels/github/messages", token="hunter2")
+        self.assertEqual(len(stored), 2)
+
+    async def test_the_same_job_may_be_in_two_channels(self) -> None:
+        """Posting a job on and sending it somewhere else are different acts;
+        a channel keeps one copy of a job, not the workspace."""
+        ws = await self.workspace()
+        url = "https://www.upwork.com/jobs/~0221"
+        for channel in ("jobs", "review"):
+            await self.call("POST", f"/{ws}/api/channels", {"name": channel}, token="hunter2")
+            _, said = await self.call("POST", f"/{ws}/api/channels/{channel}/messages",
+                                      {"body": {"title": "A job", "upworkUrl": url}},
+                                      token="hunter2")
+            self.assertFalse(said.get("duplicate"), channel)
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,
@@ -1277,5 +1344,6 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"Paragraph {n}:", arrived, f"paragraph {n} never arrived")
         for part in self.telegram.sent:
             self.assertLessEqual(len(part["text"]), LIMIT)
+
 
 
