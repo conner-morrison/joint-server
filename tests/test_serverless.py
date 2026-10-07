@@ -446,6 +446,82 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                                       token="hunter2")
             self.assertFalse(said.get("duplicate"), channel)
 
+    # --- being told about itself -------------------------------------------
+    async def test_a_worker_is_told_it_was_added_and_removed(self) -> None:
+        """A worker cannot see either event. Being added to a channel is the
+        moment it may start publishing there; being taken out is the moment its
+        work stops reaching anyone. Without being told, both look exactly like
+        a quiet day."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        worker_id = await self.enrol(ws, "scout")
+
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{worker_id}", {}, token="hunter2")
+        _, got = await self.call("GET", f"/{ws}/messages", token=worker_id)
+        self.assertEqual([(n["kind"], n["channel"]) for n in got["notices"]], [("joined", "jobs")])
+        self.assertEqual(got["notices"][0]["message"], "added to #jobs")
+
+        await self.call("DELETE", f"/{ws}/api/channels/jobs/members/{worker_id}", token="hunter2")
+        _, after = await self.call("GET", f"/{ws}/messages", token=worker_id)
+        self.assertEqual([n["message"] for n in after["notices"]], ["removed from #jobs"])
+
+    async def test_a_notice_is_handed_over_once(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        worker_id = await self.enrol(ws, "scout")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{worker_id}", {}, token="hunter2")
+        await self.call("GET", f"/{ws}/messages", token=worker_id)
+        _, again = await self.call("GET", f"/{ws}/messages?wait=1", token=worker_id)
+        self.assertEqual(again["notices"], [])
+
+    async def test_a_notice_ends_a_wait(self) -> None:
+        """So a worker holding a poll open acts on it now rather than whenever
+        its wait happens to run out."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        worker_id = await self.enrol(ws, "scout")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{worker_id}", {}, token="hunter2")
+        await self.call("GET", f"/{ws}/messages", token=worker_id)
+
+        async def remove_soon() -> None:
+            await asyncio.sleep(0.5)
+            await self.call("DELETE", f"/{ws}/api/channels/jobs/members/{worker_id}",
+                            token="hunter2")
+
+        started = time.monotonic()
+        remover = asyncio.create_task(remove_soon())
+        _, got = await self.call("GET", f"/{ws}/messages?wait=20", token=worker_id)
+        took = time.monotonic() - started
+        await remover
+        self.assertEqual([n["message"] for n in got["notices"]], ["removed from #jobs"])
+        self.assertLess(took, 8, f"heard {took - 0.5:.1f}s after being removed")
+
+    async def test_being_told_outlives_what_it_is_about(self) -> None:
+        """The hard half. A worker taken out of a channel can no longer be told
+        anything through it, and a worker that was away while it happened must
+        still find out."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        worker_id = await self.enrol(ws, "scout")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{worker_id}", {}, token="hunter2")
+        await self.call("DELETE", f"/{ws}/api/channels/jobs/members/{worker_id}", token="hunter2")
+        await self.call("DELETE", f"/{ws}/api/channels/jobs", token="hunter2")
+
+        _, got = await self.call("GET", f"/{ws}/messages", token=worker_id)
+        self.assertEqual([n["message"] for n in got["notices"]],
+                         ["added to #jobs", "removed from #jobs"])
+
+    async def test_adding_a_worker_already_there_says_nothing(self) -> None:
+        """Clicking twice is clicking twice, not two events."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        worker_id = await self.enrol(ws, "scout")
+        for _ in range(3):
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{worker_id}", {},
+                            token="hunter2")
+        _, got = await self.call("GET", f"/{ws}/messages", token=worker_id)
+        self.assertEqual(len(got["notices"]), 1)
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,
@@ -530,6 +606,11 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         mailer_id = await self.enrol(ws, "mailer")
         await self.call("PUT", f"/{ws}/api/channels/jobs/members/{mailer_id}", {}, token="hunter2")
 
+        # Being added to a channel is itself news, and ends a wait. Collected
+        # first, so what is timed below is the wait for the message.
+        _, joined = await self.call("GET", f"/{ws}/messages", token=mailer_id)
+        self.assertEqual([n["message"] for n in joined["notices"]], ["added to #jobs"])
+
         async def post_soon() -> None:
             await asyncio.sleep(1.0)
             await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": "late"}, token="hunter2")
@@ -579,6 +660,10 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         ids = {who: await self.enrol(ws, who) for who in ("reporter", "builder", "notifier")}
         for who in ("reporter", "builder", "notifier"):
             await self.call("PUT", f"/{ws}/api/channels/github/members/{ids[who]}", {}, token="hunter2")
+
+        # Each was just added to the channel, which is news of its own.
+        for who in ("reporter", "builder", "notifier"):
+            await self.call("GET", f"/{ws}/messages", token=ids[who])
 
         async def publish_soon() -> None:
             await asyncio.sleep(0.5)

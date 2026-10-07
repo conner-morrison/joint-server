@@ -309,10 +309,16 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
                     for channel in await scoped.channels_of(worker_id)]
         while True:
             found = await scoped.waiting_for(worker_id, limit=min(max(limit, 1), 1000))
+            # What the server has to say about this worker rather than to the
+            # channels it is in: that it has been added to one, or taken out of
+            # one. Worth ending a wait for, because both change what the worker
+            # should be doing next.
+            notices = await scoped.notices_for(worker_id)
             left = deadline - time.monotonic()
-            if found or left <= 0:
+            if found or notices or left <= 0:
                 await scoped.redelivered(worker_id, [int(m["seq"]) for m in found])
-                return {"messages": found, "worker_id": worker_id}
+                await scoped.notices_taken([int(n["id"]) for n in notices])
+                return {"messages": found, "notices": notices, "worker_id": worker_id}
             # Woken by the publish itself. The timeout is a safety net for a
             # notification that never arrives, not the thing doing the work,
             # which is why it can afford to be long.

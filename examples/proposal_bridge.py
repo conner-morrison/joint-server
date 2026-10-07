@@ -338,6 +338,13 @@ class Bridge:
                 say(f"approved after {time.time() - waiting_since:.0f}s")
                 waiting_since = 0.0
 
+            # What the server has to say about this worker rather than about a
+            # channel: that it has been added to one, or taken out of one.
+            # Worth a line, because both change what it should be doing and
+            # neither is visible from here any other way.
+            for notice in body.get("notices", []):
+                say(f"this worker was {notice.get('message', notice.get('kind', 'told something'))}")
+
             for msg in body.get("messages", []):
                 if self.args.channel and msg.get("channel") not in self.args.channel:
                     continue

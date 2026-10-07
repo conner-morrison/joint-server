@@ -160,6 +160,24 @@ CREATE TABLE IF NOT EXISTS muted (
     PRIMARY KEY (workspace, key)
 );
 
+-- Something the server has to tell one worker about itself, rather than about
+-- the world: that it has been put into a channel, or taken out of one. It is
+-- not a message in a channel, because it is nobody else's business and because
+-- a worker taken out of a channel can no longer be told anything through it.
+--
+-- Tied to the workspace and nothing else on purpose: a notice about leaving a
+-- channel has to outlive the membership it describes, and one about a deleted
+-- channel has to outlive the channel.
+CREATE TABLE IF NOT EXISTS notices (
+    id          BIGSERIAL PRIMARY KEY,
+    workspace   TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
+    worker_id   TEXT NOT NULL,
+    kind        TEXT NOT NULL,              -- joined, or left
+    channel     TEXT NOT NULL,
+    at          DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notices_worker ON notices(workspace, worker_id, id);
+
 CREATE TABLE IF NOT EXISTS messages (
     seq         BIGSERIAL PRIMARY KEY,
     workspace   TEXT NOT NULL,
@@ -788,15 +806,51 @@ class WorkspaceStore:
         if not await self.worker_exists(worker_id):
             raise LookupError(f"no worker {worker_id!r}")
         cursor = 0 if from_start else await self.head()
-        return await self.store._run("""
+        joined = await self.store._run("""
             INSERT INTO members(workspace, channel, worker_id, cursor, joined_at) VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (workspace, channel, worker_id) DO NOTHING""",
             (self.slug, channel, worker_id, cursor, time.time())) > 0
+        if joined:
+            await self.tell_worker(worker_id, "joined", channel)
+        return joined
 
     async def leave(self, channel: str, worker_id: str) -> bool:
-        return await self.store._run(
+        left = await self.store._run(
             "DELETE FROM members WHERE workspace = %s AND channel = %s AND worker_id = %s",
             (self.slug, channel, worker_id)) > 0
+        if left:
+            await self.tell_worker(worker_id, "left", channel)
+        return left
+
+    async def tell_worker(self, worker_id: str, kind: str, channel: str) -> None:
+        """Leave a worker something to find the next time it asks.
+
+        A worker is told what it was put into and taken out of because it
+        cannot see either: being added to a channel is the moment it may start
+        publishing there, and being taken out is the moment its work stops
+        reaching anyone. Without this, both look exactly like a quiet day.
+        """
+        await self.store._run(
+            "INSERT INTO notices(workspace, worker_id, kind, channel, at) VALUES (%s, %s, %s, %s, %s)",
+            (self.slug, worker_id, kind, channel, time.time()))
+
+    async def notices_for(self, worker_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        rows = await self.store._all(
+            "SELECT id, kind, channel, at FROM notices "
+            " WHERE workspace = %s AND worker_id = %s ORDER BY id LIMIT %s",
+            (self.slug, worker_id, limit))
+        said = {"joined": "added to", "left": "removed from"}
+        return [{"id": r["id"], "kind": r["kind"], "channel": r["channel"], "at": r["at"],
+                 "message": f"{said.get(r['kind'], r['kind'])} #{r['channel']}"} for r in rows]
+
+    async def notices_taken(self, ids: list[int]) -> None:
+        """Spent once handed over. A notice says something happened, not that
+        anything is owed; keeping it until the worker acknowledged would repeat
+        it on every poll until then."""
+        if not ids:
+            return
+        await self.store._run("DELETE FROM notices WHERE workspace = %s AND id = ANY(%s)",
+                              (self.slug, ids))
 
     async def is_member(self, channel: str, worker_id: str) -> bool:
         return await self.store._one(

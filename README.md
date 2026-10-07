@@ -221,6 +221,29 @@ because some of them are code that cannot be edited today, and a deploy is no
 time for a pipeline to stop. The console marks them. Nothing new is ever given
 a token.
 
+## Being told about itself
+
+A poll answers with what is waiting in the worker's channels, and with anything
+the server has to say about the worker itself:
+
+```json
+{
+  "messages": [ … ],
+  "notices": [ {"kind": "joined", "channel": "jobs", "message": "added to #jobs"} ],
+  "worker_id": "w-9f3c…"
+}
+```
+
+A worker cannot see either event on its own. Being added to a channel is the
+moment it may start publishing there; being taken out is the moment its work
+stops reaching anyone. Without being told, both look exactly like a quiet day.
+
+A notice ends a wait, so a worker holding a poll open acts on it at once. It is
+handed over once and then forgotten: it says something happened, not that
+anything is owed. And it outlives what it describes - a worker taken out of a
+channel cannot be told anything through that channel, and one that was away
+while it happened still finds out when it comes back.
+
 ## Deploying the relay
 
 The relay needs somewhere to run and a Postgres to talk to, reached through
