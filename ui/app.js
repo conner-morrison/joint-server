@@ -1458,6 +1458,19 @@ const LABELS = [
   [["budget", "rate"], "budget"],
   [["published"], "published"],
   [["posted"], "posted"],
+  [["name", "full name", "contact", "lead"], "name"],
+  [["headline"], "headline"],
+  [["role", "position", "job title at company"], "role"],
+  [["company", "organisation", "organization", "employer"], "company"],
+  [["location", "based in", "country"], "location"],
+  [["profile", "linkedin", "linkedin url", "profile url"], "profile"],
+  [["email", "e-mail"], "email"],
+  [["phone", "mobile"], "phone"],
+  [["industry"], "industry"],
+  [["connections"], "connections"],
+  [["notes", "note", "summary", "about"], "notes"],
+  [["status"], "status"],
+  [["score", "fit"], "score"],
 ];
 const LABEL_OF = new Map(LABELS.flatMap(([names, key]) => names.map((n) => [n, key])));
 const LABEL_MAX = 24;                     // characters before the colon
@@ -1574,6 +1587,10 @@ const FACTS = [["Decision", "decision"], ["Verdict", "verdict"], ["Reason", "rea
 // work was published and where its source is; both are worth their names.
 const NAMED_LINKS = [["published", "Published"], ["deployed", "Published"], ["live", "Published"],
                      ["job_url", "Upwork"], ["jobUrl", "Upwork"], ["jobLink", "Upwork"],
+                     ["linkedin", "LinkedIn"], ["linkedinUrl", "LinkedIn"],
+                     ["linkedin_url", "LinkedIn"], ["profile", "Profile"],
+                     ["profileUrl", "Profile"], ["profile_url", "Profile"],
+                     ["website", "Website"], ["company_url", "Company"],
                      ["demo", "Demo"], ["source", "Source"], ["repo", "Source"],
                      ["repository", "Source"], ["homepage", "Homepage"],
                      ["upworkUrl", "Upwork"], ["inviteUrl", "Invitation"],
@@ -1664,7 +1681,7 @@ function clientOf(body) {
   // A plain string under `client` is a name, which is still worth showing.
   if (typeof body.client === "string" && body.client.trim()) found.name = body.client.trim();
   if (!found.name) {
-    for (const key of ["client_name", "clientName", "company", "buyer"]) {
+    for (const key of ["client_name", "clientName"]) {
       if (typeof body[key] === "string" && body[key].trim()) { found.name = body[key].trim(); break; }
     }
   }
@@ -1744,9 +1761,10 @@ function jobCard(body) {
   if (jobId) {
     facts.unshift(h("span", { class: "fact" }, h("b", {}, "Job"), h("code", {}, jobId)));
   }
-  // Whatever the publisher sent that this does not have a place for. Hidden,
-  // but never dropped: a body is the worker's, not the console's, to decide.
-  const rest = Object.fromEntries(Object.entries(body).filter(([key]) => !SHOWN.has(key)));
+  // Whatever the publisher sent that this has no particular place for. Laid
+  // out rather than dumped, and never dropped: a body is the worker's, not the
+  // console's, to decide.
+  const extra = laidOut(body, SHOWN);
 
   const title = titleOf(body);
   return h("div", { class: "job" },
@@ -1755,18 +1773,19 @@ function jobCard(body) {
       : h("div", { class: "job-title" }, title),
     facts.length ? h("div", { class: "job-facts" }, facts) : false,
     shortJd ? h("p", { class: "msg-text" }, shortJd) : false,
-    listed.length
-      ? h("div", { class: "job-links" }, listed.map((l) =>
+    listed.length || extra.extraLinks.length
+      ? h("div", { class: "job-links" }, [...listed, ...extra.extraLinks].map((l) =>
         h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
                  title: l.url }, l.label)))
       : false,
-    jdButton ? h("div", { class: "job-actions" }, jdButton) : false,
+    extra.pills.length ? h("div", { class: "job-facts" }, extra.pills) : false,
+    jdButton || extra.panels.length
+      ? h("div", { class: "job-actions" }, jdButton, extra.panels.map(([button]) => button))
+      : false,
     jdBox || false,
+    extra.panels.map(([, box]) => box),
     clientBlock(body),
-    Object.keys(rest).length
-      ? h("details", { class: "job-more" }, h("summary", {}, "Everything else"),
-          h("pre", {}, JSON.stringify(rest, null, 2)))
-      : false);
+    extra.blocks);
 }
 
 // Where an alert came from decides how much attention it deserves, so it is
@@ -1801,6 +1820,123 @@ function sourceTag(body) {
   if (source.startsWith("upwork")) return h("span", { class: "src" }, "Upwork");
   if (!source) return null;
   return h("span", { class: "src" }, source.replace(/[-_]+/g, " "));
+}
+
+// --- anything else --------------------------------------------------------
+// A channel the console has never been told about still has items in it, and
+// JSON in a monospace block is not an item. Every field is shown as itself:
+// short values as labelled pills, links as chips, long text behind a button.
+// It costs nothing to know nothing about a shape and still lay it out.
+const NICER = { url: "URL", id: "ID", jd: "JD", linkedin: "LinkedIn", ok: "OK" };
+
+function humanise(key) {
+  const words = String(key)
+    .replace(/[_\-]+/g, " ")
+    .replace(/([a-z\d])([A-Z])/g, "$1 $2")
+    .trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return String(key);
+  return words
+    .map((word, i) => NICER[word] || (i === 0 ? word[0].toUpperCase() + word.slice(1) : word))
+    .join(" ");
+}
+
+// What a person looks for first in a lead or a contact, before anything the
+// publisher happened to add.
+const FIRST = ["name", "fullName", "full_name", "headline", "title", "role", "position",
+               "company", "organisation", "organization", "location", "industry",
+               "email", "phone", "status", "decision", "reason", "score", "connections"];
+const HEADINGS = ["name", "fullName", "full_name", "title", "headline", "author",
+                  "company"];
+const LONG = 140;
+
+// Whatever a card has no particular place for, laid out rather than dumped:
+// short values as labelled pills, nested objects as blocks, long text behind a
+// button of its own. The job card uses this for its leftovers and the plain
+// card uses it for everything, so an unknown field looks the same either way.
+function laidOut(body, skip) {
+  const pills = [];
+  const blocks = [];
+  const long = [];
+  const extraLinks = [];
+  const order = [...FIRST.filter((k) => k in body),
+                 ...Object.keys(body).filter((k) => !FIRST.includes(k))];
+  for (const key of order) {
+    if (skip.has(key)) continue;
+    const value = body[key];
+    if (value === null || value === undefined || value === "") continue;
+    if (httpUrl(value)) {
+      // A link under a name nobody listed is still a link, and dropping it
+      // loses the one part of an item a person wants to click.
+      extraLinks.push({ url: httpUrl(value), label: humanise(key) });
+      continue;
+    }
+    if (Array.isArray(value) && value.length && value.every((v) => httpUrl(v))) {
+      value.forEach((v) => extraLinks.push({ url: httpUrl(v), label: humanise(key) }));
+      continue;
+    }
+    if (Array.isArray(value) && value.every((v) => !v || typeof v !== "object")) {
+      const said = value.filter((v) => v !== null && v !== undefined && v !== "").join(", ");
+      if (said) pills.push(h("span", { class: "fact" }, h("b", {}, humanise(key)), said));
+      continue;
+    }
+    if (value && typeof value === "object") {
+      const rows = Object.entries(value)
+        .filter(([, v]) => v !== null && v !== undefined && v !== "" && typeof v !== "object")
+        .map(([k, v]) => h("div", { class: "client-row" },
+          h("dt", {}, humanise(k)), h("dd", {}, String(v))));
+      if (rows.length) {
+        blocks.push(h("div", { class: "client" },
+          h("div", { class: "client-head" }, humanise(key)),
+          h("dl", { class: "client-facts" }, rows)));
+      }
+      continue;
+    }
+    if (Array.isArray(value) && value.some((v) => v && typeof v === "object")) continue;
+    const said = Array.isArray(value) ? value.join(", ") : String(value);
+    if (!said.trim()) continue;
+    if (said.length > LONG || said.includes("\n")) long.push([key, said]);
+    else pills.push(h("span", { class: "fact" }, h("b", {}, humanise(key)), said));
+  }
+
+  // The longest thing is the one worth a button rather than the whole card.
+  const panels = long.map(([key, said]) => {
+    const box = h("div", { class: "jd", hidden: true }, said);
+    const button = h("button", {
+      class: "btn small jd-toggle", type: "button",
+      onclick: () => {
+        box.hidden = !box.hidden;
+        button.textContent = (box.hidden ? "View " : "Hide ") + humanise(key).toLowerCase();
+      },
+    }, "View " + humanise(key).toLowerCase());
+    return [button, box];
+  });
+  return { pills, panels, blocks, extraLinks };
+}
+
+function fieldsCard(body) {
+  const links = linksOf(body);
+  const headingKey = HEADINGS.find((k) => typeof body[k] === "string" && body[k].trim()
+    && !httpUrl(body[k]));
+  const heading = headingKey ? body[headingKey].trim() : "";
+  const link = links.length ? links[0].url : null;
+  const { pills, panels, blocks, extraLinks } = laidOut(body, new Set(headingKey ? [headingKey] : []));
+  const shown = [...(heading && link ? links.slice(1) : links), ...extraLinks];
+
+  return h("div", { class: "job" },
+    heading
+      ? (link
+        ? h("a", { class: "job-title", href: link, target: "_blank", rel: "noopener noreferrer" }, heading)
+        : h("div", { class: "job-title" }, heading))
+      : false,
+    pills.length ? h("div", { class: "job-facts" }, pills) : false,
+    shown.length
+      ? h("div", { class: "job-links" }, shown.map((l) =>
+        h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
+                 title: l.url }, l.label)))
+      : false,
+    panels.length ? h("div", { class: "job-actions" }, panels.map(([button]) => button)) : false,
+    panels.map(([, box]) => box),
+    blocks);
 }
 
 function messageBody(body) {
@@ -1843,6 +1979,9 @@ function messageBody(body) {
           h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
                    title: l.url }, l.label)))
         : false);
+  }
+  if (body && typeof body === "object" && !Array.isArray(body) && Object.keys(body).length) {
+    return fieldsCard(body);
   }
   return h("pre", {}, JSON.stringify(body, null, 2));
 }

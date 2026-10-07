@@ -123,9 +123,18 @@ class RoughBodyTest(unittest.TestCase):
 
     def test_a_client_name_is_found_wherever_it_was_put(self) -> None:
         for body in ({"client_name": "Acme"}, {"clientName": "Acme"}, {"client": "Acme"},
-                     {"client": {"name": "Acme"}}, {"company": "Acme"}):
+                     {"client": {"name": "Acme"}}):
             sent = render({**body, "title": "A job"}, channel="jobs")
             self.assertIn("Name: Acme", "\n".join(sent), f"{body} lost the client's name")
+
+    def test_a_company_is_not_a_client(self) -> None:
+        """A lead has a company and no client at all. Reading one as the other
+        put a Client block on every lead, repeating what was already said a
+        line above it."""
+        sent = "\n".join(render({"name": "Dana", "company": "Northwind"},
+                                channel="linkedin-leads"))
+        self.assertIn("Company: <b>Northwind</b>", sent)
+        self.assertNotIn("<i>Client</i>", sent)
 
 
 class LabelledTextTest(unittest.TestCase):
@@ -246,3 +255,54 @@ class FitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeadTest(unittest.TestCase):
+    """A channel nobody wrote a format for.
+
+    Items keep turning up in shapes this was never told about, and a title with
+    nothing under it is not an item. What a message says is shown, whether or
+    not anything here recognises the names it was said under.
+    """
+
+    LEAD = {"name": "Dana Whitfield", "headline": "Head of Growth at Northwind",
+            "company": "Northwind Analytics", "location": "Toronto, Canada",
+            "linkedin": "https://www.linkedin.com/in/dana-whitfield",
+            "status": "to contact", "score": 82,
+            "notes": "Posted twice this month about replacing their reporting stack, and "
+                     "mentioned a budget cycle closing in November."}
+
+    def test_fields_nobody_planned_for_are_still_said(self) -> None:
+        said = "\n".join(render(self.LEAD, channel="linkedin-leads", source="linkedin-scout"))
+        for shown in ("Headline: <b>Head of Growth at Northwind</b>",
+                      "Company: <b>Northwind Analytics</b>",
+                      "Location: <b>Toronto, Canada</b>",
+                      "Status: <b>to contact</b>", "Score: <b>82</b>"):
+            self.assertIn(shown, said)
+
+    def test_the_name_links_to_the_profile(self) -> None:
+        said = "\n".join(render(self.LEAD, channel="linkedin-leads"))
+        self.assertIn('<a href="https://www.linkedin.com/in/dana-whitfield">Dana Whitfield</a>',
+                      said)
+
+    def test_the_longest_thing_it_says_reads_as_its_words(self) -> None:
+        """Not squeezed into the row of short facts, where a paragraph is
+        unreadable, and not dropped for having a name nobody listed."""
+        sent = render(self.LEAD, channel="linkedin-leads")
+        self.assertTrue(sent[0].rstrip().endswith("closing in November."))
+        self.assertNotIn("Notes: <b>", sent[0])
+
+    def test_a_lead_written_as_labelled_text_reads_the_same(self) -> None:
+        raw = ("Name: Dana Whitfield\nRole: Head of Growth\nCompany: Northwind Analytics\n"
+               "Profile: https://www.linkedin.com/in/dana-whitfield\nStatus: to contact\n"
+               "Notes:\nPosted twice about replacing their reporting stack.")
+        said = "\n".join(render(raw, channel="linkedin-leads", source="linkedin-scout"))
+        self.assertIn(">Dana Whitfield</a>", said)
+        self.assertIn("Role: <b>Head of Growth</b>", said)
+        self.assertIn("Posted twice about replacing their reporting stack.", said)
+
+    def test_a_link_under_an_unknown_name_is_still_a_link(self) -> None:
+        said = "\n".join(render(
+            {"author": "Dana", "permalink": "https://www.linkedin.com/feed/update/urn:li:7123"},
+            channel="linkedin-leads"))
+        self.assertIn("https://www.linkedin.com/feed/update/urn:li:7123", said)

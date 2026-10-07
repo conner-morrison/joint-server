@@ -15,6 +15,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -39,6 +40,10 @@ NAMED_LINKS = (("published", "Published"), ("deployed", "Published"), ("live", "
                ("repository", "Source"), ("homepage", "Homepage"),
                ("upworkUrl", "Upwork"), ("job_url", "Upwork"), ("jobUrl", "Upwork"),
                ("jobLink", "Upwork"), ("inviteUrl", "Invitation"),
+               ("linkedin", "LinkedIn"), ("linkedinUrl", "LinkedIn"),
+               ("linkedin_url", "LinkedIn"), ("profile", "Profile"),
+               ("profileUrl", "Profile"), ("profile_url", "Profile"),
+               ("permalink", "Link"), ("website", "Website"),
                ("html_url", "Link"), ("htmlUrl", "Link"), ("url", "Link"), ("link", "Link"))
 LINK_KEYS = tuple(key for key, _ in NAMED_LINKS)
 JD_KEYS = ("description", "jobDescription", "job_description", "jd", "snippet", "summary",
@@ -47,7 +52,7 @@ JD_KEYS = ("description", "jobDescription", "job_description", "jd", "snippet", 
 # spells it job_title is not sending something less worth reading.
 TITLE_KEYS = ("title", "job_title", "jobTitle", "jobName", "job_name", "heading", "name",
               "subject", "emailSubject")
-CLIENT_NAME_KEYS = ("client_name", "clientName", "company", "buyer")
+CLIENT_NAME_KEYS = ("client_name", "clientName")
 
 # A worker may send a job as a block of labelled text rather than as fields:
 # "Job title: …" on one line, "Job description:" and then the posting. It is
@@ -69,6 +74,19 @@ LABELS = (
     (("budget", "rate"), "budget"),
     (("published",), "published"),
     (("posted",), "posted"),
+    (("name", "full name", "contact", "lead"), "name"),
+    (("headline",), "headline"),
+    (("role", "position"), "role"),
+    (("company", "organisation", "organization", "employer"), "company"),
+    (("location", "based in", "country"), "location"),
+    (("profile", "linkedin", "linkedin url", "profile url"), "profile"),
+    (("email", "e-mail"), "email"),
+    (("phone", "mobile"), "phone"),
+    (("industry",), "industry"),
+    (("connections",), "connections"),
+    (("notes", "note", "about"), "notes"),
+    (("status",), "status"),
+    (("score", "fit"), "score"),
 )
 LABEL_OF = {said: key for names, key in LABELS for said in names}
 LABEL_MAX = 24                            # characters before the colon
@@ -225,6 +243,52 @@ def fit(text: str, budget: int) -> tuple[str, str]:
     return text[:at].rstrip(), text[at:].lstrip()
 
 
+# Everything the message already says somewhere, so the rest can be added
+# without repeating any of it.
+SHOWN = ({key for _, key in FACTS} | set(JD_KEYS) | set(LINK_KEYS) | set(TITLE_KEYS)
+         | set(CLIENT_NAME_KEYS) | {"client", "type", "source", "links", "urls", "index",
+                                    "emailId", "receivedAt", "id"}
+         | {"client" + key[0].upper() + key[1:] for _, key in CLIENT_FIELDS})
+NICER = {"url": "URL", "id": "ID", "jd": "JD", "linkedin": "LinkedIn"}
+LEFTOVER_MAX = 12                         # fields worth listing before it is a dump
+LEFTOVER_LONG = 80                        # longer than this and it is the item's own words
+
+
+def humanise(key: str) -> str:
+    words = re.sub(r"([a-z\d])([A-Z])", r"\1 \2", str(key).replace("_", " ").replace("-", " "))
+    parts = [w for w in words.strip().lower().split() if w]
+    if not parts:
+        return str(key)
+    return " ".join(NICER.get(w, w.capitalize() if i == 0 else w) for i, w in enumerate(parts))
+
+
+def leftovers(body: dict[str, Any]) -> list[str]:
+    """The fields this message has no particular place for.
+
+    A channel nobody wrote a format for still has items in it, and a title with
+    nothing under it is not one. Said plainly rather than guessed at.
+    """
+    said: list[str] = []
+    for key, value in body.items():
+        if key in SHOWN or value in (None, "", [], {}):
+            continue
+        if isinstance(value, dict):
+            continue
+        if isinstance(value, (list, tuple)):
+            if any(isinstance(item, (dict, list)) for item in value):
+                continue
+            value = ", ".join(str(item) for item in value if item not in (None, ""))
+        if http_url(value):
+            continue                      # already a link
+        text = str(value).strip()
+        if not text or len(text) > LEFTOVER_LONG:
+            continue                      # long enough to read as the item's own words
+        said.append(f"{esc(humanise(key))}: <b>{esc(text)}</b>")
+        if len(said) >= LEFTOVER_MAX:
+            break
+    return said
+
+
 def title_of(body: dict[str, Any]) -> str:
     for key in TITLE_KEYS:
         said = body.get(key)
@@ -315,6 +379,7 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
              if body.get(key) and not http_url(body.get(key))]
     if body.get("receivedAt"):
         facts.append(esc(when(body["receivedAt"])))
+    facts += leftovers(body)
     if facts:
         lines.append(" · ".join(facts))
 
@@ -334,6 +399,14 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
     head = "\n".join(lines)
     text = next((body[key].strip() for key in JD_KEYS
                  if isinstance(body.get(key), str) and body[key].strip()), "")
+    if not text:
+        # Nothing under a name this knows. The longest thing the item says that
+        # has no place of its own is the nearest thing it has to a description,
+        # and a notification with a title and nothing under it says little.
+        said = [value.strip() for key, value in body.items()
+                if key not in SHOWN and isinstance(value, str)
+                and len(value.strip()) > LEFTOVER_LONG and not http_url(value)]
+        text = max(said, key=len, default="")
     if not text:
         return [head[:LIMIT]]
 
