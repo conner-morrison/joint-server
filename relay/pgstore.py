@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS bot_members (
     bot         TEXT NOT NULL,
     cursor      BIGINT NOT NULL,
     joined_at   DOUBLE PRECISION NOT NULL,
+    -- Workers this chat does not want to hear from. A channel may carry the
+    -- work of two publishers where only one of them is worth a phone buzzing.
+    deaf_to     TEXT[] NOT NULL DEFAULT '{}',
     PRIMARY KEY (workspace, channel, bot),
     FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE,
     FOREIGN KEY (workspace, bot) REFERENCES bots(workspace, name) ON DELETE CASCADE
@@ -424,6 +427,10 @@ class PgStore:
         try:
             async with self.pool.connection() as conn:
                 await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS job_key TEXT")
+                # Added here for the same reason: a table that already exists
+                # gains nothing from CREATE TABLE IF NOT EXISTS.
+                await conn.execute("ALTER TABLE bot_members ADD COLUMN IF NOT EXISTS "
+                                   "deaf_to TEXT[] NOT NULL DEFAULT '{}'")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_job "
                                    "ON messages(workspace, channel, job_key)")
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
@@ -545,7 +552,7 @@ class PgStore:
         because the sender is one loop for the whole server rather than one
         per workspace."""
         return await self._all("""
-            SELECT m.workspace, m.channel, m.bot AS name, m.cursor,
+            SELECT m.workspace, m.channel, m.bot AS name, m.cursor, m.deaf_to,
                    b.kind, b.chat_id, b.bot_token
               FROM bot_members m JOIN bots b
                 ON b.workspace = m.workspace AND b.name = m.bot
@@ -1007,11 +1014,17 @@ class WorkspaceStore:
             "SELECT name, kind, chat_id, label, created_at FROM bots WHERE workspace = %s "
             "ORDER BY name", (self.slug,))
         channels: dict[str, list[str]] = {}
+        # Who each chat is deaf to, per channel: a chat may follow two channels
+        # and want everything from one of them and only half of the other.
+        deaf: dict[str, dict[str, list[str]]] = {}
         for m in await self.store._all(
-                "SELECT bot, channel FROM bot_members WHERE workspace = %s ORDER BY channel",
-                (self.slug,)):
+                "SELECT bot, channel, deaf_to FROM bot_members WHERE workspace = %s "
+                " ORDER BY channel", (self.slug,)):
             channels.setdefault(m["bot"], []).append(m["channel"])
-        return [{**r, "channels": channels.get(r["name"], [])} for r in rows]
+            if m["deaf_to"]:
+                deaf.setdefault(m["bot"], {})[m["channel"]] = list(m["deaf_to"])
+        return [{**r, "channels": channels.get(r["name"], []),
+                 "deaf_to": deaf.get(r["name"], {})} for r in rows]
 
     async def bot_for_chat(self, chat_id: str) -> str | None:
         """The bot already sending to a chat, if there is one. One chat, one
@@ -1049,11 +1062,34 @@ class WorkspaceStore:
 
     async def bots_of(self, channel: str) -> list[dict[str, Any]]:
         return await self.store._all("""
-            SELECT b.name, b.chat_id, b.label
+            SELECT b.name, b.chat_id, b.label, m.deaf_to
               FROM bot_members m JOIN bots b
                 ON b.workspace = m.workspace AND b.name = m.bot
              WHERE m.workspace = %s AND m.channel = %s
              ORDER BY b.name""", (self.slug, channel))
+
+    async def bot_hears(self, channel: str, bot: str, worker_id: str, hears: bool) -> bool:
+        """Whether a chat is told about what one worker publishes here.
+
+        A channel can carry the work of two publishers where only one of them
+        is worth a phone buzzing - a search that sifts everything and a search
+        that already decided. Silencing one of them is not the same as taking
+        the chat out of the channel, and not the same as muting a job.
+        """
+        if not await self.store._one(
+                "SELECT 1 FROM bot_members WHERE workspace = %s AND channel = %s AND bot = %s",
+                (self.slug, channel, bot)):
+            raise LookupError(f"{bot!r} is not in channel {channel!r}")
+        if hears:
+            sql = ("UPDATE bot_members SET deaf_to = array_remove(deaf_to, %s) "
+                   " WHERE workspace = %s AND channel = %s AND bot = %s")
+        else:
+            sql = ("UPDATE bot_members SET deaf_to = array_append(deaf_to, %s) "
+                   " WHERE workspace = %s AND channel = %s AND bot = %s "
+                   "   AND NOT (%s = ANY(deaf_to))")
+        args = ((worker_id, self.slug, channel, bot) if hears
+                else (worker_id, self.slug, channel, bot, worker_id))
+        return await self.store._run(sql, args) > 0
 
     # --- messages --------------------------------------------------------
     # --- muted ------------------------------------------------------------

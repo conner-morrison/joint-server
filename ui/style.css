@@ -344,3 +344,8 @@ a.job-title::after { content: " ↗"; font-size: 12px; color: var(--muted); text
 .send-again { font-size: 15px; opacity: .45; transition: opacity .12s; }
 .msg:hover .send-again, .send-again:focus-visible { opacity: 1; }
 .send-again:hover { color: var(--accent); }
+
+/* --- which publishers a chat hears -------------------------------------- */
+.hears { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 0 6px; }
+.chip.toggle { cursor: pointer; border: 1px solid var(--border); background: var(--card); }
+.chip.toggle.off { opacity: .5; text-decoration: line-through; }

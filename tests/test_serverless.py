@@ -1361,6 +1361,75 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
             status, _ = await self.call("POST", path, token="p")
             self.assertEqual(status, 404, path)
 
+    async def test_a_chat_can_be_deaf_to_one_publisher(self) -> None:
+        """A channel carries the work of two publishers where only one of them
+        is worth a phone buzzing: a search that sifts everything, and a search
+        that has already decided. Silencing one is not taking the chat out of
+        the channel and not muting a job - everything is still stored, and the
+        console still shows all of it."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        sifter = (await self.call("POST", "/acme/api/workers", {"name": "general-search"},
+                                  token="p"))[1]["worker_id"]
+        decider = (await self.call("POST", "/acme/api/workers", {"name": "zachary-alert"},
+                                   token="p"))[1]["worker_id"]
+        for who in (sifter, decider):
+            await self.call("PUT", f"/acme/api/channels/jobs/members/{who}", {}, token="p")
+
+        status, said = await self.call(
+            "DELETE", f"/acme/api/channels/jobs/bots/phone/hears/{sifter}", token="p")
+        self.assertEqual((status, said["hears"]), (200, False))
+
+        await self.call("POST", "/acme/publish",
+                        {"channel": "jobs", "body": {"title": "Sifted"}}, token=sifter)
+        await self.call("POST", "/acme/publish",
+                        {"channel": "jobs", "body": {"title": "Decided"}}, token=decider)
+        await self.eventually(1)
+        await asyncio.sleep(1.0)
+        self.assertEqual(len(self.telegram.sent), 1)
+        self.assertIn("Decided", self.telegram.sent[0]["text"])
+
+        # Both are in the channel: this silenced a phone, it did not drop work.
+        _, stored = await self.call("GET", "/acme/api/channels/jobs/messages", token="p")
+        self.assertEqual(len(stored), 2)
+
+    async def test_passing_over_a_publisher_leaves_no_backlog(self) -> None:
+        """Otherwise the console shows a number that never clears, which reads
+        as a chat that has stopped working."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        sifter = (await self.call("POST", "/acme/api/workers", {"name": "general-search"},
+                                  token="p"))[1]["worker_id"]
+        await self.call("PUT", f"/acme/api/channels/jobs/members/{sifter}", {}, token="p")
+        await self.call("DELETE", f"/acme/api/channels/jobs/bots/phone/hears/{sifter}", token="p")
+        await self.call("POST", "/acme/publish",
+                        {"channel": "jobs", "body": {"title": "Sifted"}}, token=sifter)
+        await asyncio.sleep(1.5)
+        self.assertEqual(self.telegram.sent, [])
+        _, rows = await self.call("GET", "/acme/api/channels/jobs/delivery", token="p")
+        behind = {r["name"]: r["waiting"] for r in rows if r["kind"] == "bot"}
+        self.assertEqual(behind, {"phone": 0})
+
+    async def test_it_can_be_undone(self) -> None:
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        who = (await self.call("POST", "/acme/api/workers", {"name": "general-search"},
+                               token="p"))[1]["worker_id"]
+        await self.call("PUT", f"/acme/api/channels/jobs/members/{who}", {}, token="p")
+        await self.call("DELETE", f"/acme/api/channels/jobs/bots/phone/hears/{who}", token="p")
+        await self.call("PUT", f"/acme/api/channels/jobs/bots/phone/hears/{who}", token="p")
+        await self.call("POST", "/acme/publish",
+                        {"channel": "jobs", "body": {"title": "Heard again"}}, token=who)
+        await self.eventually(1)
+        self.assertIn("Heard again", self.telegram.sent[0]["text"])
+
+    async def test_silencing_a_chat_that_is_not_in_the_channel_is_refused(self) -> None:
+        await self.ready()
+        await self.register("phone", "555", "1:abc", channel="jobs", join=False)
+        status, _ = await self.call("DELETE", "/acme/api/channels/jobs/bots/phone/hears/anyone",
+                                    token="p")
+        self.assertEqual(status, 404)
+
     async def test_bots_belong_to_their_channel(self) -> None:
         await self.ready()
         await self.call("POST", "/acme/api/channels", {"name": "quiet"}, token="p")

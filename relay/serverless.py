@@ -536,6 +536,24 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             sender.nudge()
         return {"resending": again}
 
+    @app.put("/{ws}/api/channels/{name}/bots/{bot}/hears/{worker_id}")
+    @app.delete("/{ws}/api/channels/{name}/bots/{bot}/hears/{worker_id}")
+    async def bot_hears(request: Request, name: str, bot: str, worker_id: str,
+                        scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Whether this chat is told about what one worker publishes here.
+
+        A channel can carry the work of two publishers where only one is worth
+        a phone buzzing. Silencing one is not taking the chat out of the
+        channel, and not muting a job: everything still arrives, and the
+        console still shows all of it.
+        """
+        hears = request.method == "PUT"
+        try:
+            await scoped.bot_hears(name, bot, worker_id, hears)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return {"bot": bot, "worker_id": worker_id, "hears": hears}
+
     @app.get("/{ws}/api/channels/{name}/delivery")
     async def delivery(name: str, scoped: WorkspaceStore = Depends(admin)
                        ) -> list[dict[str, Any]]:

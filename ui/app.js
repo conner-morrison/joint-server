@@ -1141,6 +1141,7 @@ function renderMembers() {
   // ticked box, so when nothing about it has changed only the list is redrawn.
   const shape = `${ch.name}|${others.map((w) => w.worker_id).join(",")}`
     + `|${state.bots.map((b) => b.name + ":" + (b.channels || []).join("+")).join(",")}`
+    + `|${inChannel.map((b) => ((b.deaf_to || {})[ch.name] || []).join("+")).join(",")}`
     + `|${state.muted.map((m) => m.key).join(",")}`;
   if (el.dataset.shape === shape) return renderMemberList();
   el.dataset.shape = shape;
@@ -1171,7 +1172,7 @@ function renderMembers() {
           class: "btn icon", title: `Remove ${b.name} from this channel`,
           "aria-label": `Remove ${b.name} from this channel`,
           onclick: () => removeBotMember(ch.name, b.name),
-        }, "\u00d7"))))
+        }, "\u00d7"))).concat(hearsRow(ch, inChannel)))
       : false,
     freeBots.length ? h("h2", {}, "Add a bot") : false,
     freeBots.length
@@ -1302,6 +1303,33 @@ async function unmute(key) {
   try {
     await api("DELETE", "/api/muted/" + enc(key));
     state.muted = await api("GET", "/api/muted");
+    renderMembers();
+  } catch (err) { handleError(err); }
+}
+
+// Which publishers each chat hears. Only worth asking about where there is
+// more than one, because with one member the answer is the channel itself.
+function hearsRow(ch, bots) {
+  if (ch.members.length < 2 || !bots.length) return [];
+  return bots.map((b) => h("div", { class: "hears" },
+    h("span", { class: "muted small" }, `${b.name} hears`),
+    h("div", { class: "chips" }, ch.members.map((m) => {
+      const deaf = ((b.deaf_to || {})[ch.name] || []).includes(m.worker_id);
+      return h("button", {
+        class: "chip toggle" + (deaf ? " off" : ""),
+        title: deaf
+          ? `${m.name} is passed over for ${b.name}. Click to send it again.`
+          : `Click to stop sending ${m.name}'s items to ${b.name}.`,
+        onclick: () => setHears(ch.name, b.name, m.worker_id, deaf),
+      }, m.name || m.worker_id);
+    }))));
+}
+
+async function setHears(channel, bot, workerId, hears) {
+  try {
+    await api(hears ? "PUT" : "DELETE",
+      `/api/channels/${enc(channel)}/bots/${enc(bot)}/hears/${enc(workerId)}`);
+    await refreshAll();
     renderMembers();
   } catch (err) { handleError(err); }
 }

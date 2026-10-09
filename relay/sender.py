@@ -103,12 +103,21 @@ class BotSender:
         # once per worker per round, because a round is usually one worker's
         # messages and the name does not change inside it.
         names: dict[str, str] = {}
+        deaf_to = set(bot.get("deaf_to") or ())
         for message in waiting:
+            sender = str(message.get("sender") or "")
+            if sender in deaf_to:
+                # This chat does not hear this publisher. The cursor still
+                # moves: passed over is not the same as still waiting, and
+                # leaving it would show as a backlog that never clears.
+                await self.store.bot_ack(bot["workspace"], bot["channel"], bot["name"],
+                                         int(message["seq"]))
+                sent += 1
+                continue
             # Usually one. A job whose description is longer than Telegram will
             # carry is rendered as a message and its continuation, and the
             # cursor waits for the last part: half a job description delivered
             # and then forgotten would be worse than delivering it again.
-            sender = str(message.get("sender") or "")
             if sender and sender not in names:
                 names[sender] = (sender if sender.startswith("@")
                                  else await scoped.name_of(sender))

@@ -28,7 +28,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-FACTS = [("Budget", "budget"), ("Published", "published"), ("Posted", "posted")]
+FACTS = [("Decision", "decision"), ("Reason", "reason"), ("Budget", "budget"),
+         ("Published", "published"), ("Posted", "posted")]
 CLIENT_FIELDS = [("Rank", "rank"), ("Rating", "rating"), ("Payment verified", "paymentVerified"),
                  ("Location", "location"), ("Reviews", "reviews"), ("Jobs posted", "jobsPosted"),
                  ("Hire rate", "hireRate"), ("Spent", "spent"), ("Registered", "registered")]
@@ -110,6 +111,85 @@ def http(method: str, url: str, body: Any = None, token: str = "", timeout: floa
             return exc.code, {"detail": raw.decode("utf-8", "replace")[:300]}
 
 
+# A worker may send a job as a block of labelled text rather than as fields:
+# "Job title: …" on one line, "Job description:" and then the posting. It is
+# the same job, said differently, and proposal-writer should be given the job
+# either way rather than a quoted blob with the posting buried in it.
+#
+# Only these labels start a field. A description is full of lines like
+# "Community Engagement: identify niche communities", and treating every colon
+# as a label would chop it into nonsense.
+LABELS = (
+    (("job title", "title"), "title"),
+    (("job link", "job url", "link", "url"), "upworkUrl"),
+    (("job description", "description", "jd"), "description"),
+    (("client name", "client"), "clientName"),
+    (("decision",), "decision"),
+    (("reason", "why"), "reason"),
+    (("project id", "projectid"), "projectId"),
+    (("budget", "rate"), "budget"),
+    (("published",), "published"),
+    (("posted",), "posted"),
+)
+LABEL_OF = {said: key for names, key in LABELS for said in names}
+LABEL_MAX = 24                            # characters before the colon
+
+
+def labelled(text: Any) -> dict[str, Any] | None:
+    """A job written as labelled lines, read back as fields.
+
+    A label counts the first time it appears and not after, so a description
+    that happens to say "Reason:" partway through is still the description.
+    """
+    if not isinstance(text, str) or ":" not in text:
+        return None
+    if "\n" not in text and "\\n" in text:
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    found: dict[str, Any] = {}
+    lead: list[str] = []
+    current = None
+    for line in text.splitlines():
+        at = line.find(":")
+        key = None
+        if 0 < at <= LABEL_MAX:
+            key = LABEL_OF.get(line[:at].strip().lower())
+            if key in found:
+                key = None
+        if key:
+            current = key
+            found[key] = line[at + 1:].strip()
+        elif current:
+            found[current] = f"{found[current]}\n{line}"
+        else:
+            lead.append(line)
+    if len(found) < 2:
+        return None
+    for key in found:
+        found[key] = found[key].strip()
+    said = "\n".join(lead).strip()
+    if said and not found.get("description"):
+        found["description"] = said
+    return found
+
+
+def fields(body: Any) -> Any:
+    """Whatever arrived, as fields where that is possible at all."""
+    if isinstance(body, str):
+        if body[:1] in ('"', "{"):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                pass
+    if isinstance(body, str):
+        return labelled(body) or body
+    if isinstance(body, dict) and not body.get("title"):
+        for key in ("text", "message", "raw"):
+            read = labelled(body.get(key))
+            if read:
+                return {**body, **read}
+    return body
+
+
 def described(body: Any) -> str:
     """The posting's own words, as the publisher sent them.
 
@@ -118,6 +198,7 @@ def described(body: Any) -> str:
     already short when it was published - and that is the difference between
     looking for the fault here and looking for it in the parser upstream.
     """
+    body = fields(body)
     if not isinstance(body, dict):
         return ""
     return next((body[key].strip() for key in JD_KEYS
@@ -132,6 +213,7 @@ def as_jd(body: Any) -> str:
     they would want it: the posting itself, then the terms, then who is
     offering them.
     """
+    body = fields(body)
     if not isinstance(body, dict):
         return json.dumps(body, indent=2, ensure_ascii=False)
 
@@ -150,6 +232,9 @@ def as_jd(body: Any) -> str:
 
     client = body.get("client") if isinstance(body.get("client"), dict) else {}
     facts = []
+    named = body.get("clientName") or (body["client"] if isinstance(body.get("client"), str) else "")
+    if named:
+        facts.append(f"Name: {named}")
     for label, key in CLIENT_FIELDS:
         flat = body.get("client" + key[0].upper() + key[1:])
         value = client.get(key, flat)

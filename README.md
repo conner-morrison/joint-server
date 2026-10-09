@@ -244,6 +244,24 @@ anything is owed. And it outlives what it describes - a worker taken out of a
 channel cannot be told anything through that channel, and one that was away
 while it happened still finds out when it comes back.
 
+## A chat that does not hear everything
+
+A channel can carry the work of two publishers where only one of them is worth
+a phone buzzing: a search that sifts everything, and a search that has already
+decided. In the channel's members panel each chat lists the workers it hears;
+clicking one strikes it through.
+
+```
+DELETE /{ws}/api/channels/{channel}/bots/{bot}/hears/{worker_id}   # stop
+PUT    /{ws}/api/channels/{channel}/bots/{bot}/hears/{worker_id}   # start again
+```
+
+It silences a phone and nothing else. Everything is still published, still
+stored, still delivered to every worker, and still shown in the console - this
+is not muting a job, and not taking the chat out of the channel. The chat's
+place in the channel moves past what it was not told about, so a backlog that
+never clears cannot build up behind it.
+
 ## Deploying the relay
 
 The relay needs somewhere to run and a Postgres to talk to, reached through
