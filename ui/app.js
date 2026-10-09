@@ -22,6 +22,7 @@ const state = {
   bots: [],
   delivery: [],
   muted: [],
+  hooks: {},
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
@@ -1104,6 +1105,7 @@ async function renderChannelView(name) {
   state.feed = { channel: name, messages: [], hasOlder: false };
   state.delivery = [];
   loadDelivery(name);
+  loadHooks(name).then(() => renderMembers());
   try {
     const page = await api("GET", `/api/channels/${enc(name)}/messages?limit=${PAGE}`);
     if (state.feed.channel !== name) return;             // navigated away meanwhile
@@ -1142,7 +1144,8 @@ function renderMembers() {
   const shape = `${ch.name}|${others.map((w) => w.worker_id).join(",")}`
     + `|${state.bots.map((b) => b.name + ":" + (b.channels || []).join("+")).join(",")}`
     + `|${inChannel.map((b) => ((b.deaf_to || {})[ch.name] || []).join("+")).join(",")}`
-    + `|${state.muted.map((m) => m.key).join(",")}`;
+    + `|${state.muted.map((m) => m.key).join(",")}`
+    + `|${(state.hooks[ch.name] || []).map((t) => t.name + ":" + t.fires + ":" + t.last_status).join(",")}`;
   if (el.dataset.shape === shape) return renderMemberList();
   el.dataset.shape = shape;
   const select = h("select", { "aria-label": "Worker to add" },
@@ -1185,6 +1188,7 @@ function renderMembers() {
     // action: it is never stored, so nothing is alerted and nothing has to be
     // deleted afterwards.
     h("h2", {}, "Muted jobs"),
+    triggerSection(ch),
     mutedSection(),
 
     h("h2", {}, "Add member"),
@@ -1330,6 +1334,97 @@ async function setHears(channel, bot, workerId, hears) {
     await api(hears ? "PUT" : "DELETE",
       `/api/channels/${enc(channel)}/bots/${enc(bot)}/hears/${enc(workerId)}`);
     await refreshAll();
+    renderMembers();
+  } catch (err) { handleError(err); }
+}
+
+// --- triggers -------------------------------------------------------------
+// Somewhere to call when this channel gets something, for a worker that cannot
+// hold a request open. It says there is work, not what the work is.
+function triggerSection(ch) {
+  const rows = state.hooks[ch.name] || [];
+  const url = h("input", { type: "url", required: true, placeholder: "https://api.example.com/fire",
+                           autocomplete: "off", spellcheck: "false" });
+  const name = h("input", { type: "text", required: true, pattern: NAME_PATTERN,
+                            placeholder: "claude", autocomplete: "off" });
+  const headers = h("input", { type: "text", placeholder: '{"x-api-key": "sk-…"}',
+                               autocomplete: "off", spellcheck: "false" });
+  const payload = h("input", { type: "text", placeholder: '{"trigger_id": "trig_…"}  (optional)',
+                               autocomplete: "off", spellcheck: "false" });
+  const err = h("p", { class: "error", hidden: true });
+  const add = h("button", { class: "btn", type: "submit" }, "Add trigger");
+
+  return h("div", {},
+    h("h2", {}, "Triggers"),
+    h("p", { class: "muted small" },
+      "Called when something arrives here, for anything that cannot wait on a request. "
+      + "A burst is one call: it says there is work, and whatever it wakes collects the work "
+      + "from this channel with its own id."),
+    rows.length
+      ? h("ul", { class: "member-list" }, rows.map((t) => h("li", {},
+        dot(t.last_status >= 200 && t.last_status < 300),
+        h("div", { class: "grow" },
+          h("div", { class: "strong truncate" }, t.name),
+          h("div", { class: "muted small truncate", title: t.url },
+            t.method + " " + t.url + (t.has_headers ? " · with headers" : ""))),
+        h("span", { class: "muted small nowrap" },
+          t.last_at ? `${t.fires} fired · ${t.last_status || "no answer"}` : "not fired yet"),
+        h("button", { class: "btn small", title: "Call it now, without marking anything as seen",
+                      onclick: () => testTrigger(ch.name, t.name) }, "Test"),
+        h("button", { class: "btn icon", title: `Remove ${t.name}`, "aria-label": `Remove ${t.name}`,
+                      onclick: () => removeTrigger(ch.name, t.name) }, "\u00d7"))))
+      : h("p", { class: "muted small" }, "None. Nothing is called when this channel gets something."),
+    rows.some((t) => t.last_error)
+      ? h("p", { class: "error" }, rows.filter((t) => t.last_error)
+        .map((t) => `${t.name}: ${t.last_error}`).join(" · "))
+      : false,
+    h("form", {
+      class: "stack", onsubmit: async (e) => {
+        e.preventDefault();
+        err.hidden = true;
+        add.disabled = true;
+        try {
+          const sending = { name: name.value.trim(), url: url.value.trim() };
+          if (headers.value.trim()) sending.headers = JSON.parse(headers.value);
+          if (payload.value.trim()) sending.body = JSON.parse(payload.value);
+          await api("POST", `/api/channels/${enc(ch.name)}/hooks`, sending);
+          url.value = name.value = headers.value = payload.value = "";
+          await loadHooks(ch.name);
+          renderMembers();
+        } catch (ex) {
+          if (ex.status === 401) return handleError(ex);
+          err.textContent = ex instanceof SyntaxError
+            ? "Headers and body must be JSON objects." : ex.message;
+          err.hidden = false;
+        } finally {
+          add.disabled = false;
+        }
+      },
+    }, name, url, headers, payload, err, add));
+}
+
+async function loadHooks(channel) {
+  try {
+    state.hooks[channel] = await api("GET", `/api/channels/${enc(channel)}/hooks`);
+  } catch { state.hooks[channel] = []; }
+}
+
+async function testTrigger(channel, trigger) {
+  try {
+    const said = await api("POST", `/api/channels/${enc(channel)}/hooks/${enc(trigger)}/test`);
+    toast(said.ok ? `${trigger} answered ${said.status}`
+      : `${trigger} did not answer: ${said.error || said.status}`, !said.ok);
+    await loadHooks(channel);
+    renderMembers();
+  } catch (err) { handleError(err); }
+}
+
+async function removeTrigger(channel, trigger) {
+  if (!confirm(`Remove trigger ${trigger}?\n\nNothing will be called when #${channel} gets `
+    + "something. The channel itself is unchanged.")) return;
+  try {
+    await api("DELETE", `/api/channels/${enc(channel)}/hooks/${enc(trigger)}`);
+    await loadHooks(channel);
     renderMembers();
   } catch (err) { handleError(err); }
 }

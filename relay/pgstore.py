@@ -163,6 +163,31 @@ CREATE TABLE IF NOT EXISTS muted (
     PRIMARY KEY (workspace, key)
 );
 
+-- Somewhere to call when a channel gets something, for a worker that cannot
+-- hold a request open - anything woken by an HTTP call rather than by asking.
+--
+-- It keeps a cursor like any other member, which is what makes it a trigger
+-- rather than a delivery: a call that succeeds moves it to the head of the
+-- channel, so a burst of ten items is one call saying there is work, and a
+-- call that fails leaves it where it was and is tried again.
+CREATE TABLE IF NOT EXISTS hooks (
+    workspace   TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
+    channel     TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    method      TEXT NOT NULL DEFAULT 'POST',
+    headers     JSONB NOT NULL DEFAULT '{}'::jsonb,   -- an api key lives here
+    body        JSONB,                                -- fixed payload, or the event
+    cursor      BIGINT NOT NULL DEFAULT 0,
+    created_at  DOUBLE PRECISION NOT NULL,
+    last_at     DOUBLE PRECISION,
+    last_status INTEGER,
+    last_error  TEXT NOT NULL DEFAULT '',
+    fires       BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace, channel, name),
+    FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE
+);
+
 -- Something the server has to tell one worker about itself, rather than about
 -- the world: that it has been put into a channel, or taken out of one. It is
 -- not a message in a channel, because it is nobody else's business and because
@@ -547,6 +572,45 @@ class PgStore:
         return await self._all("SELECT slug, name, created_at FROM workspaces ORDER BY slug")
 
     # --- bot delivery, across every workspace ----------------------------
+    async def hooks_with_work(self, limit: int = 50, retry: float = 60.0) -> list[dict[str, Any]]:
+        """Triggers with something to be woken for. Asked deployment-wide, like
+        the bots, because one loop serves the whole server."""
+        return await self._all("""
+            SELECT h.*, (SELECT MAX(seq) FROM messages g
+                          WHERE g.workspace = h.workspace AND g.channel = h.channel) AS head,
+                        (SELECT COUNT(*) FROM messages g
+                          WHERE g.workspace = h.workspace AND g.channel = h.channel
+                            AND g.seq > h.cursor) AS waiting
+              FROM hooks h
+             WHERE EXISTS (SELECT 1 FROM messages g
+                            WHERE g.workspace = h.workspace AND g.channel = h.channel
+                              AND g.seq > h.cursor)
+               -- One that just failed is left alone for a while: a trigger
+               -- whose address is wrong would otherwise be called on every
+               -- publish, for ever.
+               AND (h.last_at IS NULL OR h.last_at < %s
+                    OR (h.last_status BETWEEN 200 AND 299))
+             ORDER BY h.cursor LIMIT %s""", (time.time() - retry, limit))
+
+    async def hook_fired(self, workspace: str, channel: str, name: str, seq: int,
+                         status: int, error: str = "") -> None:
+        """A call that was answered moves the trigger to the head of the
+        channel: it says there is work, not what the work is, so one call
+        covers everything that arrived while it was being made."""
+        await self._run("""
+            UPDATE hooks SET cursor = GREATEST(cursor, %s), last_at = %s, last_status = %s,
+                             last_error = %s, fires = fires + 1
+             WHERE workspace = %s AND channel = %s AND name = %s""",
+            (seq, time.time(), status, error[:300], workspace, channel, name))
+
+    async def hook_failed(self, workspace: str, channel: str, name: str,
+                          status: int, error: str) -> None:
+        """Left where it was, so it is tried again."""
+        await self._run("""
+            UPDATE hooks SET last_at = %s, last_status = %s, last_error = %s
+             WHERE workspace = %s AND channel = %s AND name = %s""",
+            (time.time(), status, error[:300], workspace, channel, name))
+
     async def bots_with_work(self, limit: int = 50) -> list[dict[str, Any]]:
         """Bot memberships that have something waiting. Asked deployment-wide,
         because the sender is one loop for the whole server rather than one
@@ -1090,6 +1154,45 @@ class WorkspaceStore:
         args = ((worker_id, self.slug, channel, bot) if hears
                 else (worker_id, self.slug, channel, bot, worker_id))
         return await self.store._run(sql, args) > 0
+
+    # --- triggers ---------------------------------------------------------
+    async def add_hook(self, channel: str, name: str, url: str, *, method: str = "POST",
+                       headers: dict[str, str] | None = None,
+                       body: Any = None, from_start: bool = False) -> dict[str, Any]:
+        check_name("trigger", name)
+        if not await self.channel_exists(channel):
+            raise LookupError(f"no channel {channel!r}")
+        cursor = 0 if from_start else await self.head()
+        try:
+            await self.store._run("""
+                INSERT INTO hooks(workspace, channel, name, url, method, headers, body,
+                                  cursor, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (self.slug, channel, name, url, method.upper(),
+                 json.dumps(headers or {}), None if body is None else json.dumps(body),
+                 cursor, time.time()))
+        except errors.UniqueViolation:
+            raise ValueError(f"a trigger called {name!r} is already on #{channel}") from None
+        return {"name": name, "channel": channel, "url": url}
+
+    async def remove_hook(self, channel: str, name: str) -> bool:
+        return await self.store._run(
+            "DELETE FROM hooks WHERE workspace = %s AND channel = %s AND name = %s",
+            (self.slug, channel, name)) > 0
+
+    async def hooks_of(self, channel: str) -> list[dict[str, Any]]:
+        """Never the headers: an api key lives in them, and this is read by a
+        console that only wants to list what is set up."""
+        return await self.store._all("""
+            SELECT name, url, method, cursor, created_at, last_at, last_status, last_error,
+                   fires, (headers <> '{}'::jsonb) AS has_headers
+              FROM hooks WHERE workspace = %s AND channel = %s ORDER BY name""",
+            (self.slug, channel))
+
+    async def hook(self, channel: str, name: str) -> dict[str, Any] | None:
+        return await self.store._one(
+            "SELECT * FROM hooks WHERE workspace = %s AND channel = %s AND name = %s",
+            (self.slug, channel, name))
 
     # --- messages --------------------------------------------------------
     # --- muted ------------------------------------------------------------

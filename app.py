@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from relay.notify import Notifier
 from relay.pgstore import PgStore
+from relay.hooks import HookSender
 from relay.sender import BotSender
 from relay.serverless import create_app
 
@@ -44,8 +45,9 @@ _notifier = Notifier(DSN) if DSN else None
 # The server delivers to registered bots itself, so a Telegram chat needs no
 # worker running anywhere and nobody has to approve it.
 _sender = BotSender(_store, _notifier) if _store else None
+_hooks = HookSender(_store) if _store else None
 
-app = create_app(_store, _notifier, _sender)
+app = create_app(_store, _notifier, _sender, _hooks)
 
 # StaticFiles raises when its directory is absent, which would be a crash at
 # import for a missing folder. The console being unavailable is worth saying

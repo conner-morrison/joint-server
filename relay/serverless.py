@@ -30,6 +30,7 @@ from pydantic import BaseModel, field_validator
 
 from relay import telegram
 from relay.notify import Notifier, key as notify_key
+from relay.hooks import HookSender, check_url
 from relay.sender import BotSender
 from relay.pgstore import PgStore, WorkspaceStore, check_name, slugify
 
@@ -95,6 +96,18 @@ class RenameIn(BaseModel):
     name: str
 
 
+class HookIn(BaseModel):
+    """Somewhere to call when this channel gets something. `headers` is where
+    an api key goes; `body` is for an endpoint that wants a particular shape,
+    and without it the call says what channel has work and how much."""
+    name: str
+    url: str
+    method: str = "POST"
+    headers: dict[str, str] = {}
+    body: Any = None
+    from_start: bool = False
+
+
 class MuteIn(BaseModel):
     url: str
     note: str = ""
@@ -122,7 +135,7 @@ def redact(text: str) -> str:
 
 
 def create_app(store: PgStore | None, notifier: Notifier | None = None,
-               sender: BotSender | None = None) -> FastAPI:
+               sender: BotSender | None = None, hooks: HookSender | None = None) -> FastAPI:
     """`store` is None when the deployment has no database configured. The app
     still starts: it serves the console and says what is missing, because a
     process that refuses to start can only report a crash."""
@@ -131,6 +144,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if sender is not None:
             sender.start()
+        if hooks is not None:
+            hooks.start()
         # Nothing is opened here. A database that is down should fail the
         # request that needed it, not stop the console from loading.
         try:
@@ -138,6 +153,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         finally:
             if sender is not None:
                 await sender.close()
+            if hooks is not None:
+                await hooks.close()
             if notifier is not None:
                 await notifier.close()
             if store is not None:
@@ -292,6 +309,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         await scoped.touch_worker(worker_id)
         if sender is not None and not duplicate:
             sender.nudge()
+        if hooks is not None:
+            hooks.nudge()
         return {"seq": seq, "duplicate": duplicate, "worker_id": worker_id}
 
     @app.get("/{ws}/messages")
@@ -534,6 +553,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(404, str(exc)) from None
         if again and sender is not None:
             sender.nudge()
+        if hooks is not None:
+            hooks.nudge()
         return {"resending": again}
 
     @app.put("/{ws}/api/channels/{name}/bots/{bot}/hears/{worker_id}")
@@ -553,6 +574,52 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from None
         return {"bot": bot, "worker_id": worker_id, "hears": hears}
+
+    @app.get("/{ws}/api/channels/{name}/hooks")
+    async def list_hooks(name: str, scoped: WorkspaceStore = Depends(admin)) -> list[dict[str, Any]]:
+        return await scoped.hooks_of(name)
+
+    @app.post("/{ws}/api/channels/{name}/hooks", status_code=201)
+    async def add_hook(name: str, body: HookIn,
+                       scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Call somewhere when this channel gets something.
+
+        For anything that cannot hold a request open: a scheduled task, a
+        function, anything woken by being called. The call says there is work
+        and not what it is - the work stays in the channel, where whatever the
+        call woke up collects it with its own id.
+        """
+        try:
+            check_url(body.url, allow_local=bool(hooks and hooks.allow_local))
+            made = await scoped.add_hook(name, body.name, body.url, method=body.method,
+                                         headers=body.headers, body=body.body,
+                                         from_start=body.from_start)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        if hooks is not None:
+            hooks.nudge()
+        return made
+
+    @app.delete("/{ws}/api/channels/{name}/hooks/{trigger}")
+    async def remove_hook(name: str, trigger: str,
+                          scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.remove_hook(name, trigger):
+            raise HTTPException(404, f"no trigger {trigger!r} on #{name}")
+        return {"removed": True}
+
+    @app.post("/{ws}/api/channels/{name}/hooks/{trigger}/test")
+    async def test_hook(name: str, trigger: str,
+                        scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Call it now, to see whether it answers. Nothing moves: a test that
+        marked the channel as seen would swallow the work it was testing."""
+        if hooks is None:
+            raise HTTPException(503, "this deployment is not firing triggers")
+        found = await scoped.hook(name, trigger)
+        if found is None:
+            raise HTTPException(404, f"no trigger {trigger!r} on #{name}")
+        return await hooks.test(found)
 
     @app.get("/{ws}/api/channels/{name}/delivery")
     async def delivery(name: str, scoped: WorkspaceStore = Depends(admin)
@@ -576,6 +643,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(404, str(exc)) from None
         if joined and sender is not None:
             sender.nudge()
+        if hooks is not None:
+            hooks.nudge()
         return {"joined": joined}
 
     @app.delete("/{ws}/api/channels/{name}/bots/{bot}")
@@ -606,6 +675,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         seq, duplicate = await scoped.append(name, SERVER_SENDER, body.body, body.id)
         if sender is not None and not duplicate:
             sender.nudge()
+        if hooks is not None:
+            hooks.nudge()
         return {"seq": seq, "duplicate": duplicate}
 
     async def database_down(_: Request, exc: Exception) -> JSONResponse:

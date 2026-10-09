@@ -1501,3 +1501,166 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
 
 
+
+
+class TriggerTest(unittest.IsolatedAsyncioTestCase):
+    """Calling somewhere when a channel gets something.
+
+    For a worker that cannot hold a request open. The second test is the
+    design: it is a trigger, not a delivery.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        assert _server is not None
+        from tests.test_hooks import Listener
+        from relay.hooks import HookSender
+
+        cls.listener = Listener()
+        cls.listener.start()
+        cls.store = PgStore(_server.get_uri(), min_size=1, max_size=8)
+        cls.notifier = Notifier(_server.get_uri())
+        cls.hooks = HookSender(cls.store, idle=0.2, allow_local=True, settle=0.6)
+        cls.app = LiveApp.__new__(LiveApp)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.app.port = s.getsockname()[1]
+        cls.app.url = f"http://127.0.0.1:{cls.app.port}"
+        app = create_app(cls.store, cls.notifier, None, cls.hooks)
+        config = uvicorn.Config(app, host="127.0.0.1", port=cls.app.port,
+                                log_level="warning", timeout_graceful_shutdown=2)
+        cls.app.server = uvicorn.Server(config)
+        cls.app.thread = threading.Thread(target=cls.app.server.run, daemon=True)
+        cls.app.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.app.stop()
+        cls.listener.stop()
+
+    def setUp(self) -> None:
+        assert _server is not None
+        _server.psql("TRUNCATE workspaces CASCADE;")
+        self.listener.calls.clear()
+        self.listener.answer = 200
+
+    async def call(self, method: str, path: str, body: Any = None, token: str | None = None
+                   ) -> tuple[int, Any]:
+        return await ServerlessTest.call(self, method, path, body, token)  # type: ignore[arg-type]
+
+    async def ready(self, channel: str = "leads") -> None:
+        status, _ = await self.call("POST", "/api/workspaces", {"name": "Acme", "password": "p"})
+        self.assertEqual(status, 201)
+        await self.call("POST", "/acme/api/channels", {"name": channel}, token="p")
+
+    async def add(self, **extra: Any) -> None:
+        status, said = await self.call("POST", "/acme/api/channels/leads/hooks",
+                                       {"name": "claude", "url": self.listener.url, **extra},
+                                       token="p")
+        self.assertEqual(status, 201, said)
+
+    async def eventually(self, count: int, within: float = 8.0) -> None:
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if len(self.listener.calls) >= count:
+                return
+            await asyncio.sleep(0.05)
+        self.fail(f"expected {count} calls, saw {len(self.listener.calls)}")
+
+    async def test_something_published_calls_it(self) -> None:
+        await self.ready()
+        await self.add()
+        await self.call("POST", "/acme/api/channels/leads/messages",
+                        {"body": {"name": "Dana"}}, token="p")
+        await self.eventually(1)
+        said = self.listener.calls[0]["body"]["relay"]
+        self.assertEqual((said["channel"], said["workspace"], said["trigger"]),
+                         ("leads", "acme", "claude"))
+
+    async def test_a_burst_is_one_call(self) -> None:
+        """The whole point. It says there is work, not what the work is, so ten
+        leads arriving together wake it once - and whatever it wakes collects
+        all ten from the channel with its own id."""
+        await self.ready()
+        await self.add()
+        for n in range(10):
+            await self.call("POST", "/acme/api/channels/leads/messages",
+                            {"body": {"name": f"Lead {n}"}}, token="p")
+        await self.eventually(1)
+        await asyncio.sleep(1.5)
+        self.assertLessEqual(len(self.listener.calls), 3,
+                             "a burst should not be one call per message")
+        # And it has caught up: nothing is left to wake it for.
+        _, listed = await self.call("GET", "/acme/api/channels/leads/hooks", token="p")
+        self.assertEqual(listed[0]["last_status"], 200)
+
+    async def test_a_quiet_channel_calls_nothing(self) -> None:
+        """What this was built for: nothing happens when nothing happens."""
+        await self.ready()
+        await self.add()
+        await asyncio.sleep(1.5)
+        self.assertEqual(self.listener.calls, [])
+
+    async def test_an_api_key_is_sent_and_never_listed(self) -> None:
+        await self.ready()
+        await self.add(headers={"x-api-key": "sk-secret", "anthropic-version": "2023-06-01"})
+        await self.call("POST", "/acme/api/channels/leads/messages", {"body": 1}, token="p")
+        await self.eventually(1)
+        self.assertEqual(self.listener.calls[0]["headers"].get("x-api-key"), "sk-secret")
+        _, listed = await self.call("GET", "/acme/api/channels/leads/hooks", token="p")
+        self.assertNotIn("sk-secret", json.dumps(listed))
+        self.assertTrue(listed[0]["has_headers"])
+
+    async def test_a_fixed_body_is_sent_as_given(self) -> None:
+        """For an endpoint that wants a particular shape - a trigger id, say -
+        rather than whatever this server would have said."""
+        await self.ready()
+        await self.add(body={"trigger_id": "trig_018qNsPwGv"})
+        await self.call("POST", "/acme/api/channels/leads/messages", {"body": 1}, token="p")
+        await self.eventually(1)
+        self.assertEqual(self.listener.calls[0]["body"], {"trigger_id": "trig_018qNsPwGv"})
+
+    async def test_a_call_that_fails_is_tried_again(self) -> None:
+        await self.ready()
+        await self.add()
+        _, listed = await self.call("GET", "/acme/api/channels/leads/hooks", token="p")
+        self.before = listed[0]["cursor"]
+        self.listener.answer = 500
+        await self.call("POST", "/acme/api/channels/leads/messages", {"body": 1}, token="p")
+        await self.eventually(1)
+        _, listed = await self.call("GET", "/acme/api/channels/leads/hooks", token="p")
+        self.assertEqual(listed[0]["last_status"], 500)
+        # Still owed: a call that was not answered did not move it on. The
+        # sequence is deployment-wide, so what matters is that it did not
+        # advance, not what number it sits at.
+        self.assertEqual(listed[0]["cursor"], self.before)
+
+    async def test_an_address_inside_the_network_is_refused(self) -> None:
+        """This server must not become a way to reach what only it can reach."""
+        await self.ready()
+        status, said = await self.call("POST", "/acme/api/channels/leads/hooks",
+                                       {"name": "probe", "url": "https://169.254.169.254/"},
+                                       token="p")
+        self.assertEqual(status, 400)
+        self.assertIn("inside the network", said["detail"])
+
+    async def test_it_can_be_tried_by_hand_without_swallowing_anything(self) -> None:
+        await self.ready()
+        await self.add()
+        await self.call("POST", "/acme/api/channels/leads/messages", {"body": 1}, token="p")
+        await self.eventually(1)
+        self.listener.calls.clear()
+
+        status, said = await self.call("POST", "/acme/api/channels/leads/hooks/claude/test",
+                                       token="p")
+        self.assertEqual((status, said["ok"], said["status"]), (200, True, 200))
+        self.assertTrue(self.listener.calls[0]["body"]["relay"]["test"])
+
+    async def test_removing_it_stops_the_calls(self) -> None:
+        await self.ready()
+        await self.add()
+        status, _ = await self.call("DELETE", "/acme/api/channels/leads/hooks/claude", token="p")
+        self.assertEqual(status, 200)
+        await self.call("POST", "/acme/api/channels/leads/messages", {"body": 1}, token="p")
+        await asyncio.sleep(1.5)
+        self.assertEqual(self.listener.calls, [])

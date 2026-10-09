@@ -262,6 +262,37 @@ is not muting a job, and not taking the chat out of the channel. The chat's
 place in the channel moves past what it was not told about, so a backlog that
 never clears cannot build up behind it.
 
+## Waking something that cannot wait
+
+A worker is told by being answered: it holds a request open and the server
+releases it. Anything woken by being *called* instead - a scheduled task, a
+function, a browser extension that cannot hold a connection - needs the server
+to go to it. A channel can have triggers for that.
+
+```
+POST /{ws}/api/channels/{channel}/hooks
+{"name": "claude", "url": "https://…", "headers": {"x-api-key": "…"},
+ "body": {"trigger_id": "…"}}
+```
+
+`headers` is where an api key goes; it is sent on every call and never appears
+in a listing. `body` is for an endpoint that wants a particular shape, and
+without it the call says which channel has work and how much.
+
+It is a trigger, not a delivery. It keeps a cursor like any other member, and a
+call that is answered moves it to the head of the channel: ten leads arriving
+together is **one** call saying there is work, not ten calls each carrying one.
+What the work is stays in the channel, to be collected by whatever the call
+woke up, with its own id. A call that is not answered leaves the cursor where
+it was and is tried again, so nothing is missed by a trigger that was briefly
+down.
+
+Anyone may create a workspace here, so a trigger is an address someone else
+chose. Only `https://` is called, and never an address that resolves inside the
+network this server runs in - a database beside it, a cloud instance's metadata
+service, anything on localhost. Otherwise this would be a way to reach what
+only the server can reach.
+
 ## Deploying the relay
 
 The relay needs somewhere to run and a Postgres to talk to, reached through
