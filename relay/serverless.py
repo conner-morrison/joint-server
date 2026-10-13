@@ -96,6 +96,10 @@ class RenameIn(BaseModel):
     name: str
 
 
+class RepeatsIn(BaseModel):
+    allowed: bool
+
+
 class HookIn(BaseModel):
     """Somewhere to call when this channel gets something. `headers` is where
     an api key goes; `body` is for an endpoint that wants a particular shape,
@@ -388,6 +392,20 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         if name is None:
             raise HTTPException(404, f"no worker {worker_id!r}")
         return {"worker_id": worker_id, "name": name}
+
+    @app.post("/{ws}/api/workers/{worker_id}/repeats")
+    async def set_repeats(worker_id: str, body: RepeatsIn,
+                          scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Whether this worker may post a job the channel already has.
+
+        Normally not: two workers watching the same board post one job between
+        them. But a worker whose contribution is what it says *about* a job is
+        not repeating the job when it posts one already there - and refusing it
+        drops the only part of that worker worth having.
+        """
+        if not await scoped.set_repeats(worker_id, body.allowed):
+            raise HTTPException(404, f"no worker {worker_id!r}")
+        return {"worker_id": worker_id, "may_repeat": body.allowed}
 
     @app.delete("/{ws}/api/workers/{worker_id}")
     async def remove_worker(worker_id: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:

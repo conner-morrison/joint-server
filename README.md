@@ -262,6 +262,26 @@ is not muting a job, and not taking the chat out of the channel. The chat's
 place in the channel moves past what it was not told about, so a backlog that
 never clears cannot build up behind it.
 
+### A worker that may repeat a job
+
+A channel keeps one copy of a job, decided by the job's own link. That is right
+for two workers watching the same board: they should post a job once between
+them, whoever sees it first.
+
+It is wrong for a worker whose contribution is what it says *about* a job - a
+decision, a reason, a score. Its second posting is the judgement, not the job
+again, and refusing it drops the only part of that worker worth having. Such a
+worker is marked **Repeats allowed** on the Workers page.
+
+```
+POST /{ws}/api/workers/{worker_id}/repeats   {"allowed": true}
+```
+
+It is per worker, so everything else is still held to the rule. And it is only
+about a job arriving again: a publisher that lost its connection and resent the
+same message is still stored once, because that is decided by the id the
+publisher sent, not by the link.
+
 ## Waking something that cannot wait
 
 A worker is told by being answered: it holds a request open and the server

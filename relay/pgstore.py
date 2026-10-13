@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS workers (
     worker_id   TEXT NOT NULL,
     name        TEXT NOT NULL DEFAULT '',
     token_hash  TEXT UNIQUE,
+    -- Whether this worker may post a job the channel already has. Normally
+    -- not: two workers watching the same board post one job between them.
+    -- But a worker whose whole contribution is what it says *about* a job -
+    -- a decision, a reason - is not repeating the job when it posts it again.
+    may_repeat  BOOLEAN NOT NULL DEFAULT FALSE,
     label       TEXT NOT NULL DEFAULT '',
     created_at  DOUBLE PRECISION NOT NULL,
     last_seen   DOUBLE PRECISION,
@@ -456,6 +461,8 @@ class PgStore:
                 # gains nothing from CREATE TABLE IF NOT EXISTS.
                 await conn.execute("ALTER TABLE bot_members ADD COLUMN IF NOT EXISTS "
                                    "deaf_to TEXT[] NOT NULL DEFAULT '{}'")
+                await conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS "
+                                   "may_repeat BOOLEAN NOT NULL DEFAULT FALSE")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_job "
                                    "ON messages(workspace, channel, job_key)")
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
@@ -667,6 +674,19 @@ class WorkspaceStore:
             (name, self.slug, worker_id))
         return name if changed else None
 
+    async def set_repeats(self, worker_id: str, allowed: bool) -> bool:
+        """Whether this worker may post a job the channel already has.
+
+        The rule exists because two workers watching the same board should post
+        one job between them. It is wrong for a worker whose contribution is
+        what it says *about* a job - a decision, a reason, a score - because
+        then the second posting is not the job again, it is the judgement, and
+        dropping it drops the only part worth having.
+        """
+        return await self.store._run(
+            "UPDATE workers SET may_repeat = %s WHERE workspace = %s AND worker_id = %s",
+            (allowed, self.slug, worker_id)) > 0
+
     async def reissue_id(self, worker_id: str) -> dict[str, Any] | None:
         """A new id for a worker whose id got out, keeping everything else: the
         same name, the same channels, the same place in each of them.
@@ -743,7 +763,7 @@ class WorkspaceStore:
         """Name first: it is what a person reads. The id comes too, because it
         is what the worker was given and what it is identified by here."""
         rows = await self.store._all(
-            "SELECT worker_id, name, label, created_at, last_seen, "
+            "SELECT worker_id, name, label, created_at, last_seen, may_repeat, "
             "       (token_hash IS NOT NULL) AS legacy, "
             "       (last_seen IS NOT NULL AND last_seen > %s) AS online "
             "  FROM workers WHERE workspace = %s ORDER BY name, worker_id",
@@ -1241,10 +1261,16 @@ class WorkspaceStore:
                 if key is not None:
                     # Inside the transaction that would store it, so the answer
                     # cannot be made stale by something committing meanwhile.
+                    # A sender allowed to repeat skips the check entirely: what
+                    # it adds to a job it has seen before is the point of it.
                     seen = await (await conn.execute(
                         "SELECT seq FROM messages "
                         " WHERE workspace = %s AND channel = %s AND job_key = %s "
-                        " ORDER BY seq LIMIT 1", (self.slug, channel, key))).fetchone()
+                        "   AND NOT EXISTS (SELECT 1 FROM workers w "
+                        "                    WHERE w.workspace = %s AND w.worker_id = %s "
+                        "                      AND w.may_repeat) "
+                        " ORDER BY seq LIMIT 1",
+                        (self.slug, channel, key, self.slug, sender))).fetchone()
                     if seen is not None:
                         return int(seen["seq"]), True
                 cur = await conn.execute(

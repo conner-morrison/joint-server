@@ -878,6 +878,14 @@ function renderWorkersTable() {
           : h("span", { class: "muted" }, "none")),
         h("td", { class: "muted nowrap" }, online ? "online now" : ago(w.last_seen)),
         h("td", { class: "actions" },
+          h("button", {
+            class: "btn small" + (w.may_repeat ? " on" : ""),
+            title: w.may_repeat
+              ? "Posts a job even when this channel already has it. Click to stop."
+              : "A job this channel already has is refused. Click to allow repeats, for a "
+                + "worker whose point is what it says about a job rather than the job.",
+            onclick: () => setRepeats(w.worker_id, w.name || w.worker_id, !w.may_repeat),
+          }, w.may_repeat ? "Repeats allowed" : "Repeats"),
           h("button", { class: "btn small", onclick: () => renameWorker(w.worker_id, w.name || "") }, "Rename"),
           h("button", { class: "btn small", onclick: () => reissueId(w.worker_id, w.name || w.worker_id) }, "New id"),
           h("button", { class: "btn small danger", onclick: () => removeWorker(w.worker_id, w.name || w.worker_id) }, "Remove")));
@@ -1031,6 +1039,18 @@ function showId(name, workerId, how) {
     h("h3", {}, "How a worker uses it"),
     copyBlock(`Authorization: Bearer ${workerId}`),
   ], [h("button", { class: "btn primary", type: "submit" }, "Done")]);
+}
+
+async function setRepeats(workerId, name, allowed) {
+  if (allowed && !confirm(`Let ${name} post a job this channel already has?\n\n`
+    + "Normally two workers watching the same board post one job between them. Allow this "
+    + "for a worker whose point is what it says about a job - a decision, a reason - because "
+    + "its second posting is the judgement, not the job again.")) return;
+  try {
+    await api("POST", `/api/workers/${enc(workerId)}/repeats`, { allowed });
+    toast(allowed ? `${name} may now repeat a job` : `${name} will not repeat a job`);
+    refreshAll();
+  } catch (err) { handleError(err); }
 }
 
 async function renameWorker(workerId, current) {

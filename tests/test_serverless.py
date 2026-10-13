@@ -410,6 +410,82 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, stored = await self.call("GET", f"/{ws}/api/channels/jobs/messages", token="hunter2")
         self.assertEqual(len(stored), 1)
 
+    async def test_a_worker_may_be_allowed_to_repeat_a_job(self) -> None:
+        """One job per channel is right for two workers watching the same board.
+        It is wrong for a worker whose contribution is what it says *about* a
+        job: its second posting is the judgement, not the job again, and
+        refusing it drops the only part of that worker worth having."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("finder", "judge")}
+        for who in ("finder", "judge"):
+            await self.call("PUT", f"/{ws}/api/channels/jobs/members/{ids[who]}", {},
+                            token="hunter2")
+        url = "https://www.upwork.com/jobs/~0221"
+
+        _, first = await self.call("POST", f"/{ws}/publish",
+                                   {"channel": "jobs", "body": {"title": "A job", "url": url}},
+                                   token=ids["finder"])
+        # Refused while it is held to the usual rule.
+        _, blocked = await self.call(
+            "POST", f"/{ws}/publish",
+            {"channel": "jobs", "body": {"title": "A job", "url": url, "decision": "apply"}},
+            token=ids["judge"])
+        self.assertTrue(blocked["duplicate"])
+
+        status, said = await self.call("POST", f"/{ws}/api/workers/{ids['judge']}/repeats",
+                                       {"allowed": True}, token="hunter2")
+        self.assertEqual((status, said["may_repeat"]), (200, True))
+
+        _, allowed = await self.call(
+            "POST", f"/{ws}/publish",
+            {"channel": "jobs", "body": {"title": "A job", "url": url, "decision": "apply"}},
+            token=ids["judge"])
+        self.assertFalse(allowed["duplicate"])
+        self.assertNotEqual(allowed["seq"], first["seq"])
+
+        # Only that worker: the other is still held to it.
+        _, still = await self.call("POST", f"/{ws}/publish",
+                                   {"channel": "jobs", "body": {"title": "A job", "url": url}},
+                                   token=ids["finder"])
+        self.assertTrue(still["duplicate"])
+
+    async def test_allowing_repeats_can_be_undone(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "judge")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers/{who}/repeats", {"allowed": True},
+                        token="hunter2")
+        url = "https://www.upwork.com/jobs/~0222"
+        for _ in range(2):
+            await self.call("POST", f"/{ws}/publish",
+                            {"channel": "jobs", "body": {"title": "A job", "url": url}},
+                            token=who)
+        await self.call("POST", f"/{ws}/api/workers/{who}/repeats", {"allowed": False},
+                        token="hunter2")
+        _, blocked = await self.call("POST", f"/{ws}/publish",
+                                     {"channel": "jobs", "body": {"title": "A job", "url": url}},
+                                     token=who)
+        self.assertTrue(blocked["duplicate"])
+        _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        self.assertFalse(workers[0]["may_repeat"])
+
+    async def test_a_resend_of_the_same_message_is_still_one_message(self) -> None:
+        """Allowing repeats is about a job arriving again, not about a publisher
+        that lost its connection and sent the same thing twice."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "judge")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers/{who}/repeats", {"allowed": True},
+                        token="hunter2")
+        message = {"channel": "jobs", "id": "job:~0223",
+                   "body": {"title": "A job", "url": "https://www.upwork.com/jobs/~0223"}}
+        _, first = await self.call("POST", f"/{ws}/publish", message, token=who)
+        _, retry = await self.call("POST", f"/{ws}/publish", message, token=who)
+        self.assertEqual((retry["seq"], retry["duplicate"]), (first["seq"], True))
+
     async def test_a_different_job_is_not_mistaken_for_it(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
