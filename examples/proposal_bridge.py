@@ -123,6 +123,8 @@ LABELS = (
     (("job title", "title"), "title"),
     (("job link", "job url", "link", "url"), "upworkUrl"),
     (("job description", "description", "jd"), "description"),
+    (("screening questions", "screening question", "screening", "questions"),
+     "screeningQuestions"),
     (("client name", "client"), "clientName"),
     (("decision",), "decision"),
     (("reason", "why"), "reason"),
@@ -190,6 +192,33 @@ def fields(body: Any) -> Any:
     return body
 
 
+# What a client asks before reading a proposal. A proposal that does not
+# answer them is not read, so these go to proposal-writer with the posting
+# rather than being left behind as a field nobody mapped.
+QUESTION_KEYS = ("screeningQuestions", "screening_questions", "screening", "questions")
+
+
+def questions_in(body: Any) -> list[str]:
+    """The screening questions, however they were sent: a block of lines or a
+    list. Numbering the publisher added is dropped, because it is numbered
+    again below."""
+    if not isinstance(body, dict):
+        return []
+    for key in QUESTION_KEYS:
+        said = body.get(key)
+        if isinstance(said, (list, tuple)):
+            lines = [str(item).strip() for item in said]
+        elif isinstance(said, str):
+            lines = said.splitlines()
+        else:
+            continue
+        found = [re.sub(r"^\s*(?:\d+[.)]|[-*\u2022])\s*", "", line).strip() for line in lines]
+        found = [line for line in found if line]
+        if found:
+            return found
+    return []
+
+
 def described(body: Any) -> str:
     """The posting's own words, as the publisher sent them.
 
@@ -222,6 +251,11 @@ def as_jd(body: Any) -> str:
         if isinstance(body.get(key), str) and body[key].strip():
             lines += ["", body[key].strip()]
             break
+
+    asked = questions_in(body)
+    if asked:
+        lines += ["", "Screening questions:",
+                  *[f"{n}. {line}" for n, line in enumerate(asked, 1)]]
 
     terms = [f"{label}: {body[key]}" for label, key in FACTS if body.get(key)]
     link = body.get("upworkUrl") or body.get("url") or body.get("link")

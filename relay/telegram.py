@@ -53,6 +53,29 @@ JD_KEYS = ("description", "jobDescription", "job_description", "jd", "snippet", 
 TITLE_KEYS = ("title", "job_title", "jobTitle", "jobName", "job_name", "heading", "name",
               "subject", "emailSubject")
 CLIENT_NAME_KEYS = ("client_name", "clientName")
+# What a client asks before reading a proposal. Optional, and the part of a
+# posting a proposal is judged on, so it is never one of the fields quietly
+# dropped for being too long to fit on a pill.
+QUESTION_KEYS = ("screeningQuestions", "screening_questions", "screening", "questions")
+
+
+def questions_in(body: dict[str, Any]) -> list[str]:
+    """The screening questions, however they were sent: a block of lines, or a
+    list. Numbering the publisher added is dropped, because it is numbered
+    again when it is shown and nobody wants "1. 1. How many years"."""
+    for key in QUESTION_KEYS:
+        said = body.get(key)
+        if isinstance(said, (list, tuple)):
+            lines = [str(item).strip() for item in said]
+        elif isinstance(said, str):
+            lines = said.splitlines()
+        else:
+            continue
+        found = [re.sub(r"^\s*(?:\d+[.)]|[-*\u2022])\s*", "", line).strip() for line in lines]
+        found = [line for line in found if line]
+        if found:
+            return found
+    return []
 
 # A worker may send a job as a block of labelled text rather than as fields:
 # "Job title: …" on one line, "Job description:" and then the posting. It is
@@ -66,6 +89,8 @@ LABELS = (
     (("job title", "title"), "title"),
     (("job link", "job url", "link", "url"), "url"),
     (("job description", "description", "jd"), "description"),
+    (("screening questions", "screening question", "screening", "questions"),
+     "screeningQuestions"),
     (("client name", "client"), "clientName"),
     (("decision",), "decision"),
     (("reason", "why"), "reason"),
@@ -246,6 +271,7 @@ def fit(text: str, budget: int) -> tuple[str, str]:
 # Everything the message already says somewhere, so the rest can be added
 # without repeating any of it.
 SHOWN = ({key for _, key in FACTS} | set(JD_KEYS) | set(LINK_KEYS) | set(TITLE_KEYS)
+         | set(QUESTION_KEYS)
          | set(CLIENT_NAME_KEYS) | {"client", "type", "source", "links", "urls", "index",
                                     "emailId", "receivedAt", "id"}
          | {"client" + key[0].upper() + key[1:] for _, key in CLIENT_FIELDS})
@@ -399,6 +425,7 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
     head = "\n".join(lines)
     text = next((body[key].strip() for key in JD_KEYS
                  if isinstance(body.get(key), str) and body[key].strip()), "")
+    asked = questions_in(body)
     if not text:
         # Nothing under a name this knows. The longest thing the item says that
         # has no place of its own is the nearest thing it has to a description,
@@ -407,6 +434,13 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
                 if key not in SHOWN and isinstance(value, str)
                 and len(value.strip()) > LEFTOVER_LONG and not http_url(value)]
         text = max(said, key=len, default="")
+    if asked:
+        # Added under the posting's own words rather than above them, and
+        # carried by the same continuation: a job with ten questions is one
+        # notification followed by the rest of itself. Never dropped for
+        # length - this is the part a proposal is judged on.
+        numbered = "\n".join(f"{n}. {line}" for n, line in enumerate(asked, 1))
+        text = f"{text}\n\nScreening questions:\n{numbered}".strip()
     if not text:
         return [head[:LIMIT]]
 

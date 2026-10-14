@@ -1664,6 +1664,7 @@ const LABELS = [
   [["job title", "title"], "title"],
   [["job link", "job url", "link", "url"], "url"],
   [["job description", "description", "jd"], "description"],
+  [["screening questions", "screening question", "screening", "questions"], "screeningQuestions"],
   [["client name", "client"], "clientName"],
   [["decision"], "decision"],
   [["reason", "why"], "reason"],
@@ -1868,8 +1869,29 @@ const CLIENT_FIELDS = [
 const JD_KEYS = ["description", "jobDescription", "job_description", "jd", "snippet",
                  "summary", "details", "text"];
 
+// What a client asks before reading a proposal. Optional, and the part a
+// proposal is judged on, so it gets a place of its own rather than being left
+// to whatever the leftovers happen to do with it.
+const QUESTION_KEYS = ["screeningQuestions", "screening_questions", "screening", "questions"];
+
+function questionsIn(body) {
+  if (!body || typeof body !== "object") return [];
+  for (const key of QUESTION_KEYS) {
+    const said = body[key];
+    const lines = Array.isArray(said) ? said.map(String)
+      : (typeof said === "string" ? said.split(/\r?\n/) : null);
+    if (!lines) continue;
+    // Numbering the publisher added is dropped, because it is numbered again
+    // below and nobody wants "1. 1. How many years".
+    const found = lines.map((line) => line.replace(/^\s*(?:\d+[.)]|[-*\u2022])\s*/, "").trim())
+      .filter(Boolean);
+    if (found.length) return found;
+  }
+  return [];
+}
+
 const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, ...LINK_KEYS,
-                       ...JOB_ID_KEYS, ...TITLE_KEYS, "links", "urls",
+                       ...JOB_ID_KEYS, ...TITLE_KEYS, ...QUESTION_KEYS, "links", "urls",
                        "client_name", "clientName",
                        "type", "source", "index", "emailId", "receivedAt",
                        "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
@@ -1955,6 +1977,21 @@ function jobCard(body) {
   const jd = jdOf(body);
   const shortJd = jd && jd.length <= 240 && !jd.includes("\n\n") ? jd : null;
   const jdBox = jd && !shortJd ? h("div", { class: "jd", hidden: true }, jd) : null;
+  // The questions are short, few, and the thing a person checks before
+  // deciding to bid, so they get their own button rather than being buried at
+  // the end of the description.
+  const asked = questionsIn(body);
+  const askedBox = asked.length
+    ? h("ol", { class: "jd questions", hidden: true }, asked.map((q) => h("li", {}, q)))
+    : null;
+  const askedButton = askedBox ? h("button", {
+    class: "btn small jd-toggle", type: "button",
+    onclick: () => {
+      askedBox.hidden = !askedBox.hidden;
+      askedButton.textContent = (askedBox.hidden ? "View" : "Hide")
+        + ` ${asked.length} question${asked.length === 1 ? "" : "s"}`;
+    },
+  }, `View ${asked.length} question${asked.length === 1 ? "" : "s"}`) : false;
   const jdButton = jdBox ? h("button", {
     class: "btn small jd-toggle", type: "button",
     onclick: () => {
@@ -1993,10 +2030,12 @@ function jobCard(body) {
                  title: l.url }, l.label)))
       : false,
     extra.pills.length ? h("div", { class: "job-facts" }, extra.pills) : false,
-    jdButton || extra.panels.length
-      ? h("div", { class: "job-actions" }, jdButton, extra.panels.map(([button]) => button))
+    jdButton || askedButton || extra.panels.length
+      ? h("div", { class: "job-actions" }, jdButton, askedButton,
+          extra.panels.map(([button]) => button))
       : false,
     jdBox || false,
+    askedBox || false,
     extra.panels.map(([, box]) => box),
     clientBlock(body),
     extra.blocks);

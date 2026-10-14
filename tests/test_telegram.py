@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import unittest
 
-from relay.telegram import LIMIT, fit, labelled, render
+from relay.telegram import LIMIT, fit, labelled, questions_in, render
 
 
 def body(**extra: object) -> dict[str, object]:
@@ -219,6 +219,70 @@ class LabelledTextTest(unittest.TestCase):
     def test_a_posting_with_no_leading_label_keeps_its_words(self) -> None:
         read = labelled("A job nobody labelled.\nDecision: skip\nReason: too cheap")
         self.assertEqual(read["description"], "A job nobody labelled.")
+
+
+class ScreeningQuestionTest(unittest.TestCase):
+    """What a client asks before reading a proposal.
+
+    Optional, and the part a proposal is judged on: a proposal that does not
+    answer them is not read. So they are never among the fields quietly left
+    out for being too long to fit on a pill.
+    """
+
+    RAW = ("Job title: Community Manager\n"
+           "Job link: https://www.upwork.com/jobs/~0221\n"
+           "Job description:\nPopsPhone is a launcher.\n"
+           "Screening questions:\n"
+           "1. How many years have you worked on organic community growth?\n"
+           "2. Describe a launch you grew without paid advertising.")
+
+    def test_they_are_read_from_labelled_text(self) -> None:
+        read = labelled(self.RAW)
+        self.assertIn("screeningQuestions", read)
+        self.assertEqual(questions_in(read), [
+            "How many years have you worked on organic community growth?",
+            "Describe a launch you grew without paid advertising."])
+
+    def test_numbering_the_publisher_added_is_dropped(self) -> None:
+        """It is numbered again when shown, and "1. 1. How many years" is what
+        happens when both do it."""
+        for written in ("1. First\n2. Second", "1) First\n2) Second",
+                        "- First\n- Second", "\u2022 First\n\u2022 Second"):
+            self.assertEqual(questions_in({"screeningQuestions": written}), ["First", "Second"])
+
+    def test_a_list_is_read_as_well_as_a_block(self) -> None:
+        self.assertEqual(questions_in({"questions": ["First", "Second"]}), ["First", "Second"])
+        self.assertEqual(questions_in({"screening_questions": "Only one"}), ["Only one"])
+
+    def test_a_job_without_them_is_unchanged(self) -> None:
+        """Optional means optional: nothing is added, and no empty heading."""
+        said = "\n".join(render({"title": "A job", "description": "Build it."}, channel="jobs"))
+        self.assertNotIn("Screening question", said)
+
+    def test_they_arrive_under_the_posting(self) -> None:
+        said = "\n".join(render(self.RAW, channel="jobs", source="general-vollna-search"))
+        self.assertIn("PopsPhone is a launcher.", said)
+        self.assertIn("Screening questions:", said)
+        self.assertIn("1. How many years have you worked on organic community growth?", said)
+        self.assertLess(said.index("PopsPhone"), said.index("Screening questions:"))
+
+    def test_they_survive_a_description_too_long_for_one_message(self) -> None:
+        """The failure worth preventing: cut to fit, the questions are the part
+        that falls off the end, because they come last."""
+        long = "\n".join(f"Paragraph {n}: " + "what the client wants. " * 14 for n in range(1, 30))
+        sent = render({"title": "A job", "description": long,
+                       "screeningQuestions": "1. Why you?\n2. When can you start?"},
+                      channel="jobs")
+        said = "\n".join(sent)
+        self.assertIn("1. Why you?", said)
+        self.assertIn("2. When can you start?", said)
+        for part in sent:
+            self.assertLessEqual(len(part), LIMIT)
+
+    def test_a_job_that_is_only_questions_still_says_them(self) -> None:
+        said = "\n".join(render({"title": "A job", "questions": ["Why you?"]}, channel="jobs"))
+        self.assertIn("Screening questions:", said)
+        self.assertIn("1. Why you?", said)
 
 
 class FitTest(unittest.TestCase):
