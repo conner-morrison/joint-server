@@ -100,6 +100,10 @@ CREATE TABLE IF NOT EXISTS members (
     worker_id   TEXT NOT NULL,
     cursor      BIGINT NOT NULL,
     joined_at   DOUBLE PRECISION NOT NULL,
+    -- Whether this worker may repeat a job *here*. NULL means it has not been
+    -- decided in this channel and the worker's own setting stands, which is
+    -- what lets one answer serve every channel until one of them differs.
+    may_repeat  BOOLEAN,
     PRIMARY KEY (workspace, channel, worker_id),
     FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE,
     FOREIGN KEY (workspace, worker_id) REFERENCES workers(workspace, worker_id) ON DELETE CASCADE
@@ -463,6 +467,10 @@ class PgStore:
                                    "deaf_to TEXT[] NOT NULL DEFAULT '{}'")
                 await conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS "
                                    "may_repeat BOOLEAN NOT NULL DEFAULT FALSE")
+                # Nullable here, and deliberately: not decided is not the same
+                # as decided no.
+                await conn.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS "
+                                   "may_repeat BOOLEAN")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_job "
                                    "ON messages(workspace, channel, job_key)")
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
@@ -674,6 +682,19 @@ class WorkspaceStore:
             (name, self.slug, worker_id))
         return name if changed else None
 
+    async def set_member_repeats(self, channel: str, worker_id: str,
+                                 allowed: bool | None) -> bool:
+        """Whether this worker may repeat a job in this channel in particular.
+
+        None puts the question back to the worker's own setting, which is not
+        the same as answering no: a channel that has never been asked should
+        follow a decision made later somewhere else.
+        """
+        return await self.store._run(
+            "UPDATE members SET may_repeat = %s "
+            " WHERE workspace = %s AND channel = %s AND worker_id = %s",
+            (allowed, self.slug, channel, worker_id)) > 0
+
     async def set_repeats(self, worker_id: str, allowed: bool) -> bool:
         """Whether this worker may post a job the channel already has.
 
@@ -874,12 +895,14 @@ class WorkspaceStore:
         # every request about that member is made with.
         members: dict[str, list[dict[str, Any]]] = {}
         for m in await self.store._all("""
-                SELECT m.channel, m.worker_id, COALESCE(NULLIF(w.name, ''), m.worker_id) AS name
+                SELECT m.channel, m.worker_id, COALESCE(NULLIF(w.name, ''), m.worker_id) AS name,
+                       m.may_repeat
                   FROM members m LEFT JOIN workers w
                     ON w.workspace = m.workspace AND w.worker_id = m.worker_id
                  WHERE m.workspace = %s ORDER BY name, m.worker_id""", (self.slug,)):
             members.setdefault(m["channel"], []).append(
-                {"worker_id": m["worker_id"], "name": m["name"]})
+                {"worker_id": m["worker_id"], "name": m["name"],
+                 "may_repeat": m["may_repeat"]})
         return [{**r, "members": members.get(r["name"], [])} for r in rows]
 
     # --- membership ------------------------------------------------------
@@ -1259,18 +1282,24 @@ class WorkspaceStore:
         async with self.store.pool.connection() as conn:
             try:
                 if key is not None:
+                    # Asked here and answered by the worker where the channel
+                    # has not said: a setting made once should serve every
+                    # channel until one of them wants to differ.
+                    rule = await (await conn.execute("""
+                        SELECT COALESCE(m.may_repeat, w.may_repeat, FALSE) AS allowed
+                          FROM workers w
+                          LEFT JOIN members m ON m.workspace = w.workspace
+                                             AND m.worker_id = w.worker_id AND m.channel = %s
+                         WHERE w.workspace = %s AND w.worker_id = %s""",
+                        (channel, self.slug, sender))).fetchone()
                     # Inside the transaction that would store it, so the answer
                     # cannot be made stale by something committing meanwhile.
                     # A sender allowed to repeat skips the check entirely: what
                     # it adds to a job it has seen before is the point of it.
-                    seen = await (await conn.execute(
+                    seen = None if (rule and rule["allowed"]) else await (await conn.execute(
                         "SELECT seq FROM messages "
                         " WHERE workspace = %s AND channel = %s AND job_key = %s "
-                        "   AND NOT EXISTS (SELECT 1 FROM workers w "
-                        "                    WHERE w.workspace = %s AND w.worker_id = %s "
-                        "                      AND w.may_repeat) "
-                        " ORDER BY seq LIMIT 1",
-                        (self.slug, channel, key, self.slug, sender))).fetchone()
+                        " ORDER BY seq LIMIT 1", (self.slug, channel, key))).fetchone()
                     if seen is not None:
                         return int(seen["seq"]), True
                 cur = await conn.execute(

@@ -450,6 +450,73 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                                    token=ids["finder"])
         self.assertTrue(still["duplicate"])
 
+    async def test_a_channel_can_decide_for_itself(self) -> None:
+        """The same worker may be worth repeating in one channel and not in
+        another. The channel's answer wins where it has given one."""
+        ws = await self.workspace()
+        for channel in ("jobs", "review"):
+            await self.call("POST", f"/{ws}/api/channels", {"name": channel}, token="hunter2")
+        who = await self.enrol(ws, "judge")
+        for channel in ("jobs", "review"):
+            await self.call("PUT", f"/{ws}/api/channels/{channel}/members/{who}", {},
+                            token="hunter2")
+
+        status, said = await self.call(
+            "POST", f"/{ws}/api/channels/jobs/members/{who}/repeats", {"allowed": True},
+            token="hunter2")
+        self.assertEqual((status, said["may_repeat"]), (200, True))
+
+        url = "https://www.upwork.com/jobs/~0231"
+        job = {"title": "A job", "url": url}
+        for channel in ("jobs", "review"):
+            await self.call("POST", f"/{ws}/publish", {"channel": channel, "body": job},
+                            token=who)
+        _, in_jobs = await self.call("POST", f"/{ws}/publish", {"channel": "jobs", "body": job},
+                                     token=who)
+        _, in_review = await self.call("POST", f"/{ws}/publish",
+                                       {"channel": "review", "body": job}, token=who)
+        self.assertFalse(in_jobs["duplicate"], "the channel said it was allowed here")
+        self.assertTrue(in_review["duplicate"], "the channel said nothing, so the worker decides")
+
+    async def test_a_channel_can_refuse_what_the_worker_allows(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "judge")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers/{who}/repeats", {"allowed": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/members/{who}/repeats",
+                        {"allowed": False}, token="hunter2")
+
+        job = {"title": "A job", "url": "https://www.upwork.com/jobs/~0232"}
+        await self.call("POST", f"/{ws}/publish", {"channel": "jobs", "body": job}, token=who)
+        _, again = await self.call("POST", f"/{ws}/publish", {"channel": "jobs", "body": job},
+                                   token=who)
+        self.assertTrue(again["duplicate"])
+
+    async def test_a_channel_can_put_the_question_back(self) -> None:
+        """Not decided here is not decided no: a channel that has never been
+        asked follows a decision made later on the worker."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "judge")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/members/{who}/repeats",
+                        {"allowed": False}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/members/{who}/repeats",
+                        {"allowed": None}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers/{who}/repeats", {"allowed": True},
+                        token="hunter2")
+
+        job = {"title": "A job", "url": "https://www.upwork.com/jobs/~0233"}
+        await self.call("POST", f"/{ws}/publish", {"channel": "jobs", "body": job}, token=who)
+        _, again = await self.call("POST", f"/{ws}/publish", {"channel": "jobs", "body": job},
+                                   token=who)
+        self.assertFalse(again["duplicate"])
+        _, channels = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+        member = [m for m in channels[0]["members"] if m["worker_id"] == who][0]
+        self.assertIsNone(member["may_repeat"], "the console should show it as not decided here")
+
     async def test_allowing_repeats_can_be_undone(self) -> None:
         ws = await self.workspace()
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")

@@ -100,6 +100,12 @@ class RepeatsIn(BaseModel):
     allowed: bool
 
 
+class MemberRepeatsIn(BaseModel):
+    """None puts the question back to the worker's own setting, which is not
+    the same as answering no."""
+    allowed: bool | None = None
+
+
 class HookIn(BaseModel):
     """Somewhere to call when this channel gets something. `headers` is where
     an api key goes; `body` is for an endpoint that wants a particular shape,
@@ -524,6 +530,19 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
     async def remove_member(name: str, worker_id: str,
                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
         return {"left": await scoped.leave(name, worker_id)}
+
+    @app.post("/{ws}/api/channels/{name}/members/{worker_id}/repeats")
+    async def set_member_repeats(name: str, worker_id: str, body: MemberRepeatsIn,
+                                 scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Whether this worker may repeat a job in this channel in particular.
+
+        `allowed` null puts the question back to the worker's own setting, so a
+        channel that has never been asked follows a decision made later
+        somewhere else.
+        """
+        if not await scoped.set_member_repeats(name, worker_id, body.allowed):
+            raise HTTPException(404, f"{worker_id!r} is not in channel {name!r}")
+        return {"channel": name, "worker_id": worker_id, "may_repeat": body.allowed}
 
     @app.post("/{ws}/api/channels/{name}/skip/{who}")
     async def skip_backlog(name: str, who: str, bot: bool = False,

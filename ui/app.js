@@ -1495,20 +1495,35 @@ async function addMember(channel, workerId, fromStart) {
 // whether it may post a job the channel already has, and whether it stays.
 function openMemberSettings(channel, workerId, shown) {
   const worker = state.workers.find((w) => w.worker_id === workerId) || {};
-  const repeats = h("input", { type: "checkbox", ...(worker.may_repeat ? { checked: true } : {}) });
+  const member = (currentChannel()?.members || []).find((m) => m.worker_id === workerId) || {};
+  const byWorker = Boolean(worker.may_repeat);
+  const here = member.may_repeat === null || member.may_repeat === undefined
+    ? "" : String(Boolean(member.may_repeat));
+  // Three answers, not two: not decided here is not the same as decided no,
+  // because a channel that has never been asked should follow a decision made
+  // later on the worker.
+  const repeats = h("select", { "aria-label": "Posting a job already here" },
+    h("option", { value: "", ...(here === "" ? { selected: true } : {}) },
+      `Follow the worker (${byWorker ? "allowed" : "refused"})`),
+    h("option", { value: "true", ...(here === "true" ? { selected: true } : {}) },
+      "Allow in this channel"),
+    h("option", { value: "false", ...(here === "false" ? { selected: true } : {}) },
+      "Refuse in this channel"));
+  const everywhere = h("input", { type: "checkbox", ...(byWorker ? { checked: true } : {}) });
   const err = h("p", { class: "error", hidden: true });
 
   const dlg = openDialog(`${shown} in #${channel}`, [
     h("p", { class: "muted small mono truncate", title: workerId }, workerId),
-    h("label", { class: "check" }, repeats,
+    field("Posting a job already here", repeats,
+      "Refused, a job this channel already has is turned away however it is written, so two "
+      + "workers watching the same board post it once between them. Allowed, this worker posts "
+      + "it anyway - for one whose point is what it says about a job, a decision or a reason, "
+      + "because that is not the job again."),
+    h("label", { class: "check" }, everywhere,
       h("span", {},
-        h("span", { class: "strong" }, "Allow posting a job already here"),
+        h("span", { class: "strong" }, "Allow it wherever this worker publishes"),
         h("span", { class: "hint" },
-          "Off, a job this channel already has is refused however it is written, so two "
-          + "workers watching the same board post it once between them. On, this worker "
-          + "posts it anyway - for one whose point is what it says about a job, a decision "
-          + "or a reason, because that is not the job again. Applies wherever this worker "
-          + "publishes, not only here."))),
+          "The worker's own setting, used by every channel that has not decided for itself."))),
     err,
     h("hr", {}),
     h("button", {
@@ -1524,8 +1539,13 @@ function openMemberSettings(channel, workerId, shown) {
   ], [cancel(), h("button", { class: "btn primary", type: "submit" }, "Save")],
     async (self) => {
       try {
-        if (repeats.checked !== Boolean(worker.may_repeat)) {
-          await api("POST", `/api/workers/${enc(workerId)}/repeats`, { allowed: repeats.checked });
+        if (everywhere.checked !== byWorker) {
+          await api("POST", `/api/workers/${enc(workerId)}/repeats`,
+            { allowed: everywhere.checked });
+        }
+        if (repeats.value !== here) {
+          await api("POST", `/api/channels/${enc(channel)}/members/${enc(workerId)}/repeats`,
+            { allowed: repeats.value === "" ? null : repeats.value === "true" });
         }
         self.close();
         await refreshAll();

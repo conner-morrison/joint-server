@@ -277,10 +277,22 @@ worker is marked **Repeats allowed** on the Workers page.
 POST /{ws}/api/workers/{worker_id}/repeats   {"allowed": true}
 ```
 
-It is per worker, so everything else is still held to the rule. And it is only
-about a job arriving again: a publisher that lost its connection and resent the
-same message is still stored once, because that is decided by the id the
-publisher sent, not by the link.
+A channel may decide for itself instead, where the same worker is worth
+repeating in one place and not in another:
+
+```
+POST /{ws}/api/channels/{channel}/members/{worker_id}/repeats   {"allowed": false}
+POST /{ws}/api/channels/{channel}/members/{worker_id}/repeats   {"allowed": null}
+```
+
+`null` is the third answer and the one worth having: it puts the question back
+to the worker, so a channel that has never been asked follows a decision made
+later somewhere else. Not decided here is not decided no.
+
+Everything else is still held to the rule. And none of this is about a job
+arriving again as the same message: a publisher that lost its connection and
+resent one is still stored once, because that is decided by the id the
+publisher sent rather than by the link.
 
 ## Waking something that cannot wait
 
