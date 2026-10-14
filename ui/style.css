@@ -350,3 +350,9 @@ a.job-title::after { content: " ↗"; font-size: 12px; color: var(--muted); text
 .chip.toggle { cursor: pointer; border: 1px solid var(--border); background: var(--card); }
 .chip.toggle.off { opacity: .5; text-decoration: line-through; }
 .btn.small.on { border-color: var(--ok); color: var(--ok); }
+
+/* --- one member's settings ---------------------------------------------- */
+.check { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; cursor: pointer; }
+.check input { margin-top: 3px; flex: none; }
+.check .hint { display: block; margin-top: 2px; }
+.modal-inner hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0 12px; width: 100%; }

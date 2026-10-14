@@ -1473,7 +1473,11 @@ function renderMemberList() {
               onclick: () => resendLast(ch.name, id, false),
             }, "\u2713")
             : false,
-        h("button", { class: "btn icon", title: `Remove ${shown} from #${ch.name}`, "aria-label": `Remove ${shown} from #${ch.name}`, onclick: () => removeMember(ch.name, id) }, "×"));
+        h("button", {
+          class: "btn icon", title: `${shown}'s settings in #${ch.name}`,
+          "aria-label": `${shown}'s settings in #${ch.name}`,
+          onclick: () => openMemberSettings(ch.name, id, shown),
+        }, "\u2699"));
     }))
     : h("p", { class: "muted small" }, "No members yet. Only members can post here and receive what is posted."));
 }
@@ -1487,10 +1491,57 @@ async function addMember(channel, workerId, fromStart) {
   } catch (err) { handleError(err); }
 }
 
+// What a person can decide about one worker in one channel, in one place:
+// whether it may post a job the channel already has, and whether it stays.
+function openMemberSettings(channel, workerId, shown) {
+  const worker = state.workers.find((w) => w.worker_id === workerId) || {};
+  const repeats = h("input", { type: "checkbox", ...(worker.may_repeat ? { checked: true } : {}) });
+  const err = h("p", { class: "error", hidden: true });
+
+  const dlg = openDialog(`${shown} in #${channel}`, [
+    h("p", { class: "muted small mono truncate", title: workerId }, workerId),
+    h("label", { class: "check" }, repeats,
+      h("span", {},
+        h("span", { class: "strong" }, "Allow posting a job already here"),
+        h("span", { class: "hint" },
+          "Off, a job this channel already has is refused however it is written, so two "
+          + "workers watching the same board post it once between them. On, this worker "
+          + "posts it anyway - for one whose point is what it says about a job, a decision "
+          + "or a reason, because that is not the job again. Applies wherever this worker "
+          + "publishes, not only here."))),
+    err,
+    h("hr", {}),
+    h("button", {
+      class: "btn danger", type: "button",
+      onclick: async () => {
+        if (!confirm(`Remove ${shown} from #${channel}?\n\nIt stops receiving what is posted `
+          + "here and can no longer publish here. The worker itself is kept, and so is "
+          + "everything it has already posted.")) return;
+        await removeMember(channel, workerId);
+        dlg.close();
+      },
+    }, `Remove from #${channel}`),
+  ], [cancel(), h("button", { class: "btn primary", type: "submit" }, "Save")],
+    async (self) => {
+      try {
+        if (repeats.checked !== Boolean(worker.may_repeat)) {
+          await api("POST", `/api/workers/${enc(workerId)}/repeats`, { allowed: repeats.checked });
+        }
+        self.close();
+        await refreshAll();
+        renderMembers();
+      } catch (ex) {
+        if (ex.status === 401) return handleError(ex);
+        err.textContent = ex.message;
+        err.hidden = false;
+      }
+    });
+}
+
 async function removeMember(channel, workerId) {
   try {
     await api("DELETE", `/api/channels/${enc(channel)}/members/${enc(workerId)}`);
-    toast(`${workerId} left #${channel}`);
+    toast(`${workerName(workerId)} left #${channel}`);
     refreshAll();
   } catch (err) { handleError(err); }
 }
