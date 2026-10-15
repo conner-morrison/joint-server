@@ -33,6 +33,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
+from relay.reading import reading
 from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
 
 log = logging.getLogger("relay.pgstore")
@@ -355,8 +356,19 @@ def slugify(name: str) -> str:
 
 
 def _message(row: dict[str, Any]) -> dict[str, Any]:
-    return {"seq": row["seq"], "channel": row["channel"], "sender": row["sender"],
-            "body": row["body"], "ts": row["ts"]}
+    """A stored row as it is handed over.
+
+    `body` is what the publisher sent, untouched. `fields` is the server's
+    reading of it under one set of names, added only when there is something to
+    read: every worker would otherwise write that parser itself, and each would
+    get a slightly different answer from the same message.
+    """
+    message = {"seq": row["seq"], "channel": row["channel"], "sender": row["sender"],
+               "body": row["body"], "ts": row["ts"]}
+    read = reading(row["body"])
+    if read:
+        message["fields"] = read
+    return message
 
 
 class PgStore:

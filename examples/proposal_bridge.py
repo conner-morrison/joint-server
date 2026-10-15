@@ -384,7 +384,14 @@ class Bridge:
         work already drafted. Treating the second as the first would have
         proposal-writer write a proposal for the word "done".
         """
+        # The relay reads a posting once and hands the reading over with the
+        # message, under one set of names whoever published it. Preferred to
+        # reading it again here, because two parsers give two answers; the
+        # local one stays for a relay too old to send a reading at all.
         body = msg.get("body")
+        read = msg.get("fields")
+        if isinstance(read, dict) and read:
+            body = {**(body if isinstance(body, dict) else {}), **read}
         job = job_id_of(body)
         if job and isinstance(body, dict) and not body.get("jd") and not body.get("description"):
             return self.report(msg, job, body)

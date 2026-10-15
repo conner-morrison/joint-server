@@ -221,6 +221,45 @@ because some of them are code that cannot be edited today, and a deploy is no
 time for a pipeline to stop. The console marks them. Nothing new is ever given
 a token.
 
+## What a worker is handed
+
+A poll answers with the messages waiting in the worker's channels. Each is the
+body exactly as its publisher sent it, and, where there is something to read,
+the server's reading of it:
+
+```json
+{
+  "seq": 412, "channel": "jobs", "sender": "w-9f3c…",
+  "body": "Decision: apply\nJob title: Community Manager\n…",
+  "fields": {
+    "title": "Community Manager",
+    "url": "https://www.upwork.com/jobs/~0221",
+    "jobId": "~0221",
+    "decision": "apply",
+    "description": "PopsPhone is a launcher.",
+    "projectInfo": "Fixed price: $1,200\nDuration: 1 to 3 months",
+    "clientInfo": "Location: Italy\nPayment: verified",
+    "workHistory": "18 jobs posted, 72% hire rate",
+    "clientName": "Comunicazione",
+    "screeningQuestions": ["Why you?", "When can you start?"]
+  }
+}
+```
+
+One publisher sends a block of labelled text, another sends `job_title` and
+`client_name`, a third sends `title` and a nested client. Every worker that
+wants the parts of a posting would otherwise write that parser itself, and each
+would get a slightly different answer from the same message. The server reads
+it once and hands the reading to all of them, under one set of names, so a
+worker written against one publisher goes on working when the next spells
+things differently.
+
+`body` is never touched: what was published is what is stored and what is
+delivered. `fields` is an extra way of looking at it, offered beside it, and it
+is absent entirely when there is nothing to read - half a reading is worse than
+none, because it invites a worker to believe a field was missing when it was
+only unread.
+
 ## Being told about itself
 
 A poll answers with what is waiting in the worker's channels, and with anything

@@ -665,6 +665,70 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, got = await self.call("GET", f"/{ws}/messages", token=worker_id)
         self.assertEqual(len(got["notices"]), 1)
 
+    async def test_a_worker_is_handed_the_reading_as_well_as_the_body(self) -> None:
+        """A posting arrives as a block of labelled text. Every worker that
+        wants its parts would otherwise write that parser itself, and each
+        would get a slightly different answer from the same message."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "reader")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+
+        raw = ("Decision: apply\nJob title: Community Manager\n"
+               "Job link: https://www.upwork.com/jobs/~0221\nClient name: Comunicazione\n"
+               "Job description:\nPopsPhone is a launcher.\n"
+               "Project info:\nFixed price: $1,200\n"
+               "Client info:\nLocation: Italy\n"
+               "Work history:\n18 jobs posted\n"
+               "Screening questions:\n1. Why you?\n2. When can you start?")
+        await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": raw},
+                        token="hunter2")
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=who)
+        message = got["messages"][0]
+        # What was published is what is delivered, untouched.
+        self.assertEqual(message["body"], raw)
+        read = message["fields"]
+        self.assertEqual(read["title"], "Community Manager")
+        self.assertEqual(read["decision"], "apply")
+        self.assertEqual(read["clientName"], "Comunicazione")
+        self.assertEqual(read["projectInfo"], "Fixed price: $1,200")
+        self.assertEqual(read["clientInfo"], "Location: Italy")
+        self.assertEqual(read["workHistory"], "18 jobs posted")
+        self.assertEqual(read["screeningQuestions"], ["Why you?", "When can you start?"])
+        self.assertEqual(read["jobId"], "~0221")
+
+    async def test_a_publisher_that_sends_fields_is_read_the_same_way(self) -> None:
+        """One shape for every worker, so a consumer written against one
+        publisher goes on working when the next spells things differently."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "reader")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/messages",
+                        {"body": {"job_title": "Community Manager",
+                                  "job_url": "https://www.upwork.com/jobs/~0221",
+                                  "client_name": "Comunicazione",
+                                  "questions": ["Why you?"]}}, token="hunter2")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=who)
+        read = got["messages"][0]["fields"]
+        self.assertEqual(read["title"], "Community Manager")
+        self.assertEqual(read["clientName"], "Comunicazione")
+        self.assertEqual(read["screeningQuestions"], ["Why you?"])
+
+    async def test_nothing_to_read_means_no_reading_at_all(self) -> None:
+        """Half a reading is worse than none: it invites a worker to believe a
+        field was absent when it was only unread."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "reader")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": "just some words"},
+                        token="hunter2")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=who)
+        self.assertNotIn("fields", got["messages"][0])
+        self.assertEqual(got["messages"][0]["body"], "just some words")
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,

@@ -50,130 +50,13 @@ JD_KEYS = ("description", "jobDescription", "job_description", "jd", "snippet", 
            "details", "text")
 # What a worker called the job. Each writes what is natural to it, and one that
 # spells it job_title is not sending something less worth reading.
-TITLE_KEYS = ("title", "job_title", "jobTitle", "jobName", "job_name", "heading", "name",
-              "subject", "emailSubject")
-CLIENT_NAME_KEYS = ("client_name", "clientName")
-# What a client asks before reading a proposal. Optional, and the part of a
-# posting a proposal is judged on, so it is never one of the fields quietly
-# dropped for being too long to fit on a pill.
-QUESTION_KEYS = ("screeningQuestions", "screening_questions", "screening", "questions")
-# Sections a richer scraper sends alongside the posting. Each is shown under
-# its own heading rather than being left to the leftovers, which drop anything
-# longer than a pill - and these are all longer than a pill.
-SECTIONS = (("projectInfo", "Project"), ("project_info", "Project"),
-            ("clientInfo", "Client"), ("client_info", "Client"),
-            ("workHistory", "Work history"), ("work_history", "Work history"))
-
-
-def questions_in(body: dict[str, Any]) -> list[str]:
-    """The screening questions, however they were sent: a block of lines, or a
-    list. Numbering the publisher added is dropped, because it is numbered
-    again when it is shown and nobody wants "1. 1. How many years"."""
-    for key in QUESTION_KEYS:
-        said = body.get(key)
-        if isinstance(said, (list, tuple)):
-            lines = [str(item).strip() for item in said]
-        elif isinstance(said, str):
-            lines = said.splitlines()
-        else:
-            continue
-        found = [re.sub(r"^\s*(?:\d+[.)]|[-*\u2022])\s*", "", line).strip() for line in lines]
-        found = [line for line in found if line]
-        if found:
-            return found
-    return []
-
-# A worker may send a job as a block of labelled text rather than as fields:
-# "Job title: …" on one line, "Job description:" and then the posting. It is
-# the same job, said differently, and reading the labels is all it takes to
-# show it the way any other job is shown.
-#
-# Only these labels start a field. A job description is full of lines like
-# "Community Engagement: identify niche communities", and treating every
-# colon as a label would chop the description into nonsense.
-LABELS = (
-    (("job title", "title"), "title"),
-    (("job link", "job url", "link", "url"), "url"),
-    (("job description", "description", "jd"), "description"),
-    (("screening questions", "screening question", "screening", "questions"),
-     "screeningQuestions"),
-    (("project info", "project details", "project"), "projectInfo"),
-    (("client info", "client details", "about the client"), "clientInfo"),
-    (("work history", "client history", "history", "hire history"), "workHistory"),
-    (("client name", "client"), "clientName"),
-    (("decision",), "decision"),
-    (("reason", "why"), "reason"),
-    (("project id", "projectid"), "projectId"),
-    (("job id", "jobid"), "jobId"),
-    (("budget", "rate"), "budget"),
-    (("published",), "published"),
-    (("posted",), "posted"),
-    (("name", "full name", "contact", "lead"), "name"),
-    (("headline",), "headline"),
-    (("role", "position"), "role"),
-    (("company", "organisation", "organization", "employer"), "company"),
-    (("location", "based in", "country"), "location"),
-    (("profile", "linkedin", "linkedin url", "profile url"), "profile"),
-    (("email", "e-mail"), "email"),
-    (("phone", "mobile"), "phone"),
-    (("industry",), "industry"),
-    (("connections",), "connections"),
-    (("notes", "note", "about"), "notes"),
-    (("status",), "status"),
-    (("score", "fit"), "score"),
+# Reading a posting is not formatting one, and two copies of the reading would
+# drift apart. The notification uses the same reading every worker is handed.
+from relay.reading import (
+    CLIENT_NAME_KEYS, QUESTION_KEYS, SECTIONS, TITLE_KEYS,
+    labelled, questions_in, title_of,
 )
-LABEL_OF = {said: key for names, key in LABELS for said in names}
-# A section runs until the next section begins. Its own lines are often
-# "Key: value" too - "Location: Italy" inside a client's details - and those
-# are part of the section, not the start of a new field. Only a section-level
-# label may interrupt one.
-SECTION_KEYS = frozenset({"description", "projectInfo", "clientInfo", "workHistory",
-                          "screeningQuestions"})
-WEAK_LABELS = frozenset({"name", "headline", "role", "company", "location", "profile",
-                         "email", "phone", "industry", "connections", "notes",
-                         "status", "score"})
-LABEL_MAX = 24                            # characters before the colon
 
-
-def labelled(text: Any) -> dict[str, Any] | None:
-    """A job written as labelled lines, read back as fields.
-
-    A label only counts the first time it appears: a description that happens
-    to say "Reason:" partway through is still the description.
-    """
-    if not isinstance(text, str) or ":" not in text:
-        return None
-    # A worker that encoded its text once too often sends the newlines as two
-    # characters, so the whole job is one line and none of the labels after the
-    # first can be seen. Reading it as it was meant costs one replacement.
-    if "\n" not in text and "\\n" in text:
-        text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
-    found: dict[str, Any] = {}
-    lead: list[str] = []
-    current: str | None = None
-    for line in text.splitlines():
-        at = line.find(":")
-        key = None
-        if 0 < at <= LABEL_MAX:
-            key = LABEL_OF.get(line[:at].strip().lower())
-            if key in found or (current in SECTION_KEYS and key in WEAK_LABELS):
-                key = None                # said once; after that it is prose
-        if key:
-            current = key
-            found[key] = line[at + 1:].strip()
-        elif current:
-            found[current] = f"{found[current]}\n{line}"
-        else:
-            lead.append(line)
-    if len(found) < 2:
-        return None
-    for key in found:
-        found[key] = found[key].strip()
-    # Anything said before the first label is the posting speaking for itself.
-    said = "\n".join(lead).strip()
-    if said and not found.get("description"):
-        found["description"] = said
-    return found
 INVITATION_WORDS = ("invit", "interview", "asked you to apply", "wants to interview")
 
 # Sent when a bot is registered. It is the test as well as the greeting: if
@@ -331,14 +214,6 @@ def leftovers(body: dict[str, Any]) -> list[str]:
         if len(said) >= LEFTOVER_MAX:
             break
     return said
-
-
-def title_of(body: dict[str, Any]) -> str:
-    for key in TITLE_KEYS:
-        said = body.get(key)
-        if isinstance(said, str) and said.strip():
-            return said.strip()
-    return ""
 
 
 def client_of(body: dict[str, Any]) -> dict[str, Any]:
