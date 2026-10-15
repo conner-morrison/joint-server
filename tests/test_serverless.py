@@ -673,6 +673,8 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
         who = await self.enrol(ws, "reader")
         await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/reads-jobs", {"reads": True},
+                        token="hunter2")
 
         raw = ("Decision: apply\nJob title: Community Manager\n"
                "Job link: https://www.upwork.com/jobs/~0221\nClient name: Comunicazione\n"
@@ -705,6 +707,8 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
         who = await self.enrol(ws, "reader")
         await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/reads-jobs", {"reads": True},
+                        token="hunter2")
         await self.call("POST", f"/{ws}/api/channels/jobs/messages",
                         {"body": {"job_title": "Community Manager",
                                   "job_url": "https://www.upwork.com/jobs/~0221",
@@ -716,6 +720,50 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read["clientName"], "Comunicazione")
         self.assertEqual(read["screeningQuestions"], ["Why you?"])
 
+    async def test_a_channel_is_not_read_as_jobs_unless_it_says_so(self) -> None:
+        """A channel carrying replies, or leads, or anything else is not a
+        channel of job postings, and reading one into job-shaped parts would be
+        this server deciding what someone else's channel is for."""
+        ws = await self.workspace()
+        for channel in ("jobs", "github"):
+            await self.call("POST", f"/{ws}/api/channels", {"name": channel}, token="hunter2")
+        who = await self.enrol(ws, "reader")
+        for channel in ("jobs", "github"):
+            await self.call("PUT", f"/{ws}/api/channels/{channel}/members/{who}", {},
+                            token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/reads-jobs", {"reads": True},
+                        token="hunter2")
+
+        raw = "Job title: Community Manager\nJob link: https://www.upwork.com/jobs/~0221"
+        for channel in ("jobs", "github"):
+            await self.call("POST", f"/{ws}/api/channels/{channel}/messages", {"body": raw},
+                            token="hunter2")
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=who)
+        read = {m["channel"]: m for m in got["messages"]}
+        self.assertIn("fields", read["jobs"])
+        self.assertNotIn("fields", read["github"], "a channel that did not ask was read anyway")
+        # Both still carry exactly what was published.
+        self.assertEqual(read["github"]["body"], raw)
+        self.assertEqual(read["jobs"]["body"], raw)
+
+    async def test_it_can_be_turned_off_again(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "reader")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        for reads in (True, False):
+            status, said = await self.call("POST", f"/{ws}/api/channels/jobs/reads-jobs",
+                                           {"reads": reads}, token="hunter2")
+            self.assertEqual((status, said["reads_jobs"]), (200, reads))
+        await self.call("POST", f"/{ws}/api/channels/jobs/messages",
+                        {"body": "Job title: A job\nJob link: https://www.upwork.com/jobs/~0222"},
+                        token="hunter2")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=who)
+        self.assertNotIn("fields", got["messages"][0])
+        _, channels = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+        self.assertFalse(channels[0]["reads_jobs"])
+
     async def test_nothing_to_read_means_no_reading_at_all(self) -> None:
         """Half a reading is worse than none: it invites a worker to believe a
         field was absent when it was only unread."""
@@ -723,6 +771,8 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
         who = await self.enrol(ws, "reader")
         await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/reads-jobs", {"reads": True},
+                        token="hunter2")
         await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": "just some words"},
                         token="hunter2")
         _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=who)

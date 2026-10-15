@@ -1147,6 +1147,17 @@ function renderChannelHead() {
     h("div", { class: "grow" },
       h("h1", {}, h("span", { class: "hash" }, "#"), ch.name),
       h("p", {}, ch.description || "No description", ` · ${ch.members.length} member${ch.members.length === 1 ? "" : "s"}, ${online} online`)),
+    h("label", { class: "check inline",
+                 title: "Off, a body reaches workers exactly as its publisher wrote it. On, the "
+                      + "server also reads it into parts - title, client, work history, screening "
+                      + "questions - so every worker gets the same answer instead of parsing it "
+                      + "itself. For a channel of job postings; leave it off for one carrying "
+                      + "replies or anything else." },
+      h("input", {
+        type: "checkbox", ...(ch.reads_jobs ? { checked: true } : {}),
+        onchange: (e) => setReadsJobs(ch.name, e.target.checked),
+      }),
+      h("span", { class: "muted small" }, "Read as job postings")),
     h("button", { class: "btn danger", onclick: () => removeChannel(ch.name) }, "Delete channel"));
 }
 
@@ -1563,6 +1574,15 @@ async function removeMember(channel, workerId) {
     await api("DELETE", `/api/channels/${enc(channel)}/members/${enc(workerId)}`);
     toast(`${workerName(workerId)} left #${channel}`);
     refreshAll();
+  } catch (err) { handleError(err); }
+}
+
+async function setReadsJobs(channel, reads) {
+  try {
+    await api("POST", `/api/channels/${enc(channel)}/reads-jobs`, { reads });
+    toast(reads ? `#${channel} is read as job postings`
+      : `#${channel} is passed on exactly as written`);
+    await refreshAll();
   } catch (err) { handleError(err); }
 }
 

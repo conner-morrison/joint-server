@@ -100,6 +100,10 @@ class RepeatsIn(BaseModel):
     allowed: bool
 
 
+class ReadsJobsIn(BaseModel):
+    reads: bool
+
+
 class MemberRepeatsIn(BaseModel):
     """None puts the question back to the worker's own setting, which is not
     the same as answering no."""
@@ -516,6 +520,20 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         if not await scoped.remove_channel(name):
             raise HTTPException(404, f"no channel {name!r}")
         return {"removed": True}
+
+    @app.post("/{ws}/api/channels/{name}/reads-jobs")
+    async def set_reads_jobs(name: str, body: ReadsJobsIn,
+                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Whether what is posted here is read as a job posting.
+
+        Off, a body is handed to workers exactly as its publisher wrote it. On,
+        the server reads it into parts as well, so every worker gets the same
+        answer rather than writing that parser itself. Per channel, because a
+        channel carrying replies or leads is not a channel of job postings.
+        """
+        if not await scoped.set_reads_jobs(name, body.reads):
+            raise HTTPException(404, f"no channel {name!r}")
+        return {"channel": name, "reads_jobs": body.reads}
 
     @app.put("/{ws}/api/channels/{name}/members/{worker_id}")
     async def add_member(name: str, worker_id: str, body: JoinIn | None = None,

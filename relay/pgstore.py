@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS channels (
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     created_at  DOUBLE PRECISION NOT NULL,
+    -- Whether what is posted here is read as a job posting and handed to
+    -- workers in parts. A channel carrying something else - replies, leads,
+    -- anything - is left exactly as its publishers wrote it.
+    reads_jobs  BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (workspace, name)
 );
 
@@ -365,9 +369,13 @@ def _message(row: dict[str, Any]) -> dict[str, Any]:
     """
     message = {"seq": row["seq"], "channel": row["channel"], "sender": row["sender"],
                "body": row["body"], "ts": row["ts"]}
-    read = reading(row["body"])
-    if read:
-        message["fields"] = read
+    # Only where the channel says what it carries is a job posting. Elsewhere a
+    # body is whatever its publisher meant by it, and reading it into job-shaped
+    # parts would be this server deciding what someone else's channel is for.
+    if row.get("reads_jobs"):
+        read = reading(row["body"])
+        if read:
+            message["fields"] = read
     return message
 
 
@@ -419,6 +427,7 @@ class PgStore:
         await self._widen_dedupe()
         await self._retire_tokens()
         await self._read_job_links()
+        await self._find_job_channels()
 
     async def _widen_dedupe(self) -> None:
         """Move an existing database from per-sender dedupe to per-workspace.
@@ -483,6 +492,8 @@ class PgStore:
                 # as decided no.
                 await conn.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS "
                                    "may_repeat BOOLEAN")
+                await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS "
+                                   "reads_jobs BOOLEAN NOT NULL DEFAULT FALSE")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_job "
                                    "ON messages(workspace, channel, job_key)")
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
@@ -503,6 +514,31 @@ class PgStore:
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
             log.warning("could not read job links from stored messages (%s); a job posted "
                         "before now may get through once more", type(exc).__name__)
+
+    async def _find_job_channels(self) -> None:
+        """Turn the reading on where it is plainly already wanted.
+
+        A channel is read as job postings only if it says so, and nothing says
+        so on an existing database. Rather than leave a working channel
+        suddenly handing out bodies and nothing else, one is switched on where
+        it already holds a posting with an Upwork job link in it - which is a
+        job channel by any reading, and is not true of a channel carrying
+        replies, leads, or anything else.
+
+        Once only: a channel switched off by hand stays off, because this runs
+        against channels that have never been asked.
+        """
+        try:
+            async with self.pool.connection() as conn:
+                await conn.execute("""
+                    UPDATE channels c SET reads_jobs = TRUE
+                     WHERE c.reads_jobs = FALSE
+                       AND EXISTS (SELECT 1 FROM messages m
+                                    WHERE m.workspace = c.workspace AND m.channel = c.name
+                                      AND m.job_key IS NOT NULL)""")
+        except Exception as exc:                 # noqa: BLE001 - reported, never fatal
+            log.warning("could not work out which channels carry job postings (%s); "
+                        "turn the reading on by hand", type(exc).__name__)
 
     async def _retire_tokens(self) -> None:
         """Move an existing database to workers identified by an id.
@@ -897,9 +933,22 @@ class WorkspaceStore:
         return await self.store._one("SELECT 1 FROM channels WHERE workspace = %s AND name = %s",
                                      (self.slug, name)) is not None
 
+    async def set_reads_jobs(self, channel: str, reads: bool) -> bool:
+        """Whether what is posted here is read as a job posting.
+
+        Off, a body is whatever its publisher meant by it and is handed over
+        exactly as written. On, the server reads it into parts as well, so
+        every worker gets the same answer instead of writing that parser
+        itself. Per channel, because a channel carrying replies or leads is
+        not a channel of job postings and should not be read as one.
+        """
+        return await self.store._run(
+            "UPDATE channels SET reads_jobs = %s WHERE workspace = %s AND name = %s",
+            (reads, self.slug, channel)) > 0
+
     async def list_channels(self) -> list[dict[str, Any]]:
         rows = await self.store._all("""
-            SELECT c.name, c.description, c.created_at,
+            SELECT c.name, c.description, c.created_at, c.reads_jobs,
                    (SELECT COUNT(*) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS messages,
                    (SELECT MAX(seq) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS last_seq
               FROM channels c WHERE c.workspace = %s ORDER BY c.name""", (self.slug,))
@@ -1369,17 +1418,21 @@ class WorkspaceStore:
     async def messages_after(self, channel: str, after: int, *, limit: int = 200,
                              exclude_sender: str | None = None) -> list[dict[str, Any]]:
         rows = await self.store._all("""
-            SELECT seq, channel, sender, body, ts FROM messages
-             WHERE workspace = %s AND channel = %s AND seq > %s AND sender <> %s
-             ORDER BY seq LIMIT %s""", (self.slug, channel, after, exclude_sender or "", limit))
+            SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs
+              FROM messages m JOIN channels c
+                ON c.workspace = m.workspace AND c.name = m.channel
+             WHERE m.workspace = %s AND m.channel = %s AND m.seq > %s AND m.sender <> %s
+             ORDER BY m.seq LIMIT %s""", (self.slug, channel, after, exclude_sender or "", limit))
         return [_message(r) for r in rows]
 
     async def messages_before(self, channel: str, before: int, *, limit: int = 100) -> list[dict[str, Any]]:
         """The newest `limit` messages below `before`, oldest first."""
         rows = await self.store._all("""
-            SELECT seq, channel, sender, body, ts FROM messages
-             WHERE workspace = %s AND channel = %s AND seq < %s
-             ORDER BY seq DESC LIMIT %s""", (self.slug, channel, before, limit))
+            SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs
+              FROM messages m JOIN channels c
+                ON c.workspace = m.workspace AND c.name = m.channel
+             WHERE m.workspace = %s AND m.channel = %s AND m.seq < %s
+             ORDER BY m.seq DESC LIMIT %s""", (self.slug, channel, before, limit))
         return [_message(r) for r in reversed(rows)]
 
     async def waiting_for(self, worker_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
@@ -1387,8 +1440,9 @@ class WorkspaceStore:
         oldest first, plus anything asked for again by hand. One query,
         because a poll should be one round trip."""
         rows = await self.store._all("""
-            SELECT m.seq, m.channel, m.sender, m.body, m.ts
+            SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs
               FROM messages m
+              JOIN channels c ON c.workspace = m.workspace AND c.name = m.channel
               JOIN members mem
                 ON mem.workspace = m.workspace AND mem.channel = m.channel
              WHERE m.workspace = %s AND mem.worker_id = %s AND m.sender <> %s
@@ -1411,8 +1465,11 @@ class WorkspaceStore:
     async def message_at(self, channel: str, seq: int) -> dict[str, Any] | None:
         """One message, by where it sits in its channel."""
         row = await self.store._one(
-            "SELECT seq, channel, sender, body, ts FROM messages "
-            " WHERE workspace = %s AND channel = %s AND seq = %s", (self.slug, channel, seq))
+            "SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs "
+            "  FROM messages m JOIN channels c "
+            "    ON c.workspace = m.workspace AND c.name = m.channel "
+            " WHERE m.workspace = %s AND m.channel = %s AND m.seq = %s",
+            (self.slug, channel, seq))
         return _message(row) if row else None
 
     async def send_again(self, channel: str, worker_id: str, seq: int) -> bool:

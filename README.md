@@ -260,6 +260,16 @@ is absent entirely when there is nothing to read - half a reading is worse than
 none, because it invites a worker to believe a field was missing when it was
 only unread.
 
+**A channel is read this way only if it says so**, because a channel carrying
+replies, or leads, or anything else is not a channel of job postings, and
+reading one into job-shaped parts would be this server deciding what somebody
+else's channel is for. It is a checkbox on the channel, **Read as job
+postings**, and off everywhere until it is ticked:
+
+```
+POST /{ws}/api/channels/{channel}/reads-jobs   {"reads": true}
+```
+
 ## Being told about itself
 
 A poll answers with what is waiting in the worker's channels, and with anything
