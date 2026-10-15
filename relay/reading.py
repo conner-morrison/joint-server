@@ -95,7 +95,16 @@ SECTION_KEYS = frozenset({"description", "projectInfo", "clientInfo", "workHisto
 WEAK_LABELS = frozenset({"name", "headline", "role", "company", "location", "profile",
                          "email", "phone", "industry", "connections", "notes",
                          "status", "score"})
-LABEL_MAX = 24                            # characters before the colon
+# A heading often counts what it is about - "Work history (50 past contracts):"
+# - so what is in brackets is set aside before the name is looked up, and the
+# limit is generous enough to let a counted heading through. It is still only a
+# label if the name that remains is one.
+LABEL_MAX = 60                            # characters before the colon
+COUNTED = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def label_of(head: str) -> str | None:
+    return LABEL_OF.get(COUNTED.sub("", head.strip()).strip().lower())
 
 
 def labelled(text: Any) -> dict[str, Any] | None:
@@ -118,7 +127,7 @@ def labelled(text: Any) -> dict[str, Any] | None:
         at = line.find(":")
         key = None
         if 0 < at <= LABEL_MAX:
-            key = LABEL_OF.get(line[:at].strip().lower())
+            key = label_of(line[:at])
             if key in found or (current in SECTION_KEYS and key in WEAK_LABELS):
                 key = None                # said once; after that it is prose
         if key:

@@ -346,6 +346,63 @@ class SectionTest(unittest.TestCase):
         self.assertEqual(said.count("Fixed price: $1,200"), 1)
 
 
+class CountedHeadingTest(unittest.TestCase):
+    """A heading that counts what it is about.
+
+    "Work history (50 past contracts):" is the heading of a section, but the
+    words before the colon are not the name of one. Read strictly, it is not a
+    label at all - so the section never began, and fifty contracts were
+    appended to whatever section happened to be open above it, which was the
+    client's details.
+    """
+
+    RAW = ("Job title: Senior AWS Backend Engineer\n"
+           "Client info:\n"
+           "  Client Rank: Excellent\n"
+           "  Payment method verified: verified\n"
+           "  total spent: $1777783\n"
+           "  country: United States\n"
+           "Work history (50 past contracts):\n"
+           "  #1 Senior AWS Backend Engineer (Node.js)- US Only (no agencies)\n"
+           "      Jul 2026 - Oct 2026 | 269hrs | $84.30/hr | billed $22,677.01\n"
+           "      to freelancer 5: Jeremy was a great addition to this project.\n"
+           "Screening questions:\n1. Why you?")
+
+    def test_the_section_begins_where_its_heading_is(self) -> None:
+        read = labelled(self.RAW)
+        self.assertIn("workHistory", read)
+        self.assertIn("#1 Senior AWS Backend Engineer", read["workHistory"])
+
+    def test_it_does_not_land_in_the_section_above(self) -> None:
+        read = labelled(self.RAW)
+        self.assertNotIn("Work history", read["clientInfo"])
+        self.assertNotIn("#1 Senior", read["clientInfo"])
+        self.assertNotIn("billed $22,677.01", read["clientInfo"])
+
+    def test_the_client_keeps_its_own_lines(self) -> None:
+        read = labelled(self.RAW)
+        for line in ("Client Rank: Excellent", "Payment method verified: verified",
+                     "total spent: $1777783", "country: United States"):
+            self.assertIn(line, read["clientInfo"], line)
+
+    def test_a_review_inside_a_section_is_not_a_heading(self) -> None:
+        """Work history is full of "to freelancer 5: ..." lines. They end
+        nothing; they are what the section is."""
+        read = labelled(self.RAW)
+        self.assertIn("to freelancer 5: Jeremy was a great addition",
+                      read["workHistory"])
+        self.assertIn("1. Why you?", read["screeningQuestions"])
+
+    def test_a_count_does_not_make_any_phrase_a_heading(self) -> None:
+        """Only the name that remains decides. Setting the brackets aside must
+        not turn an ordinary sentence into the start of a section."""
+        read = labelled("Job title: A job\nJob description:\n"
+                        "Delivery (two weeks): we need this done by the end of the month.\n"
+                        "Notes on scope (read carefully): keep it small.")
+        self.assertIn("Delivery (two weeks): we need this done", read["description"])
+        self.assertIn("Notes on scope (read carefully): keep it small.", read["description"])
+
+
 class FitTest(unittest.TestCase):
     def test_text_that_fits_is_left_alone(self) -> None:
         self.assertEqual(fit("short", 100), ("short", ""))

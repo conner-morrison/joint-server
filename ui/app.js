@@ -1720,7 +1720,16 @@ const SECTION_KEYS = new Set(["description", "projectInfo", "clientInfo", "workH
 const WEAK_LABELS = new Set(["name", "headline", "role", "company", "location", "profile",
                              "email", "phone", "industry", "connections", "notes",
                              "status", "score"]);
-const LABEL_MAX = 24;                     // characters before the colon
+// A heading often counts what it is about - "Work history (50 past contracts):"
+// - so what is in brackets is set aside before the name is looked up, and the
+// limit is generous enough to let a counted heading through. It is still only
+// a label if the name that remains is one.
+const LABEL_MAX = 60;                     // characters before the colon
+const COUNTED = /\s*\([^)]*\)\s*$/;
+
+function labelOf(head) {
+  return LABEL_OF.get(head.replace(COUNTED, "").trim().toLowerCase());
+}
 
 function labelled(text) {
   if (typeof text !== "string" || !text.includes(":")) return null;
@@ -1737,7 +1746,7 @@ function labelled(text) {
     const at = line.indexOf(":");
     // A label counts the first time it appears and not after: a description
     // that happens to say "Reason:" partway through is still the description.
-    let key = at > 0 && at <= LABEL_MAX ? LABEL_OF.get(line.slice(0, at).trim().toLowerCase()) : null;
+    let key = at > 0 && at <= LABEL_MAX ? labelOf(line.slice(0, at)) : null;
     if (key && found[key] !== undefined) key = null;
     if (key && SECTION_KEYS.has(current) && WEAK_LABELS.has(key)) key = null;
     if (key) {
@@ -2150,7 +2159,7 @@ function asRows(said) {
   const rows = [];
   for (const line of lines) {
     const at = line.indexOf(":");
-    if (at <= 0 || at > 24) return null;
+    if (at <= 0 || at > 32) return null;
     const value = line.slice(at + 1).trim();
     if (!value) return null;
     rows.push([line.slice(0, at).trim(), value]);
