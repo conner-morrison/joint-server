@@ -125,6 +125,9 @@ LABELS = (
     (("job description", "description", "jd"), "description"),
     (("screening questions", "screening question", "screening", "questions"),
      "screeningQuestions"),
+    (("project info", "project details", "project"), "projectInfo"),
+    (("client info", "client details", "about the client"), "clientInfo"),
+    (("work history", "client history", "history", "hire history"), "workHistory"),
     (("client name", "client"), "clientName"),
     (("decision",), "decision"),
     (("reason", "why"), "reason"),
@@ -134,6 +137,15 @@ LABELS = (
     (("posted",), "posted"),
 )
 LABEL_OF = {said: key for names, key in LABELS for said in names}
+# A section runs until the next section begins. Its own lines are often
+# "Key: value" too - "Location: Italy" inside a client's details - and those
+# are part of the section, not the start of a new field. Only a section-level
+# label may interrupt one.
+SECTION_KEYS = frozenset({"description", "projectInfo", "clientInfo", "workHistory",
+                          "screeningQuestions"})
+WEAK_LABELS = frozenset({"name", "headline", "role", "company", "location", "profile",
+                         "email", "phone", "industry", "connections", "notes",
+                         "status", "score"})
 LABEL_MAX = 24                            # characters before the colon
 
 
@@ -155,7 +167,7 @@ def labelled(text: Any) -> dict[str, Any] | None:
         key = None
         if 0 < at <= LABEL_MAX:
             key = LABEL_OF.get(line[:at].strip().lower())
-            if key in found:
+            if key in found or (current in SECTION_KEYS and key in WEAK_LABELS):
                 key = None
         if key:
             current = key
@@ -196,6 +208,12 @@ def fields(body: Any) -> Any:
 # answer them is not read, so these go to proposal-writer with the posting
 # rather than being left behind as a field nobody mapped.
 QUESTION_KEYS = ("screeningQuestions", "screening_questions", "screening", "questions")
+# Sections a richer scraper sends with the posting. What a client has hired for
+# before, and what they say about themselves, is what a proposal is written
+# against - so it goes with the job rather than being left behind.
+SECTIONS = (("projectInfo", "Project"), ("project_info", "Project"),
+            ("clientInfo", "About the client"), ("client_info", "About the client"),
+            ("workHistory", "Client work history"), ("work_history", "Client work history"))
 
 
 def questions_in(body: Any) -> list[str]:
@@ -251,6 +269,14 @@ def as_jd(body: Any) -> str:
         if isinstance(body.get(key), str) and body[key].strip():
             lines += ["", body[key].strip()]
             break
+
+    seen = set()
+    for key, heading in SECTIONS:
+        said = body.get(key)
+        if not isinstance(said, str) or not said.strip() or heading in seen:
+            continue
+        seen.add(heading)
+        lines += ["", f"{heading}:", said.strip()]
 
     asked = questions_in(body)
     if asked:

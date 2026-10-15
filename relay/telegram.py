@@ -57,6 +57,12 @@ CLIENT_NAME_KEYS = ("client_name", "clientName")
 # posting a proposal is judged on, so it is never one of the fields quietly
 # dropped for being too long to fit on a pill.
 QUESTION_KEYS = ("screeningQuestions", "screening_questions", "screening", "questions")
+# Sections a richer scraper sends alongside the posting. Each is shown under
+# its own heading rather than being left to the leftovers, which drop anything
+# longer than a pill - and these are all longer than a pill.
+SECTIONS = (("projectInfo", "Project"), ("project_info", "Project"),
+            ("clientInfo", "Client"), ("client_info", "Client"),
+            ("workHistory", "Work history"), ("work_history", "Work history"))
 
 
 def questions_in(body: dict[str, Any]) -> list[str]:
@@ -91,6 +97,9 @@ LABELS = (
     (("job description", "description", "jd"), "description"),
     (("screening questions", "screening question", "screening", "questions"),
      "screeningQuestions"),
+    (("project info", "project details", "project"), "projectInfo"),
+    (("client info", "client details", "about the client"), "clientInfo"),
+    (("work history", "client history", "history", "hire history"), "workHistory"),
     (("client name", "client"), "clientName"),
     (("decision",), "decision"),
     (("reason", "why"), "reason"),
@@ -114,6 +123,15 @@ LABELS = (
     (("score", "fit"), "score"),
 )
 LABEL_OF = {said: key for names, key in LABELS for said in names}
+# A section runs until the next section begins. Its own lines are often
+# "Key: value" too - "Location: Italy" inside a client's details - and those
+# are part of the section, not the start of a new field. Only a section-level
+# label may interrupt one.
+SECTION_KEYS = frozenset({"description", "projectInfo", "clientInfo", "workHistory",
+                          "screeningQuestions"})
+WEAK_LABELS = frozenset({"name", "headline", "role", "company", "location", "profile",
+                         "email", "phone", "industry", "connections", "notes",
+                         "status", "score"})
 LABEL_MAX = 24                            # characters before the colon
 
 
@@ -138,7 +156,7 @@ def labelled(text: Any) -> dict[str, Any] | None:
         key = None
         if 0 < at <= LABEL_MAX:
             key = LABEL_OF.get(line[:at].strip().lower())
-            if key in found:
+            if key in found or (current in SECTION_KEYS and key in WEAK_LABELS):
                 key = None                # said once; after that it is prose
         if key:
             current = key
@@ -271,7 +289,7 @@ def fit(text: str, budget: int) -> tuple[str, str]:
 # Everything the message already says somewhere, so the rest can be added
 # without repeating any of it.
 SHOWN = ({key for _, key in FACTS} | set(JD_KEYS) | set(LINK_KEYS) | set(TITLE_KEYS)
-         | set(QUESTION_KEYS)
+         | set(QUESTION_KEYS) | {key for key, _ in SECTIONS}
          | set(CLIENT_NAME_KEYS) | {"client", "type", "source", "links", "urls", "index",
                                     "emailId", "receivedAt", "id"}
          | {"client" + key[0].upper() + key[1:] for _, key in CLIENT_FIELDS})
@@ -434,6 +452,16 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
                 if key not in SHOWN and isinstance(value, str)
                 and len(value.strip()) > LEFTOVER_LONG and not http_url(value)]
         text = max(said, key=len, default="")
+    # Each under its own heading, in the order a person reads a posting: what
+    # the work is, who is asking, what they have done before, what they want
+    # answered.
+    seen: set[str] = set()
+    for key, heading in SECTIONS:
+        said = body.get(key)
+        if not isinstance(said, str) or not said.strip() or heading in seen:
+            continue
+        seen.add(heading)
+        text = f"{text}\n\n{heading}:\n{said.strip()}".strip()
     if asked:
         # Added under the posting's own words rather than above them, and
         # carried by the same continuation: a job with ten questions is one

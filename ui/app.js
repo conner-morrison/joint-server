@@ -1665,6 +1665,9 @@ const LABELS = [
   [["job link", "job url", "link", "url"], "url"],
   [["job description", "description", "jd"], "description"],
   [["screening questions", "screening question", "screening", "questions"], "screeningQuestions"],
+  [["project info", "project details", "project"], "projectInfo"],
+  [["client info", "client details", "about the client"], "clientInfo"],
+  [["work history", "client history", "history", "hire history"], "workHistory"],
   [["client name", "client"], "clientName"],
   [["decision"], "decision"],
   [["reason", "why"], "reason"],
@@ -1688,6 +1691,15 @@ const LABELS = [
   [["score", "fit"], "score"],
 ];
 const LABEL_OF = new Map(LABELS.flatMap(([names, key]) => names.map((n) => [n, key])));
+// A section runs until the next section begins. Its own lines are often
+// "Key: value" too - "Location: Italy" inside a client's details - and those
+// are part of the section, not the start of a new field. Only a section-level
+// label may interrupt one.
+const SECTION_KEYS = new Set(["description", "projectInfo", "clientInfo", "workHistory",
+                              "screeningQuestions"]);
+const WEAK_LABELS = new Set(["name", "headline", "role", "company", "location", "profile",
+                             "email", "phone", "industry", "connections", "notes",
+                             "status", "score"]);
 const LABEL_MAX = 24;                     // characters before the colon
 
 function labelled(text) {
@@ -1707,6 +1719,7 @@ function labelled(text) {
     // that happens to say "Reason:" partway through is still the description.
     let key = at > 0 && at <= LABEL_MAX ? LABEL_OF.get(line.slice(0, at).trim().toLowerCase()) : null;
     if (key && found[key] !== undefined) key = null;
+    if (key && SECTION_KEYS.has(current) && WEAK_LABELS.has(key)) key = null;
     if (key) {
       current = key;
       found[key] = line.slice(at + 1).trim();
@@ -2106,6 +2119,25 @@ const LONG = 140;
 // short values as labelled pills, nested objects as blocks, long text behind a
 // button of its own. The job card uses this for its leftovers and the plain
 // card uses it for everything, so an unknown field looks the same either way.
+// A section written as "Key: value" lines is a set of facts, not a paragraph,
+// and reads far better as rows than as a wall behind a button. Deliberately
+// strict: a short key, a colon, and most of the lines agreeing, so a
+// description that happens to say "Note: ..." is not mistaken for a table.
+function asRows(said) {
+  if (typeof said !== "string" || !said.includes("\n")) return null;
+  const lines = said.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return null;
+  const rows = [];
+  for (const line of lines) {
+    const at = line.indexOf(":");
+    if (at <= 0 || at > 24) return null;
+    const value = line.slice(at + 1).trim();
+    if (!value) return null;
+    rows.push([line.slice(0, at).trim(), value]);
+  }
+  return rows;
+}
+
 function laidOut(body, skip) {
   const pills = [];
   const blocks = [];
@@ -2130,6 +2162,14 @@ function laidOut(body, skip) {
     if (Array.isArray(value) && value.every((v) => !v || typeof v !== "object")) {
       const said = value.filter((v) => v !== null && v !== undefined && v !== "").join(", ");
       if (said) pills.push(h("span", { class: "fact" }, h("b", {}, humanise(key)), said));
+      continue;
+    }
+    const asFacts = asRows(value);
+    if (asFacts) {
+      blocks.push(h("div", { class: "client" },
+        h("div", { class: "client-head" }, humanise(key)),
+        h("dl", { class: "client-facts" }, asFacts.map(([k, v]) =>
+          h("div", { class: "client-row" }, h("dt", {}, k), h("dd", {}, v))))));
       continue;
     }
     if (value && typeof value === "object") {

@@ -285,6 +285,67 @@ class ScreeningQuestionTest(unittest.TestCase):
         self.assertIn("1. Why you?", said)
 
 
+class SectionTest(unittest.TestCase):
+    """A richer scraper sends the posting in parts: what the work is, who is
+    asking, what they have hired for before, what they want answered."""
+
+    RAW = ("Job title: Community Manager\n"
+           "Job link: https://www.upwork.com/jobs/~0221\n"
+           "Client name: Comunicazione\n"
+           "Job description:\nPopsPhone is a launcher.\n"
+           "Project info:\nFixed price: $1,200\nDuration: 1 to 3 months\n"
+           "Client info:\nLocation: Italy\nPayment: verified\n"
+           "Work history:\n18 jobs posted, 72% hire rate\n"
+           "Screening questions:\n1. Why you?")
+
+    def test_every_section_is_its_own_field(self) -> None:
+        read = labelled(self.RAW)
+        self.assertEqual(read["description"], "PopsPhone is a launcher.")
+        self.assertEqual(read["projectInfo"], "Fixed price: $1,200\nDuration: 1 to 3 months")
+        self.assertEqual(read["clientInfo"], "Location: Italy\nPayment: verified")
+        self.assertEqual(read["workHistory"], "18 jobs posted, 72% hire rate")
+        self.assertEqual(read["screeningQuestions"], "1. Why you?")
+
+    def test_a_section_keeps_its_own_key_value_lines(self) -> None:
+        """The subtle one. A section's lines are often "Key: value" as well -
+        "Location: Italy" inside a client's details - and those words are also
+        labels in their own right. Read as labels they end the section and
+        swallow the rest of it into a field of their own."""
+        read = labelled(self.RAW)
+        self.assertIn("Location: Italy", read["clientInfo"])
+        self.assertIn("Payment: verified", read["clientInfo"])
+        self.assertNotIn("location", read, "a section's own line started a new field")
+        self.assertNotIn("company", read)
+
+    def test_a_lead_still_reads_its_labels(self) -> None:
+        """The same words are real labels where no section is open, which is
+        how a lead is written."""
+        read = labelled("Name: Dana Whitfield\nRole: Head of Growth\n"
+                        "Company: Northwind\nLocation: Toronto")
+        self.assertEqual(read["name"], "Dana Whitfield")
+        self.assertEqual(read["company"], "Northwind")
+        self.assertEqual(read["location"], "Toronto")
+
+    def test_the_phone_gets_every_section_under_its_own_heading(self) -> None:
+        said = "\n".join(render(self.RAW, channel="jobs", source="vollna-scraper"))
+        for heading in ("Project:", "Client:", "Work history:", "Screening questions:"):
+            self.assertIn(heading, said, f"{heading} never arrived")
+        self.assertIn("Fixed price: $1,200", said)
+        self.assertIn("18 jobs posted, 72% hire rate", said)
+        # In the order a posting is read.
+        self.assertLess(said.index("PopsPhone"), said.index("Project:"))
+        self.assertLess(said.index("Work history:"), said.index("Screening questions:"))
+
+    def test_a_job_without_them_gains_no_empty_headings(self) -> None:
+        said = "\n".join(render({"title": "A job", "description": "Build it."}, channel="jobs"))
+        for heading in ("Project:", "Client:", "Work history:", "Screening questions:"):
+            self.assertNotIn(heading, said)
+
+    def test_a_section_is_not_also_listed_as_a_leftover(self) -> None:
+        said = "\n".join(render(self.RAW, channel="jobs"))
+        self.assertEqual(said.count("Fixed price: $1,200"), 1)
+
+
 class FitTest(unittest.TestCase):
     def test_text_that_fits_is_left_alone(self) -> None:
         self.assertEqual(fit("short", 100), ("short", ""))
