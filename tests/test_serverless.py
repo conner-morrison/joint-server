@@ -779,6 +779,118 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("fields", got["messages"][0])
         self.assertEqual(got["messages"][0]["body"], "just some words")
 
+    # --- who hears whom -----------------------------------------------------
+    async def line_of_work(self, ws: str) -> dict[str, str]:
+        """Three workers in one channel, as a line of work rather than a room."""
+        await self.call("POST", f"/{ws}/api/channels", {"name": "github"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who)
+               for who in ("writer", "repo-finder", "github-finder")}
+        for who in ids:
+            await self.call("PUT", f"/{ws}/api/channels/github/members/{ids[who]}", {},
+                            token="hunter2")
+            await self.call("GET", f"/{ws}/messages", token=ids[who])   # take the join notice
+        return ids
+
+    async def heard_by(self, ws: str, ids: dict[str, str]) -> dict[str, list[Any]]:
+        got = {}
+        for who, worker in ids.items():
+            _, said = await self.call("GET", f"/{ws}/messages?wait=1", token=worker)
+            got[who] = [m["body"] for m in said["messages"]]
+        return got
+
+    async def test_a_channel_is_a_room_until_something_is_said(self) -> None:
+        """Nothing changes for a channel nobody has routed: everything posted
+        reaches every member but the one that posted it."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": "a job"},
+                        token=ids["writer"])
+        got = await self.heard_by(ws, ids)
+        self.assertEqual(got["repo-finder"], ["a job"])
+        self.assertEqual(got["github-finder"], ["a job"])
+        self.assertEqual(got["writer"], [])
+
+    async def test_a_sender_with_a_route_reaches_only_who_is_named(self) -> None:
+        """The first route about a sender changes it from reaching everyone to
+        reaching those named. That is the point, and the thing to know before
+        making one."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        status, said = await self.call(
+            "PUT", f"/{ws}/api/channels/github/routes/{ids['writer']}/{ids['repo-finder']}",
+            token="hunter2")
+        self.assertEqual((status, said["reaches"]), (200, True))
+
+        await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": "a job"},
+                        token=ids["writer"])
+        got = await self.heard_by(ws, ids)
+        self.assertEqual(got["repo-finder"], ["a job"])
+        self.assertEqual(got["github-finder"], [], "a worker not named was sent it anyway")
+
+    async def test_each_sender_is_routed_on_its_own(self) -> None:
+        """A line of work: the job goes one way, the answer another, and the
+        answer to that somewhere else again."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        for sender, recipient in (("writer", "repo-finder"),
+                                  ("repo-finder", "github-finder"),
+                                  ("github-finder", "writer")):
+            await self.call(
+                "PUT", f"/{ws}/api/channels/github/routes/{ids[sender]}/{ids[recipient]}",
+                token="hunter2")
+
+        for who, body in (("writer", "a job"), ("repo-finder", "some repos"),
+                          ("github-finder", "the chosen urls")):
+            await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": body},
+                            token=ids[who])
+        got = await self.heard_by(ws, ids)
+        self.assertEqual(got["repo-finder"], ["a job"])
+        self.assertEqual(got["github-finder"], ["some repos"])
+        self.assertEqual(got["writer"], ["the chosen urls"])
+
+    async def test_a_route_can_be_taken_back(self) -> None:
+        """Removing the last route about a sender puts it back to reaching
+        everyone, rather than leaving it reaching nobody."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        path = f"/{ws}/api/channels/github/routes/{ids['writer']}/{ids['repo-finder']}"
+        await self.call("PUT", path, token="hunter2")
+        await self.call("DELETE", path, token="hunter2")
+        await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": "a job"},
+                        token=ids["writer"])
+        got = await self.heard_by(ws, ids)
+        self.assertEqual(got["repo-finder"], ["a job"])
+        self.assertEqual(got["github-finder"], ["a job"])
+
+    async def test_sending_one_message_by_hand_ignores_the_routes(self) -> None:
+        """Asking for a message to go to a worker is an act, not a rule, and
+        an act is honoured: otherwise a route would make a channel impossible
+        to repair from the console."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("PUT",
+                        f"/{ws}/api/channels/github/routes/{ids['writer']}/{ids['repo-finder']}",
+                        token="hunter2")
+        _, said = await self.call("POST", f"/{ws}/publish",
+                                  {"channel": "github", "body": "a job"}, token=ids["writer"])
+        await self.heard_by(ws, ids)
+
+        status, _ = await self.call(
+            "POST", f"/{ws}/api/channels/github/send/{ids['github-finder']}?seq={said['seq']}",
+            token="hunter2")
+        self.assertEqual(status, 200)
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["github-finder"])
+        self.assertEqual([m["body"] for m in got["messages"]], ["a job"])
+
+    async def test_the_console_shows_what_was_said(self) -> None:
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("PUT",
+                        f"/{ws}/api/channels/github/routes/{ids['writer']}/{ids['repo-finder']}",
+                        token="hunter2")
+        _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        self.assertEqual(routes, {ids["writer"]: [ids["repo-finder"]]})
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,

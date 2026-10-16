@@ -562,6 +562,27 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(404, f"{worker_id!r} is not in channel {name!r}")
         return {"channel": name, "worker_id": worker_id, "may_repeat": body.allowed}
 
+    @app.get("/{ws}/api/channels/{name}/routes")
+    async def list_routes(name: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """sender -> who it reaches here. A sender absent from this reaches
+        every member, which is what a channel does when nothing has been said
+        about it."""
+        return await scoped.routes_of(name)
+
+    @app.put("/{ws}/api/channels/{name}/routes/{sender}/{recipient}")
+    @app.delete("/{ws}/api/channels/{name}/routes/{sender}/{recipient}")
+    async def set_route(request: Request, name: str, sender: str, recipient: str,
+                        scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Whether what `sender` posts here reaches `recipient`.
+
+        The first route made about a sender changes it from reaching everyone
+        to reaching only who is named. It is not "also send to"; it is "send
+        to these".
+        """
+        on = request.method == "PUT"
+        await scoped.set_route(name, sender, recipient, on)
+        return {"channel": name, "sender": sender, "recipient": recipient, "reaches": on}
+
     @app.post("/{ws}/api/channels/{name}/skip/{who}")
     async def skip_backlog(name: str, who: str, bot: bool = False,
                            scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:

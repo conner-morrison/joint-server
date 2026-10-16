@@ -202,6 +202,24 @@ CREATE TABLE IF NOT EXISTS hooks (
     FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE
 );
 
+-- Who hears whom in a channel. A channel is normally a room: everything
+-- posted reaches every member. Some channels are a line of work instead, where
+-- one worker answers another and a third answers that, and handing all of it
+-- to all of them means each has to work out what is addressed to it.
+--
+-- A row says "what this sender posts here reaches this recipient". The rule is
+-- per sender: a sender with no rows reaches everyone, as it always did, and a
+-- sender with any rows reaches exactly those named. So a channel stays a room
+-- until something is said about it, and then only the senders mentioned change.
+CREATE TABLE IF NOT EXISTS routes (
+    workspace   TEXT NOT NULL REFERENCES workspaces(slug) ON DELETE CASCADE,
+    channel     TEXT NOT NULL,
+    sender      TEXT NOT NULL,
+    recipient   TEXT NOT NULL,
+    made_at     DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (workspace, channel, sender, recipient)
+);
+
 -- Something the server has to tell one worker about itself, rather than about
 -- the world: that it has been put into a channel, or taken out of one. It is
 -- not a message in a channel, because it is nobody else's business and because
@@ -1435,6 +1453,34 @@ class WorkspaceStore:
              ORDER BY m.seq DESC LIMIT %s""", (self.slug, channel, before, limit))
         return [_message(r) for r in reversed(rows)]
 
+    async def set_route(self, channel: str, sender: str, recipient: str, on: bool) -> bool:
+        """Whether what `sender` posts in this channel reaches `recipient`.
+
+        The first route made about a sender changes that sender from reaching
+        everyone to reaching only who is named, which is worth knowing before
+        making one: it is not "also send to", it is "send to these".
+        """
+        if on:
+            return await self.store._run("""
+                INSERT INTO routes(workspace, channel, sender, recipient, made_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (workspace, channel, sender, recipient) DO NOTHING""",
+                (self.slug, channel, sender, recipient, time.time())) > 0
+        return await self.store._run(
+            "DELETE FROM routes WHERE workspace = %s AND channel = %s "
+            "  AND sender = %s AND recipient = %s",
+            (self.slug, channel, sender, recipient)) > 0
+
+    async def routes_of(self, channel: str) -> dict[str, list[str]]:
+        """sender -> who it reaches. A sender absent from this reaches every
+        member, which is what a channel does when nothing has been said."""
+        found: dict[str, list[str]] = {}
+        for row in await self.store._all(
+                "SELECT sender, recipient FROM routes WHERE workspace = %s AND channel = %s "
+                " ORDER BY sender, recipient", (self.slug, channel)):
+            found.setdefault(row["sender"], []).append(row["recipient"])
+        return found
+
     async def waiting_for(self, worker_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         """Everything above this worker's cursors, across all its channels,
         oldest first, plus anything asked for again by hand. One query,
@@ -1447,6 +1493,18 @@ class WorkspaceStore:
                 ON mem.workspace = m.workspace AND mem.channel = m.channel
              WHERE m.workspace = %s AND mem.worker_id = %s AND m.sender <> %s
                AND (m.seq > mem.cursor
+                    OR EXISTS (SELECT 1 FROM redeliveries r
+                                WHERE r.workspace = m.workspace AND r.channel = m.channel
+                                  AND r.worker_id = mem.worker_id AND r.seq = m.seq))
+               -- Who this sender reaches here, where that has been said at all.
+               -- Asking for one message by hand is an act, not a rule, so it
+               -- is honoured whatever the routes say.
+               AND (NOT EXISTS (SELECT 1 FROM routes t
+                                 WHERE t.workspace = m.workspace AND t.channel = m.channel
+                                   AND t.sender = m.sender)
+                    OR EXISTS (SELECT 1 FROM routes t
+                                WHERE t.workspace = m.workspace AND t.channel = m.channel
+                                  AND t.sender = m.sender AND t.recipient = mem.worker_id)
                     OR EXISTS (SELECT 1 FROM redeliveries r
                                 WHERE r.workspace = m.workspace AND r.channel = m.channel
                                   AND r.worker_id = mem.worker_id AND r.seq = m.seq))

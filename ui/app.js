@@ -23,6 +23,7 @@ const state = {
   delivery: [],
   muted: [],
   hooks: {},
+  routes: {},
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
@@ -1126,6 +1127,7 @@ async function renderChannelView(name) {
   state.delivery = [];
   loadDelivery(name);
   loadHooks(name).then(() => renderMembers());
+  loadRoutes(name).then(() => renderMembers());
   try {
     const page = await api("GET", `/api/channels/${enc(name)}/messages?limit=${PAGE}`);
     if (state.feed.channel !== name) return;             // navigated away meanwhile
@@ -1176,7 +1178,8 @@ function renderMembers() {
     + `|${state.bots.map((b) => b.name + ":" + (b.channels || []).join("+")).join(",")}`
     + `|${inChannel.map((b) => ((b.deaf_to || {})[ch.name] || []).join("+")).join(",")}`
     + `|${state.muted.map((m) => m.key).join(",")}`
-    + `|${(state.hooks[ch.name] || []).map((t) => t.name + ":" + t.fires + ":" + t.last_status).join(",")}`;
+    + `|${(state.hooks[ch.name] || []).map((t) => t.name + ":" + t.fires + ":" + t.last_status).join(",")}`
+    + `|${JSON.stringify(state.routes[ch.name] || {})}`;
   if (el.dataset.shape === shape) return renderMemberList();
   el.dataset.shape = shape;
   const select = h("select", { "aria-label": "Worker to add" },
@@ -1460,6 +1463,46 @@ async function removeTrigger(channel, trigger) {
   } catch (err) { handleError(err); }
 }
 
+// Who each worker reaches in this channel. A channel is normally a room, so
+// nothing is shown until there is more than one member to choose between, and
+// a worker with no routes is marked as reaching everyone - which is what it
+// does, and what it goes on doing until something is said about it.
+function routesRow(ch, member) {
+  const others = ch.members.filter((m) => m.worker_id !== member.worker_id);
+  if (others.length < 2) return false;
+  const reaches = (state.routes[ch.name] || {})[member.worker_id];
+  const everyone = !reaches || !reaches.length;
+  return h("div", { class: "hears" },
+    h("span", { class: "muted small" },
+      everyone ? "reaches everyone here" : "reaches"),
+    h("div", { class: "chips" }, others.map((m) => {
+      const on = !everyone && reaches.includes(m.worker_id);
+      return h("button", {
+        class: "chip toggle" + (everyone ? " faint" : (on ? "" : " off")),
+        title: everyone
+          ? `${member.name} reaches every member. Click to send only to ${m.name}.`
+          : (on ? `Click to stop sending ${member.name}'s posts to ${m.name}.`
+                : `Click to also send ${member.name}'s posts to ${m.name}.`),
+        onclick: () => setRoute(ch.name, member.worker_id, m.worker_id, everyone || !on),
+      }, m.name || m.worker_id);
+    })));
+}
+
+async function setRoute(channel, sender, recipient, on) {
+  try {
+    await api(on ? "PUT" : "DELETE",
+      `/api/channels/${enc(channel)}/routes/${enc(sender)}/${enc(recipient)}`);
+    await loadRoutes(channel);
+    renderMembers();
+  } catch (err) { handleError(err); }
+}
+
+async function loadRoutes(channel) {
+  try {
+    state.routes[channel] = await api("GET", `/api/channels/${enc(channel)}/routes`);
+  } catch { state.routes[channel] = {}; }
+}
+
 function renderMemberList() {
   const el = $("#member-list");
   const ch = currentChannel();
@@ -1488,7 +1531,8 @@ function renderMemberList() {
           class: "btn icon", title: `${shown}'s settings in #${ch.name}`,
           "aria-label": `${shown}'s settings in #${ch.name}`,
           onclick: () => openMemberSettings(ch.name, id, shown),
-        }, "\u2699"));
+        }, "\u2699"),
+        routesRow(ch, m));
     }))
     : h("p", { class: "muted small" }, "No members yet. Only members can post here and receive what is posted."));
 }

@@ -270,6 +270,35 @@ postings**, and off everywhere until it is ticked:
 POST /{ws}/api/channels/{channel}/reads-jobs   {"reads": true}
 ```
 
+## A channel that is a line of work
+
+A channel is normally a room: everything posted reaches every member but the
+one that posted it. Some channels are a line of work instead - one worker
+answers another, a third answers that - and handing all of it to all of them
+means each has to work out what was addressed to it.
+
+```
+PUT    /{ws}/api/channels/{channel}/routes/{sender}/{recipient}
+DELETE /{ws}/api/channels/{channel}/routes/{sender}/{recipient}
+GET    /{ws}/api/channels/{channel}/routes
+```
+
+A route says what one sender posts here reaches one recipient, and the rule is
+per sender: a sender with no routes reaches everyone, as it always did, and a
+sender with any routes reaches exactly those named. So a channel stays a room
+until something is said about it, and then only the senders mentioned change.
+The first route about a sender is therefore not "also send to" but "send to
+these" - worth knowing before making one. Removing the last route about a
+sender puts it back to reaching everyone rather than leaving it reaching
+nobody.
+
+In the console each member lists who it reaches, under its name in the
+channel's members panel.
+
+Sending one message to one worker by hand ignores all of this. That is an act
+rather than a rule, and acts are honoured - otherwise a route could leave a
+channel impossible to repair from the console.
+
 ## Being told about itself
 
 A poll answers with what is waiting in the worker's channels, and with anything
