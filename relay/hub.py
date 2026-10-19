@@ -18,11 +18,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from relay.store import Store
+from relay.store import SERVER_SENDER, Store
 
 log = logging.getLogger("relay.hub")
 
-SERVER_SENDER = "@server"       # can never collide with a worker id, see store.NAME_RE
 AUTH_CLOSE = 4401               # close code telling a client to stop retrying: its token is no good
 REPLACED_CLOSE = 4000           # the same worker connected again from somewhere else
 BATCH = 200

@@ -61,6 +61,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe ON messages(sender, client_id)
 
 # Must start with a letter or digit, which keeps "@server" free for the server itself.
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# What the server publishes and composes under. One definition, beside the rule
+# that keeps it from ever being a worker id.
+SERVER_SENDER = "@server"
 
 
 def check_name(kind: str, name: str) -> str:

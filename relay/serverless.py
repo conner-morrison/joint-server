@@ -34,8 +34,8 @@ from relay.hooks import HookSender, check_url
 from relay.kinds import listed as listed_kinds
 from relay.sender import BotSender
 from relay.pgstore import PgStore, WorkspaceStore, check_name, slugify
+from relay.store import SERVER_SENDER
 
-SERVER_SENDER = "@server"
 MAX_BODY_BYTES = int(os.environ.get("RELAY_MAX_BODY_BYTES", "256000"))
 POLL_MAX_WAIT = float(os.environ.get("RELAY_POLL_MAX_WAIT", "25"))
 POLL_INTERVAL = float(os.environ.get("RELAY_POLL_INTERVAL", "5.0"))

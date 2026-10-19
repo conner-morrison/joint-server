@@ -1453,6 +1453,43 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://github.com/me/hub", reply)
         self.assertNotIn("https://github.com/d/hub", reply)
 
+    async def test_a_composed_reply_comes_from_the_server(self) -> None:
+        """The worker that finishes a job triggers the answer and writes none
+        of it - most of it is the search's. Handed over under that worker's
+        name, the server's own composition would read as that worker
+        broadcasting to the channel."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/github/reads-jobs", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "aa11", "event": "similar_repos",
+                                  "repos": [{"url": "https://github.com/d/hub",
+                                             "fit": "Use its navigation."}]}},
+                        token=ids["repo-finder"])
+        await self.heard_by(ws, ids)
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "aa11", "event": "done",
+                                  "repos": [{"source": "https://github.com/d/hub",
+                                             "name": "hub",
+                                             "published": "https://github.com/me/hub"}]}},
+                        token=ids["github-finder"])
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        answer = next(m for m in got["messages"] if m.get("reply"))
+        self.assertEqual(answer["sender"], "@server", "the reply arrived as a worker's broadcast")
+        self.assertNotEqual(answer["sender"], ids["github-finder"])
+        # Nothing of the triggering message rides along: not its body, and not
+        # the server's reading of it either.
+        self.assertNotIn("body", answer)
+        self.assertNotIn("fields", answer)
+        self.assertNotIn("thread", answer)
+        self.assertEqual(sorted(answer), ["channel", "job", "reply", "sender", "seq", "ts"])
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,

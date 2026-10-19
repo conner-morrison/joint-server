@@ -36,7 +36,8 @@ from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
 from relay.kinds import KINDS, check_kind
 from relay.reading import reading, thread_of
 from relay.replies import compose, results_in
-from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
+from relay.store import (  # one definition of a valid name, and of the server itself
+    NAME_RE, SERVER_SENDER, _hash, check_name)
 
 log = logging.getLogger("relay.pgstore")
 
@@ -1816,6 +1817,15 @@ class WorkspaceStore:
                 # proposal's, so they do not go.
                 message["reply"] = answer
                 message.pop("body", None)
+                # Nor the server's reading of them: the job is already here,
+                # and the rest is the triggering message said again.
+                message.pop("fields", None)
+                # The server wrote this one. The worker that finished the job
+                # triggered it and wrote none of it - most of it is the
+                # search's - so handing it over under that worker's name would
+                # pass the server's own composition off as that worker
+                # broadcasting to the channel.
+                message["sender"] = SERVER_SENDER
             elif also:
                 message["thread"] = also
         return found
