@@ -81,13 +81,65 @@ def unfinished(body: dict[str, Any]) -> str:
     return "; ".join(said)
 
 
+# A line long enough to be worth comparing. Below this, two fields agreeing is
+# a coincidence - "done", a date, a one-word stack - not one repeating the other.
+SUBSTANTIAL = 25
+
+
+def lines_of(value: Any) -> list[str]:
+    """A field as the lines it would be printed as."""
+    if isinstance(value, (list, tuple)):
+        return [str(line) for line in value if line not in (None, "")]
+    if isinstance(value, dict):
+        return [f"{k}: {v}" for k, v in value.items() if v not in (None, "")]
+    return str(value).splitlines()
+
+
+def gist(text: str) -> str:
+    """A line with its punctuation and spacing taken off, so the same sentence
+    written as prose and as a bullet compares equal."""
+    return re.sub(r"\s+", " ", str(text)).strip().strip("-*\u2022").strip().lower()
+
+
+def said_once(item: dict[str, Any], keys: list[str]) -> list[str]:
+    """The fields worth printing, with what is only said twice left out.
+
+    A search that sends both its prose and the same prose split into fields
+    says everything twice, and the answer becomes unreadable - the description
+    alone repeated the other fields line for line and doubled the message.
+
+    So where one field says nothing the others do not, it goes. The longest
+    goes first, because two fields that repeat each other are a blob and its
+    parts, and the parts are the more useful of the two: dropping the blob
+    keeps every heading, dropping the parts would keep none. Removing it can
+    leave another field no longer repeated, which is then kept.
+    """
+    kept = list(keys)
+    body = {key: [g for g in (gist(line) for line in lines_of(item[key])) if len(g) > SUBSTANTIAL]
+            for key in keys}
+    while True:
+        repeats = []
+        for key in kept:
+            mine = body[key]
+            if not mine:
+                continue
+            others = [g for other in kept if other != key for g in body[other]]
+            if others and all(any(g in o or o in g for o in others) for g in mine):
+                repeats.append(key)
+        if not repeats:
+            return kept
+        # The longest of them: the blob rather than one of its parts.
+        kept.remove(max(repeats, key=lambda key: len(str(item[key]))))
+
+
 def about(item: dict[str, Any]) -> list[str]:
-    """One repository as the search described it, in full. A proposal is
-    written from this, so none of it is summarised away."""
+    """One repository as the search described it. A proposal is written from
+    this, so none of it is summarised away - but nothing is said twice."""
     said: list[str] = []
-    for key, value in item.items():
-        if key in NOT_ABOUT or value in (None, "", [], {}):
-            continue
+    worth = [key for key, value in item.items()
+             if key not in NOT_ABOUT and value not in (None, "", [], {})]
+    for key in said_once(item, worth):
+        value = item[key]
         if isinstance(value, (list, tuple)):
             said.append(f"{humanise(key)}:")
             said += [f"  - {line}" for line in value if line not in (None, "")]

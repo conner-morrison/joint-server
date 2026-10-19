@@ -1407,6 +1407,52 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(filed, ["88a2c2da", "88a2c2da"],
                          "the rescued answer is not shown as belonging to the job")
 
+    async def test_an_answer_says_each_thing_once(self) -> None:
+        """repo-finder sends its prose and the same prose split into fields,
+        which said everything twice and doubled the answer. The parts are kept
+        over the blob: dropping the blob keeps every heading, dropping the
+        parts would keep none."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "aa11", "event": "similar_repos",
+                                  "repos": [{
+                                      "url": "https://github.com/d/hub",
+                                      "fit": "Use its navigation for the resource hub.",
+                                      "know_how": ["Map ows_taxId_ crawled properties, not ows_."],
+                                      "tech_stack": ["SharePoint Online with hub sites"],
+                                      # The same two lines again, as prose.
+                                      "description": (
+                                          "Know-how:\n"
+                                          "- Map ows_taxId_ crawled properties, not ows_.\n"
+                                          "\nTech stack:\n"
+                                          "- SharePoint Online with hub sites\n")}]}},
+                        token=ids["repo-finder"])
+        await self.heard_by(ws, ids)
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "aa11", "event": "done",
+                                  "repos": [{"source": "https://github.com/d/hub",
+                                             "name": "hub", "status": "done",
+                                             "published": "https://github.com/me/hub"}]}},
+                        token=ids["github-finder"])
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        answer = next(m for m in got["messages"] if m.get("reply"))
+        reply = answer["reply"]
+        # Said once, under its heading, and not again as prose.
+        self.assertEqual(reply.count("Map ows_taxId_ crawled properties"), 1, reply)
+        self.assertEqual(reply.count("SharePoint Online with hub sites"), 1, reply)
+        self.assertIn("Know how:", reply)
+        self.assertIn("Tech stack:", reply)
+        # What the answer is for, still there.
+        self.assertTrue(reply.startswith("Job aa11: done"), reply[:40])
+        self.assertIn("https://github.com/me/hub", reply)
+        self.assertNotIn("https://github.com/d/hub", reply)
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,
