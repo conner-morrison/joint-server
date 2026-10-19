@@ -35,6 +35,7 @@ from psycopg_pool import AsyncConnectionPool
 from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
 from relay.kinds import KINDS, check_kind
 from relay.reading import reading, thread_of
+from relay.replies import compose
 from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
 
 log = logging.getLogger("relay.pgstore")
@@ -1745,6 +1746,12 @@ class WorkspaceStore:
                     if r["seq"] != row["seq"]]
             if also:
                 message["thread"] = also
+            # The worker that finishes a job is the trigger, not the author.
+            # What asked for the job should be handed the answer once, whole,
+            # rather than two messages and the work of joining them.
+            answer = compose(row["body"], also)
+            if answer:
+                message["reply"] = answer
         return found
         return [_message(r) for r in rows]
 

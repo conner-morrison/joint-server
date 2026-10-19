@@ -1221,6 +1221,87 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(behind["writer"], 1, "the one it is actually for is not owed it")
         self.assertEqual(behind["repo-finder"], 0, "it was shown work it will never be given")
 
+    async def test_the_answer_to_a_job_arrives_as_one_message(self) -> None:
+        """A job is worked on by more than one worker, and neither of them is
+        the answer. The one that finishes is the trigger; whoever asked should
+        be handed the answer once, whole, rather than two messages and the
+        work of joining them."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        for sender, recipient in (("writer", "repo-finder"), ("repo-finder", "github-finder"),
+                                  ("github-finder", "writer")):
+            await self.call(
+                "PUT", f"/{ws}/api/channels/github/routes/{ids[sender]}/{ids[recipient]}",
+                token="hunter2")
+
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job": "d792948d", "title": "Inventory analysis"}},
+                        token=ids["writer"])
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "d792948d", "event": "similar_repos",
+                                  "summary": "The client wants inventory analysed.",
+                                  "repos": [{"url": "https://github.com/a/dead-stock",
+                                             "reason": "The same analysis.",
+                                             "fit": "Use it as the backbone.",
+                                             "tech_stack": ["Python", "Power BI"]}]}},
+                        token=ids["repo-finder"])
+        await self.heard_by(ws, ids)
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "d792948d", "event": "done", "completed": 1,
+                                  "failed": 0,
+                                  "repos": [{"source": "https://github.com/a/dead-stock",
+                                             "name": "working", "status": "done",
+                                             "published": "https://github.com/me/working"}]}},
+                        token=ids["github-finder"])
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        answer = next(m for m in got["messages"] if m["body"].get("event") == "done")
+        reply = answer["reply"]
+        self.assertTrue(reply.startswith("Job d792948d: done"), reply[:60])
+        self.assertIn("The client wants inventory analysed.", reply)
+        self.assertIn("Published: https://github.com/me/working  (working)", reply)
+        self.assertIn("Reason: The same analysis.", reply)
+        self.assertIn("Fit: Use it as the backbone.", reply)
+        self.assertIn("Tech stack:\n  - Python\n  - Power BI", reply)
+        # Where it came from is the publisher's business, not the proposal's.
+        self.assertNotIn("https://github.com/a/dead-stock", reply)
+
+    async def test_only_an_answer_is_given_that_shape(self) -> None:
+        """A job being posted must not arrive wearing the shape of an answer
+        to itself."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github", "body": {"job": "d792948d", "title": "A job"}},
+                        token=ids["writer"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["repo-finder"])
+        self.assertNotIn("reply", got["messages"][0])
+
+    async def test_an_answer_that_fell_short_says_so_first(self) -> None:
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "x1", "event": "done", "completed": 1, "failed": 1,
+                                  "repos": [{"published": "https://github.com/me/one",
+                                             "name": "one"},
+                                            {"name": "two", "error": "rate limited"}]}},
+                        token=ids["github-finder"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        reply = got["messages"][0]["reply"]
+        self.assertIn("Incomplete: 1 failed; two: rate limited", reply)
+        self.assertLess(reply.index("Incomplete"), reply.index("Published"))
+        self.assertIn("Not published: two - rate limited", reply)
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,

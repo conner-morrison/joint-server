@@ -311,6 +311,31 @@ message:
  "thread": [ {"seq": 2, "sender": "w-78d5…", "body": { …what the step before found… }} ]}
 ```
 
+Where those messages are the parts of one answer, the answer itself comes with
+them, as `reply`:
+
+```
+Job d792948d: done
+
+A 3PL with fulfillment operations wants its inventory analysed and improved: …
+
+Published: https://github.com/…/working  (working)
+Fit: Use it as the analytics backbone: …
+Reason: The same inventory-health analysis the job asks for …
+Know how:
+  - Snapshot-based inventory plus transaction facts lets aging …
+```
+
+A job is worked on by more than one worker: one finds repositories and says why
+each matters, another publishes the chosen ones and reports where they went.
+Neither is the answer - the answer is both. The one that finishes is the
+trigger, not the author, and whoever asked for the job is handed the answer
+once, whole, rather than two messages and the work of joining them. Composed,
+never stored: the messages stay exactly as their workers wrote them.
+
+A message that is not an answer never gets that shape, and an answer that fell
+short says so at the top, where it cannot be mistaken for a whole one.
+
 Beside the message, never folded into it: those are other workers' messages and
 they stay as they were written. What ties them together is the job each names -
 `job_id`, `jobId`, `job`, or an Upwork link - so a worker that names no job

@@ -549,6 +549,30 @@ class Bridge:
         # running thing, not the repository.
         published = [url for label, url in links_in(body) if label == "Published"]
         short = unfinished(body)
+        # The relay composes the answer to a job now - the job, what became of
+        # it, and what the search said about each published thing - because it
+        # is the only one that sees every part. Preferred to assembling it
+        # again here, where it would drift; the local one stays for a relay
+        # too old to send it.
+        ready = msg.get("reply")
+        if isinstance(ready, str) and ready.strip():
+            try:
+                status, _ = http("POST", f"{self.local()}/api/job/{job}/message",
+                                 {"role": "user", "text": ready},
+                                 timeout=self.args.local_timeout)
+            except OSError as exc:
+                say(f"proposal-writer is not answering ({exc}); will try #{msg['seq']} again")
+                return False
+            if status == 200:
+                say(f"#{msg['seq']} answer for job {job} -> proposal-writer "
+                    f"({len(ready)} characters)")
+                return True
+            if status == 404:
+                say(f"#{msg['seq']} mentions job {job}, which proposal-writer does not have")
+                return True
+            say(f"proposal-writer refused the answer for {job}: {status}")
+            return True
+
         # What the search said about these repositories, carried alongside this
         # message because routing meant this worker never received it.
         overall, by_url = searched(msg.get("thread"))
