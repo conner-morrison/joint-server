@@ -995,6 +995,14 @@ class WorkspaceStore:
         name = check_worker_name(name)
         ticket = secrets.token_urlsafe(32)
         ref = secrets.token_hex(8)
+        # A worker that asks again while its first request is still waiting is
+        # the same worker asking again - it restarted, or lost the ticket. One
+        # row per name waiting, so a person is not asked to approve the same
+        # machine four times and left wondering which one is real. An answered
+        # request is left alone: it is a record of something that happened.
+        await self.store._run(
+            "DELETE FROM registrations WHERE workspace = %s AND name = %s "
+            "  AND granted_id IS NULL", (self.slug, name))
         await self.store._run(
             "INSERT INTO registrations(workspace, ref, name, ticket_hash, label, requested_at) "
             "VALUES (%s, %s, %s, %s, %s, %s)",
@@ -1007,12 +1015,27 @@ class WorkspaceStore:
         return {"ref": ref, "ticket": ticket, "name": name}
 
     async def registration(self, ticket: str) -> dict[str, Any] | None:
-        """What came of a request, for the worker that made it."""
+        """What came of a request, for the worker that made it.
+
+        An answer is kept for a week so a worker that missed it can ask again.
+        But the worker it named can be removed or given a new id in that week,
+        and handing out an id that opens nothing leaves the asker in a loop:
+        collect, be refused, collect the same id again. So an answer that no
+        longer names a worker is no answer, and the request is gone.
+        """
         if not ticket:
             return None
-        return await self.store._one(
+        found = await self.store._one(
             "SELECT ref, name, label, granted_id, requested_at FROM registrations "
             " WHERE workspace = %s AND ticket_hash = %s", (self.slug, _hash(ticket)))
+        if found is None or not found["granted_id"]:
+            return found
+        if await self.worker_exists(str(found["granted_id"])):
+            return found
+        await self.store._run(
+            "DELETE FROM registrations WHERE workspace = %s AND ticket_hash = %s",
+            (self.slug, _hash(ticket)))
+        return None
 
     async def is_pending(self, ticket: str) -> str | None:
         """The name a ticket is waiting as, if it is still waiting."""

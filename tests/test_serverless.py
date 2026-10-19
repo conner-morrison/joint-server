@@ -274,6 +274,57 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
         self.assertEqual(len(workers), 1)
 
+    async def test_asking_again_while_waiting_replaces_the_request(self) -> None:
+        """A worker that restarts asks again, and it is the same worker asking.
+        One row per name waiting, or a person is asked to approve the same
+        machine four times and left to guess which is real."""
+        ws = await self.workspace()
+        tickets = [(await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"}))[1]["ticket"]
+                   for _ in range(3)]
+        _, pending = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        self.assertEqual([r["name"] for r in pending], ["Office PC"])
+
+        # The last ticket is the live one; the ones it replaced are gone.
+        for spent in tickets[:-1]:
+            status, _ = await self.call("GET", f"/{ws}/enrol/{spent}")
+            self.assertEqual(status, 404)
+        status, _ = await self.call("GET", f"/{ws}/enrol/{tickets[-1]}")
+        self.assertEqual(status, 202)
+
+    async def test_another_worker_waiting_is_untouched(self) -> None:
+        ws = await self.workspace()
+        _, first = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        await self.call("POST", f"/{ws}/enrol", {"name": "Laptop"})
+        await self.call("POST", f"/{ws}/enrol", {"name": "Laptop"})
+        _, pending = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        self.assertEqual(sorted(r["name"] for r in pending), ["Laptop", "Office PC"])
+        self.assertEqual((await self.call("GET", f"/{ws}/enrol/{first['ticket']}"))[0], 202)
+
+    async def test_an_answer_naming_a_worker_that_is_gone_is_no_answer(self) -> None:
+        """An answer is kept a week so a worker that missed it can ask again.
+        If the worker it named is removed or given a new id meanwhile, handing
+        the id out leaves the asker in a loop: collect, be refused, collect the
+        same id again - which reads in a log as registering over and over."""
+        ws = await self.workspace()
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        _, approved = await self.call("POST", f"/{ws}/api/pending/{rows[0]['ref']}",
+                                      token="hunter2")
+        self.assertEqual((await self.call("GET", f"/{ws}/enrol/{asked['ticket']}"))[0], 200)
+
+        await self.call("DELETE", f"/{ws}/api/workers/{approved['worker_id']}", token="hunter2")
+        status, said = await self.call("GET", f"/{ws}/enrol/{asked['ticket']}")
+        self.assertEqual((status, said["status"]), (404, "unknown"))
+
+    async def test_a_new_id_leaves_the_old_answer_useless(self) -> None:
+        ws = await self.workspace()
+        _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        _, approved = await self.call("POST", f"/{ws}/api/pending/{rows[0]['ref']}",
+                                      token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers/{approved['worker_id']}/id", token="hunter2")
+        self.assertEqual((await self.call("GET", f"/{ws}/enrol/{asked['ticket']}"))[0], 404)
+
     async def test_a_rejected_request_leaves_nothing_behind(self) -> None:
         ws = await self.workspace()
         _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})

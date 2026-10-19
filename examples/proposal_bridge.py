@@ -467,6 +467,11 @@ class Bridge:
             if status == 200 and body.get("worker_id"):
                 self.worker_id = str(body["worker_id"])
                 self.state["worker_id"] = self.worker_id
+                # Cleared here as well as on disk. Left set, a later refusal
+                # sends this back to the same answered request, which hands
+                # back the same id, which is refused again - a loop that reads
+                # in the log as registering over and over.
+                self.ticket = ""
                 self.state.pop("ticket", None)
                 self._save_state()
                 say(f"registered as {body.get('name')}. Its id is kept in {self.state_path}; "
