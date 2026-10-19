@@ -1308,6 +1308,79 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(reply.index("Incomplete"), reply.index("Published"))
         self.assertIn("Not published: two - rate limited", reply)
 
+    async def test_an_answer_that_forgot_the_job_is_tied_back_by_what_it_copied(self) -> None:
+        """A worker that forgets to echo the job id leaves its answer belonging
+        to nothing: no thread, no reply, and whoever asked cannot tell which
+        job was answered. It does say where each copy came from, and the search
+        that found those said which job it was looking for."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job": "88a2c2da", "title": "SharePoint work"}},
+                        token=ids["writer"])
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "88a2c2da", "event": "similar_repos",
+                                  "summary": "They want an intranet.",
+                                  "repos": [{"url": "https://github.com/d/knowledge-hub",
+                                             "fit": "Use its navigation."}]}},
+                        token=ids["repo-finder"])
+        await self.heard_by(ws, ids)
+        # The answer names no job at all - the field is there and empty, which
+        # is what a worker sends when it means to echo one and does not.
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": None, "event": "done", "completed": 1, "failed": 0,
+                                  "repos": [{"source": "https://github.com/d/knowledge-hub",
+                                             "name": "steady-migration",
+                                             "published": "https://github.com/me/steady"}]}},
+                        token=ids["github-finder"])
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        answer = next((m for m in got["messages"] if m.get("reply")), None)
+        self.assertIsNotNone(answer, "the answer was not tied to any job")
+        self.assertTrue(answer["reply"].startswith("Job 88a2c2da: done"), answer["reply"][:40])
+        self.assertIn("Use its navigation.", answer["reply"])
+
+    async def test_a_search_is_not_an_answer(self) -> None:
+        """A search carries a list of what it found, which is the same shape as
+        a list of what was published. Composed as an answer it would tell
+        whoever asked that a job was finished when it had only been looked
+        at."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "aa11", "event": "similar_repos",
+                                  "repos": [{"url": "https://github.com/a/one",
+                                             "fit": "Use it."}]}},
+                        token=ids["repo-finder"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        self.assertNotIn("reply", got["messages"][0])
+        self.assertIn("body", got["messages"][0])
+
+    async def test_an_answer_about_nothing_known_is_left_alone(self) -> None:
+        """The rescue must not invent a job. Something that copied nothing this
+        channel has seen belongs to nothing, and saying otherwise would file a
+        proposal against the wrong job - which nothing afterwards would catch."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": None, "event": "done",
+                                  "repos": [{"source": "https://github.com/nobody/else",
+                                             "published": "https://github.com/me/x"}]}},
+                        token=ids["github-finder"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        self.assertNotIn("reply", got["messages"][0])
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,

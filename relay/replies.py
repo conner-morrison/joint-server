@@ -119,18 +119,27 @@ def searched(thread: list[dict[str, Any]]) -> tuple[str, dict[str, dict[str, Any
     return overall, by_url
 
 
-def compose(body: Any, thread: list[dict[str, Any]]) -> str | None:
+def compose(body: Any, thread: list[dict[str, Any]], job: str | None = None) -> str | None:
     """The answer to one job, as one message, or None when this is not one.
 
     None matters: a message that is not an answer - a job being posted, a note,
     anything without a result in it - must not arrive wearing the shape of one.
+
+    The job is the one the message was filed under, which is not always the one
+    it names: a worker that forgot to echo the job id was tied back to its job
+    by what it copied, and reading the id out of the body again would lose
+    exactly that.
     """
     if not isinstance(body, dict):
         return None
     results = results_in(body)
-    if not results:
+    # An answer is a message that says what became of the work: something was
+    # published, or something failed. A search carries a list too - the things
+    # it found - and it is not an answer to anything, so it must never arrive
+    # wearing the shape of one.
+    if not any(isinstance(r.get("published"), str) or r.get("error") for r in results):
         return None
-    job = thread_of(body)
+    job = job or thread_of(body)
     if not job:
         return None
 

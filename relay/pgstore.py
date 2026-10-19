@@ -35,7 +35,7 @@ from psycopg_pool import AsyncConnectionPool
 from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
 from relay.kinds import KINDS, check_kind
 from relay.reading import reading, thread_of
-from relay.replies import compose
+from relay.replies import compose, results_in
 from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
 
 log = logging.getLogger("relay.pgstore")
@@ -554,6 +554,8 @@ class PgStore:
                 found = []
                 for row in missing:
                     key, thread = job_of(row["body"]), thread_of(row["body"])
+                    if thread is None:
+                        thread = await self._thread_by_source_in(conn, row["seq"], row["body"])
                     if key or thread:
                         found.append((key, thread, row["seq"]))
                 for key, thread, seq in found:
@@ -591,6 +593,30 @@ class PgStore:
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
             log.warning("could not work out which channels carry job postings (%s); "
                         "turn the reading on by hand", type(exc).__name__)
+
+    async def _thread_by_source_in(self, conn: Any, seq: int, body: Any) -> str | None:
+        """The same rescue, for a message already stored. Looked up by what it
+        copied, in the channel it is in."""
+        sources = []
+        for item in results_in(body):
+            for key in ("source", "url", "from"):
+                said = item.get(key) if isinstance(item, dict) else None
+                if isinstance(said, str) and said.startswith(("http://", "https://")):
+                    sources.append(said)
+                    break
+        if not sources:
+            return None
+        for url in sources[:5]:
+            row = await (await conn.execute("""
+                SELECT m.thread_key FROM messages m
+                  JOIN messages me ON me.seq = %s
+                 WHERE m.workspace = me.workspace AND m.channel = me.channel
+                   AND m.thread_key IS NOT NULL AND m.seq <> me.seq
+                   AND m.body::text LIKE %s
+                 ORDER BY m.seq DESC LIMIT 1""", (seq, f"%{url}%"))).fetchone()
+            if row is not None:
+                return str(row["thread_key"])
+        return None
 
     async def _retire_tokens(self) -> None:
         """Move an existing database to workers identified by an id.
@@ -1579,11 +1605,12 @@ class WorkspaceStore:
                         " ORDER BY seq LIMIT 1", (self.slug, channel, key))).fetchone()
                     if seen is not None:
                         return int(seen["seq"]), True
+                thread = thread_of(body) or await self._thread_by_source(conn, channel, body)
                 cur = await conn.execute(
                     "INSERT INTO messages(workspace, channel, sender, client_id, job_key, "
                     "                     thread_key, body, ts) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING seq",
-                    (self.slug, channel, sender, client_id, key, thread_of(body),
+                    (self.slug, channel, sender, client_id, key, thread,
                      json.dumps(body), time.time() if ts is None else ts))
                 row = await cur.fetchone()
                 await self._trim(conn, channel)
@@ -1606,6 +1633,34 @@ class WorkspaceStore:
                 if row is None:
                     raise
                 return int(row["seq"]), True
+
+    async def _thread_by_source(self, conn: Any, channel: str, body: Any) -> str | None:
+        """The job an answer belongs to, worked out from what it copied.
+
+        A worker that forgets to echo the job id leaves its answer belonging to
+        nothing: no thread, no reply, and whoever asked cannot tell which job
+        was answered. It does say where each published copy came from, and the
+        search that found those said which job it was looking for - so the two
+        can be tied together without guessing.
+
+        This is a rescue, not the design. A worker should echo the id.
+        """
+        sources = []
+        for item in results_in(body):
+            for key in ("source", "url", "from"):
+                said = item.get(key) if isinstance(item, dict) else None
+                if isinstance(said, str) and said.startswith(("http://", "https://")):
+                    sources.append(said)
+                    break
+        for url in sources[:5]:
+            row = await (await conn.execute(
+                "SELECT thread_key FROM messages "
+                " WHERE workspace = %s AND channel = %s AND thread_key IS NOT NULL "
+                "   AND body::text LIKE %s ORDER BY seq DESC LIMIT 1",
+                (self.slug, channel, f"%{url}%"))).fetchone()
+            if row is not None:
+                return str(row["thread_key"])
+        return None
 
     async def _trim(self, conn: Any, channel: str) -> None:
         """Drop the oldest so the channel keeps only its newest CHANNEL_MAX.
@@ -1747,7 +1802,7 @@ class WorkspaceStore:
             # The worker that finishes a job is the trigger, not the author.
             # What asked for the job should be handed the answer once, whole,
             # rather than two messages and the work of joining them.
-            answer = compose(row["body"], also)
+            answer = compose(row["body"], also, row["thread_key"])
             if answer:
                 # The answer is the message. The parts it was made from say
                 # one thing more than it does - where each published copy was
