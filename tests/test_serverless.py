@@ -325,17 +325,43 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         await self.call("POST", f"/{ws}/api/workers/{approved['worker_id']}/id", token="hunter2")
         self.assertEqual((await self.call("GET", f"/{ws}/enrol/{asked['ticket']}"))[0], 404)
 
-    async def test_a_rejected_request_leaves_nothing_behind(self) -> None:
+    async def test_a_refusal_is_remembered_and_said(self) -> None:
+        """Deleting a refused request reads to the worker exactly like one that
+        expired, so it asks again - and a person who said no is asked the same
+        question for ever. Mine asked eleven times in an afternoon."""
         ws = await self.workspace()
         _, asked = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
         _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
-        status, _ = await self.call("DELETE", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
+        status, _ = await self.call("DELETE", f"/{ws}/api/pending/{rows[0]['ref']}",
+                                    token="hunter2")
         self.assertEqual(status, 200)
         _, pending = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
-        self.assertEqual(pending, [])
-        # The worker asking after it is told plainly, so it can ask again.
+        self.assertEqual(pending, [], "a refused request is still in the waiting list")
+
+        # The worker is told no, rather than told nothing.
         status, body = await self.call("GET", f"/{ws}/enrol/{asked['ticket']}")
-        self.assertEqual((status, body["status"]), (404, "unknown"))
+        self.assertEqual((status, body["status"]), (403, "refused"))
+
+    async def test_asking_again_after_a_refusal_is_refused(self) -> None:
+        """And does not put the question back in front of a person."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        await self.call("DELETE", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
+
+        for _ in range(3):
+            status, said = await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+            self.assertEqual((status, said["status"]), (403, "refused"))
+        _, pending = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        self.assertEqual(pending, [], "refusing it put it back in the waiting list")
+
+    async def test_a_refusal_is_about_that_name_only(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/enrol", {"name": "Office PC"})
+        _, rows = await self.call("GET", f"/{ws}/api/pending", token="hunter2")
+        await self.call("DELETE", f"/{ws}/api/pending/{rows[0]['ref']}", token="hunter2")
+        status, _ = await self.call("POST", f"/{ws}/enrol", {"name": "Laptop"})
+        self.assertEqual(status, 202)
 
     async def test_two_workers_may_be_called_the_same_thing(self) -> None:
         """Two machines may both reasonably be called "gmail". The name is for

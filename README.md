@@ -201,6 +201,12 @@ of it dialling out. So it learns it was approved by asking - and with `wait` the
 question is held open, so the answer arrives when the person clicks rather than
 whenever the worker next had a reason to speak.
 
+Refusing a request is remembered. Deleting it would read to the worker exactly
+like a request that had expired, so it would ask again - and a person who said
+no would be asked the same question for ever. A refused worker is told it was
+refused, asking again under that name is refused too, and a refusal stands for
+a day (`RELAY_REFUSAL_STANDS`).
+
 The id is the worker's identity and its credential at once, so it is random,
 128 bits of it, and it deserves the care a password does. The console shows it
 next to the name, because it is what every request about that worker is made

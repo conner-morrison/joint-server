@@ -266,6 +266,8 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         scoped = db().ws(ws)
         try:
             asked = await scoped.request_worker(body.name, body.label)
+        except PermissionError as exc:
+            raise HTTPException(403, {"status": "refused", "message": str(exc)}) from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         return {"status": "pending", "name": asked["name"], "ticket": asked["ticket"],
@@ -300,6 +302,13 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             # Approval is a person clicking, so a second is soon enough and
             # costs one small query. There is nothing to notify on here.
             await asyncio.sleep(min(1.0, max(deadline - time.monotonic(), 0.05)))
+        if found["refused_at"]:
+            # Told, rather than left to guess. A refusal that reads like an
+            # expiry is a refusal that gets asked again.
+            raise HTTPException(403, {
+                "status": "refused", "name": found["name"],
+                "message": "this worker was refused in the console. Asking again will not "
+                           "change that; someone has to approve it there."})
         if not found["granted_id"]:
             response.status_code = 202
             return {"status": "pending", "name": found["name"],

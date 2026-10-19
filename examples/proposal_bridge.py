@@ -482,7 +482,9 @@ class Bridge:
                     say("waiting for someone to approve this worker in the console")
                     self.said_waiting = True
                 return                            # asked again next pass
-            # Declined, or so old the relay has forgotten it. Ask afresh.
+            if status == 403:
+                self.refused(body)
+            # So old the relay has forgotten it. Ask afresh.
             say("the request is gone; asking again")
             self.ticket = ""
             self.state.pop("ticket", None)
@@ -495,7 +497,27 @@ class Bridge:
             self._save_state()
             say(f"asked to join as {body.get('name')}: {body.get('message', '')}")
             return
+        if status == 403:
+            self.refused(body)
         sys.exit(f"could not ask to join: {status} {body}")
+
+    def refused(self, body: Any) -> None:
+        """Told no, and stopping.
+
+        Asking again after a refusal is how a person who said no ends up
+        answering the same question for ever. The state is cleared so that
+        starting this again is a deliberate act rather than the loop resuming.
+        """
+        said = body.get("detail", body) if isinstance(body, dict) else body
+        if isinstance(said, dict):
+            said = said.get("message", said)
+        say(f"refused: {said}")
+        say(f"not asking again. Approve it in the console, then start this once more; "
+            f"what it was asking under is cleared from {self.state_path}.")
+        self.ticket = ""
+        self.state.pop("ticket", None)
+        self._save_state()
+        sys.exit(0)
 
     def deliver(self, msg: dict[str, Any]) -> bool:
         """Hand one message to proposal-writer. False means try again later,

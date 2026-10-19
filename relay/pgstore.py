@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS registrations (
     ticket_hash  TEXT NOT NULL,
     label        TEXT NOT NULL DEFAULT '',
     granted_id   TEXT,
+    -- A refusal is kept rather than deleted. Deleted, it reads to the worker
+    -- exactly like a request that expired, so it asks again - and a person
+    -- who said no is asked the same question for ever.
+    refused_at   DOUBLE PRECISION,
     requested_at DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (workspace, ref)
 );
@@ -293,6 +297,10 @@ CHANNEL_MAX = int(os.environ.get("RELAY_CHANNEL_MAX", "100"))
 # touches this at least that often, and this leaves room for two of those to
 # be missed before it is called gone.
 ONLINE_WINDOW = float(os.environ.get("RELAY_ONLINE_WINDOW", "75"))
+# How long a refusal answers for. Long enough that a worker restarting in a
+# loop cannot wear a person down; short enough that a change of mind costs a
+# wait rather than a support request.
+REFUSAL_STANDS = float(os.environ.get("RELAY_REFUSAL_STANDS", str(24 * 3600)))
 
 
 # Upwork names a job in its own links: ~021987abc. Two links to one job differ
@@ -525,6 +533,8 @@ class PgStore:
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS "
                                    "carries_thread BOOLEAN NOT NULL DEFAULT FALSE")
                 await conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS kind TEXT")
+                await conn.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS "
+                                   "refused_at DOUBLE PRECISION")
                 await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS "
                                    "thread_key TEXT")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_thread "
@@ -1000,9 +1010,21 @@ class WorkspaceStore:
         # row per name waiting, so a person is not asked to approve the same
         # machine four times and left wondering which one is real. An answered
         # request is left alone: it is a record of something that happened.
+        # Asking again after being told no is not a new request. Said plainly
+        # rather than quietly queued, or a person who refused something is
+        # asked the same question until they give in.
+        refused = await self.store._one(
+            "SELECT refused_at FROM registrations "
+            " WHERE workspace = %s AND name = %s AND refused_at IS NOT NULL "
+            "   AND refused_at > %s ORDER BY refused_at DESC LIMIT 1",
+            (self.slug, name, time.time() - REFUSAL_STANDS))
+        if refused is not None:
+            raise PermissionError(
+                f"{name!r} was refused here. Nothing is waiting for approval, and asking "
+                "again will not change that until someone removes the refusal.")
         await self.store._run(
             "DELETE FROM registrations WHERE workspace = %s AND name = %s "
-            "  AND granted_id IS NULL", (self.slug, name))
+            "  AND granted_id IS NULL AND refused_at IS NULL", (self.slug, name))
         await self.store._run(
             "INSERT INTO registrations(workspace, ref, name, ticket_hash, label, requested_at) "
             "VALUES (%s, %s, %s, %s, %s, %s)",
@@ -1026,7 +1048,7 @@ class WorkspaceStore:
         if not ticket:
             return None
         found = await self.store._one(
-            "SELECT ref, name, label, granted_id, requested_at FROM registrations "
+            "SELECT ref, name, label, granted_id, refused_at, requested_at FROM registrations "
             " WHERE workspace = %s AND ticket_hash = %s", (self.slug, _hash(ticket)))
         if found is None or not found["granted_id"]:
             return found
@@ -1049,7 +1071,8 @@ class WorkspaceStore:
         whatever else happened to ask at the same moment."""
         rows = await self.store._all(
             "SELECT ref, name, label, ticket_hash, requested_at FROM registrations "
-            " WHERE workspace = %s AND granted_id IS NULL ORDER BY requested_at", (self.slug,))
+            " WHERE workspace = %s AND granted_id IS NULL AND refused_at IS NULL "
+            " ORDER BY requested_at", (self.slug,))
         return [{"ref": r["ref"], "name": r["name"], "label": r["label"],
                  "requested_at": r["requested_at"], "fingerprint": r["ticket_hash"][:12]}
                 for r in rows]
@@ -1075,8 +1098,12 @@ class WorkspaceStore:
         return {"worker_id": worker_id, "name": str(row["name"])}
 
     async def reject_worker(self, ref: str) -> bool:
+        """No, and remembered. The worker is told it was refused rather than
+        told nothing, so it can stop asking instead of starting again."""
         return await self.store._run(
-            "DELETE FROM registrations WHERE workspace = %s AND ref = %s", (self.slug, ref)) > 0
+            "UPDATE registrations SET refused_at = %s "
+            " WHERE workspace = %s AND ref = %s AND refused_at IS NULL",
+            (time.time(), self.slug, ref)) > 0
 
     # --- channels --------------------------------------------------------
     async def add_channel(self, name: str, description: str = "") -> None:
