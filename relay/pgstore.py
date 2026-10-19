@@ -1323,7 +1323,19 @@ class WorkspaceStore:
                    m.cursor,
                    (SELECT COUNT(*) FROM messages g
                      WHERE g.workspace = m.workspace AND g.channel = m.channel
-                       AND g.seq > m.cursor AND g.sender <> m.worker_id) AS waiting
+                       AND g.seq > m.cursor AND g.sender <> m.worker_id
+                       -- Only what this member will actually be handed. A
+                       -- channel that routes work has messages above a
+                       -- member's cursor that are not for it, and counting
+                       -- those shows a backlog that never clears - which is
+                       -- what a worker that has stopped collecting looks like.
+                       AND (NOT EXISTS (SELECT 1 FROM routes t
+                                         WHERE t.workspace = g.workspace
+                                           AND t.channel = g.channel AND t.sender = g.sender)
+                            OR EXISTS (SELECT 1 FROM routes t
+                                        WHERE t.workspace = g.workspace
+                                          AND t.channel = g.channel AND t.sender = g.sender
+                                          AND t.recipient = m.worker_id))) AS waiting
               FROM members m LEFT JOIN workers w
                 ON w.workspace = m.workspace AND w.worker_id = m.worker_id
              WHERE m.workspace = %s AND m.channel = %s

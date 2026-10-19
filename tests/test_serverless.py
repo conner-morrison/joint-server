@@ -1199,6 +1199,28 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         for k in kinds:
             self.assertTrue(k["label"] and k["about"])
 
+    async def test_what_is_waiting_counts_only_what_will_be_handed_over(self) -> None:
+        """A routed channel has messages above a member's cursor that are not
+        for it. Counted, they show as a backlog that never clears - which is
+        exactly what a worker that has stopped collecting looks like, so the
+        one number that says whether a pipeline is healthy would lie."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        for sender, recipient in (("writer", "repo-finder"), ("repo-finder", "github-finder"),
+                                  ("github-finder", "writer")):
+            await self.call(
+                "PUT", f"/{ws}/api/channels/github/routes/{ids[sender]}/{ids[recipient]}",
+                token="hunter2")
+        # The editor answers; only the writer is owed it.
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github", "body": "the chosen urls"},
+                        token=ids["github-finder"])
+
+        _, rows = await self.call("GET", f"/{ws}/api/channels/github/delivery", token="hunter2")
+        behind = {r["name"]: r["waiting"] for r in rows}
+        self.assertEqual(behind["writer"], 1, "the one it is actually for is not owed it")
+        self.assertEqual(behind["repo-finder"], 0, "it was shown work it will never be given")
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,
