@@ -1945,12 +1945,17 @@ function jobIdOf(body) {
 // Messages arranged as what happened and what came back. A later message
 // carrying a job id already seen belongs under the one that introduced it,
 // because that is what it is: an answer, not a new event.
+//
+// The job the server filed it under comes first, and the body only after. A
+// worker that forgets to echo the job id is tied back by what it copied, and
+// reading the id out of the body again would undo exactly that - the answer
+// would stand on its own as though it had answered nothing.
 function thread(messages) {
   const sources = new Map();          // job id -> the message that introduced it
   const replies = new Map();          // seq of that message -> answers to it
   const top = [];
   for (const m of messages) {
-    const id = jobIdOf(m.body);
+    const id = m.job || jobIdOf(m.body);
     const source = id ? sources.get(id) : null;
     if (!source) {
       if (id) sources.set(id, m);
