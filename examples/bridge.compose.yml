@@ -1,0 +1,43 @@
+# Running the bridge as a container, from the image the relay is built from.
+#
+#   docker compose -f examples/bridge.compose.yml up -d --build
+#
+# Why this and not a service on the relay: proposal-writer listens on the
+# host's loopback, and the relay runs in a datacentre with no route to it.
+# Something has to sit on this side and dial out. A container is that
+# something without being a terminal somebody has to remember to leave open.
+#
+# Two settings here are load-bearing:
+#
+#   network_mode: host   A container has its own loopback, so 127.0.0.1 inside
+#                        it is not the machine's 127.0.0.1 and proposal-writer
+#                        would be unreachable. Linux only; on macOS or Windows
+#                        drop this line and set PROPOSAL_UI to
+#                        http://host.docker.internal:8765 instead.
+#
+#   the state volume     The worker's id lives in it. Without it, every
+#                        `up` is a worker the relay has never seen, asking to
+#                        join under a name that already exists - and somebody
+#                        has to approve it, again, for ever.
+services:
+  proposal-bridge:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["python", "examples/proposal_bridge.py"]
+    network_mode: host
+    environment:
+      RELAY_URL: "https://relay-production-7643.up.railway.app/upwork"
+      # Its own name, so it can never be mistaken for a worker you already
+      # have. Approve it once in the console the first time it starts.
+      RELAY_WORKER: "proposal-bridge"
+      RELAY_CHANNELS: "jobs,github"
+      PROPOSAL_UI: "http://127.0.0.1:8765"
+      PROPOSAL_PERSON: "Zachary"
+      PROPOSAL_GUIDE: "general"
+      BRIDGE_STATE: "/state/proposal-bridge.json"
+    volumes:
+      - ${HOME}/.relay/bridge:/state
+    # A clean exit means it was refused, or told to stop. Only a crash is
+    # worth coming back from.
+    restart: on-failure

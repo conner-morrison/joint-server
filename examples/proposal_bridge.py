@@ -707,8 +707,11 @@ def main() -> None:
                    help="the workspace address, e.g. https://relay.example.com/upwork")
     p.add_argument("--local", default=os.environ.get("PROPOSAL_UI", "http://127.0.0.1:8765"),
                    help="where proposal-writer is listening")
-    p.add_argument("--channel", action="append", default=[],
-                   help="a channel to watch; repeatable, and every channel when not given")
+    p.add_argument("--channel", action="append",
+                   default=[c for c in os.environ.get("RELAY_CHANNELS", "").split(",") if c.strip()],
+                   help="a channel to watch; repeatable, and every channel when not given. "
+                        "RELAY_CHANNELS sets it as a comma-separated list, for somewhere a "
+                        "repeated flag is awkward - a compose file, a unit file")
     p.add_argument("--name", default=os.environ.get("RELAY_WORKER", "upwork-proposal-writer"),
                    help="what to call this worker in the console")
     p.add_argument("--label", default="proposal-writer bridge")

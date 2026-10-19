@@ -500,6 +500,25 @@ invents its own token comes back after every deploy as a stranger waiting to be
 approved again; given one, it is the same worker each time. It prints the token
 it made if you do not set one.
 
+**The bridge as a container.** `examples/bridge.compose.yml` runs the bridge
+from the same image, so it is not a terminal somebody has to leave open:
+
+```bash
+docker compose -f examples/bridge.compose.yml up -d --build
+docker compose -f examples/bridge.compose.yml logs -f
+```
+
+Two settings in it are load-bearing. `network_mode: host`, because a container
+has its own loopback and `127.0.0.1` inside it is not the machine's - without
+it proposal-writer is unreachable. (On macOS or Windows, drop that line and
+point `PROPOSAL_UI` at `http://host.docker.internal:8765`.) And the volume
+holding its state, because the worker's id lives there: without it every `up`
+is a worker the relay has never seen, asking to join under a name that already
+exists.
+
+It asks to join under its own name the first time it starts, so it cannot be
+confused with a worker you already have. Approve it once in the console.
+
 **Render.** `render.yaml` describes the same service; import it as a Blueprint
 and set `DATABASE_URL` in the dashboard. A free instance sleeps when idle, so
 a worker's poll waits for it to wake.
