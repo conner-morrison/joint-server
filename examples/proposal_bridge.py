@@ -516,14 +516,15 @@ class Bridge:
         # running thing, not the repository.
         published = [url for label, url in links_in(body) if label == "Published"]
         short = unfinished(body)
-        note = said + (f" ({short})" if short else "") + (
-            " \u00b7 " + published[0] if published else "")
         # What the search said about these repositories, carried alongside this
         # message because routing meant this worker never received it.
         overall, by_url = searched(msg.get("thread"))
-        text = f"From #{msg.get('channel')}: {said}"
+        # One message for one job, and it names the job. The id is in the
+        # address as well, but a message that has to be read alongside its own
+        # url is a message that can be filed against the wrong job.
+        text = f"Job {job}: {said}"
         if short:
-            # Said before the list, so it cannot be read as a complete answer.
+            # Said at the top, so it cannot be read as a complete answer.
             text += f"\nIncomplete: {short}"
         if overall:
             text += f"\n\n{overall}"
@@ -534,19 +535,22 @@ class Bridge:
                 text += f"\n\nPublished: {url}" + (f"  ({name})" if name else "")
                 # Matched on where it came from: the search knows the original,
                 # and what was published from it is a copy under another name.
+                # Where it came from is the worker's business, not the
+                # proposal's, so only what was said about it goes on.
                 found = by_url.get(item.get("source") or "") or by_url.get(url)
                 if found:
-                    text += f"\nFrom {item.get('source') or url}\n{about(found)}"
+                    text += f"\n{about(found)}"
             elif item.get("error"):
                 text += f"\nNot published: {item.get('name') or 'one item'} - {item['error']}"
         if not results_in(body) and published:
             text += "\n" + "\n".join(f"Published: {url}" for url in published)
+        # One message, and one only. The gate at the other end clears on the
+        # first reply for a job and replaces rather than appends, so a second
+        # message about the same job arrives after it has closed and is lost -
+        # along with whatever it was carrying.
         try:
             status, _ = http("POST", f"{self.local()}/api/job/{job}/message",
                              {"role": "user", "text": text}, timeout=self.args.local_timeout)
-            if status == 200:
-                http("POST", f"{self.local()}/api/job/{job}/note", {"note": note[:200]},
-                     timeout=self.args.local_timeout)
         except OSError as exc:
             say(f"proposal-writer is not answering ({exc}); will try #{msg['seq']} again")
             return False
