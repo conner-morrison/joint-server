@@ -2425,13 +2425,43 @@ function messageRow(m, replies) {
 
 // An answer to something above it. Short by nature: who, when, and what they
 // said, which is usually one word.
+// What a worker says it did, under whichever name it used. "event" belongs
+// here: a worker reporting {"event": "done"} was saying the same thing as one
+// reporting {"status": "done"}, and was read as having said nothing at all.
+const SAID_KEYS = ["status", "state", "result", "event", "outcome", "text", "message"];
+// A worker that did several things reports them as a list. The list is the
+// answer - without it a reply says only that there was one.
+const RESULT_KEYS = ["repos", "results", "items", "outputs", "published", "created"];
+
+function resultsIn(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return [];
+  for (const key of RESULT_KEYS) {
+    const said = body[key];
+    if (Array.isArray(said) && said.some((item) => item && typeof item === "object")) {
+      return said.filter((item) => item && typeof item === "object");
+    }
+  }
+  return [];
+}
+
 function replyRow(m) {
   const body = m.body;
-  const said = body && typeof body === "object" && !Array.isArray(body)
-    ? String(body.status || body.state || body.result || body.text || body.message || "")
+  const plain = body && typeof body === "object" && !Array.isArray(body);
+  const said = plain
+    ? String(SAID_KEYS.map((k) => body[k]).find((v) => v !== undefined && v !== null && v !== "")
+      || "")
     : String(body ?? "");
   const done = /^(done|ok|complete|completed|success|succeeded|finished|merged)$/i.test(said.trim());
   const links = linksOf(body);
+  const results = resultsIn(body);
+  // What it managed, where a worker counted. A failure above zero is the one
+  // number that must not be read as a complete answer.
+  const counts = plain
+    ? [["done", body.completed], ["failed", body.failed], ["skipped", body.skipped]]
+      .filter(([, n]) => typeof n === "number")
+      .map(([what, n]) => h("span", { class: "fact" + (what === "failed" && n > 0 ? " bad" : "") },
+        h("b", {}, what), String(n)))
+    : [];
   return h("div", { class: "reply" },
     h("span", { class: "reply-mark" + (done ? " done" : "") }, done ? "\u2713" : "\u203a"),
     h("div", { class: "grow" },
@@ -2440,10 +2470,27 @@ function replyRow(m) {
         h("span", { class: "muted small", title: m.sender }, "\u00b7 " + workerName(m.sender)),
         h("time", { class: "muted small", title: new Date(m.ts * 1000).toLocaleString() },
           "\u00b7 " + clock(m.ts))),
+      counts.length ? h("div", { class: "job-facts" }, counts) : false,
       links.length
         ? h("div", { class: "job-links" }, links.map((l) =>
           h("a", { class: "link-chip", href: l.url, target: "_blank", rel: "noopener noreferrer",
                    title: l.url }, l.label)))
+        : false,
+      results.length
+        ? h("ul", { class: "results" }, results.map((item) => {
+          const own = linksOf(item);
+          const failed = item.error || /^(failed|error)$/i.test(String(item.status || ""));
+          return h("li", {},
+            h("span", { class: "reply-mark" + (failed ? " bad" : " done") }, failed ? "!" : "\u2713"),
+            h("span", { class: "strong truncate" },
+              item.name || item.title || item.id || labelFor(own.length ? own[0].url : "")),
+            own.length
+              ? h("div", { class: "job-links" }, own.map((l) =>
+                h("a", { class: "link-chip", href: l.url, target: "_blank",
+                         rel: "noopener noreferrer", title: l.url }, l.label)))
+              : false,
+            item.error ? h("span", { class: "muted small" }, String(item.error)) : false);
+        }))
         : false));
 }
 
