@@ -872,7 +872,9 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         got = {}
         for who, worker in ids.items():
             _, said = await self.call("GET", f"/{ws}/messages?wait=1", token=worker)
-            got[who] = [m["body"] for m in said["messages"]]
+            # A message the server answered for arrives as the answer, with
+            # the parts it was made from left behind, so there may be no body.
+            got[who] = [m["body"] for m in said["messages"] if "body" in m]
         return got
 
     async def test_a_channel_is_a_room_until_something_is_said(self) -> None:
@@ -995,21 +997,25 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         await self.heard_by(ws, ids)
         await self.call("POST", f"/{ws}/publish",
                         {"channel": "github",
+                         # `source` is how a published copy is paired with what
+                         # the search said about the thing it was copied from.
+                         # It is read here and never passed on.
                          "body": {"event": "done", "job_id": "23646e37", "repos": [
-                             {"name": "one",
+                             {"name": "one", "source": "https://github.com/a/one",
                               "published": "https://github.com/me/one"}]}},
                         token=ids["github-finder"])
 
         _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
         message = got["messages"][0]
-        self.assertEqual(message["body"]["event"], "done")
-        # What repo-finder said, which routing never sent it.
-        carried = {m["sender"]: m["body"] for m in message["thread"]}
-        self.assertIn(ids["repo-finder"], carried)
-        self.assertEqual(carried[ids["repo-finder"]]["repos"][0]["description"], "does the sync")
-        # Not its own job item, and not the message it is being handed.
-        self.assertNotIn(ids["writer"], carried)
-        self.assertNotIn(ids["github-finder"], carried)
+        # The parts are carried as the answer made from them, which is the
+        # point of carrying them: what repo-finder said, which routing never
+        # sent this worker, reaches it attached to what became of the job.
+        self.assertIn("does the sync", message["reply"])
+        self.assertIn("https://github.com/me/one", message["reply"])
+        # And the messages it was made from do not come too: they say one
+        # thing more than it does, which is where each copy was copied from.
+        self.assertNotIn("body", message)
+        self.assertNotIn("thread", message)
 
     async def test_a_channel_that_does_not_carry_it_is_unchanged(self) -> None:
         ws = await self.workspace()
@@ -1260,7 +1266,7 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                         token=ids["github-finder"])
 
         _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
-        answer = next(m for m in got["messages"] if m["body"].get("event") == "done")
+        answer = next(m for m in got["messages"] if m.get("reply"))
         reply = answer["reply"]
         self.assertTrue(reply.startswith("Job d792948d: done"), reply[:60])
         self.assertIn("The client wants inventory analysed.", reply)

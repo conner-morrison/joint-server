@@ -34,10 +34,10 @@ OVERALL_KEYS = ("summary", "overview", "report")
 # published copy came from is the publisher's business, not the proposal's.
 NOT_ABOUT = frozenset({"url", "published", "source", "similarity", "created", "last_push",
                        "name", "status", "error", "id", "job", "job_id", "jobId",
-                       # The posting's own words, already in front of whoever
-                       # asked for the job; and the search's prose, which is
-                       # what the fields here say.
-                       "description", "report"})
+                       # The search's prose, which is the fields here said
+                       # again at length. A repository's own description is
+                       # not that and is kept: it is the description.
+                       "report"})
 
 
 def said_in(body: Any) -> str:
@@ -152,7 +152,9 @@ def compose(body: Any, thread: list[dict[str, Any]]) -> str | None:
         name = item.get("name") or ""
         lines += ["", f"Published: {url}" + (f"  ({name})" if name else "")]
         # Matched on where it came from: the search knows the original, and
-        # what was published from it is a copy under another name.
+        # what was published from it is a copy under another name. So the
+        # answer must say `source` for its description to be found - it is
+        # read here and never passed on.
         found = by_url.get(item.get("source") or "") or by_url.get(url)
         if found:
             lines += about(found)

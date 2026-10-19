@@ -1744,14 +1744,19 @@ class WorkspaceStore:
             also = [{"seq": r["seq"], "sender": r["sender"], "body": r["body"], "ts": r["ts"]}
                     for r in by_thread.get((row["channel"], row["thread_key"]), ())
                     if r["seq"] != row["seq"]]
-            if also:
-                message["thread"] = also
             # The worker that finishes a job is the trigger, not the author.
             # What asked for the job should be handed the answer once, whole,
             # rather than two messages and the work of joining them.
             answer = compose(row["body"], also)
             if answer:
+                # The answer is the message. The parts it was made from say
+                # one thing more than it does - where each published copy was
+                # copied from - and that is the publisher's business, not the
+                # proposal's, so they do not go.
                 message["reply"] = answer
+                message.pop("body", None)
+            elif also:
+                message["thread"] = also
         return found
         return [_message(r) for r in rows]
 

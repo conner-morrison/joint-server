@@ -336,6 +336,16 @@ never stored: the messages stay exactly as their workers wrote them.
 A message that is not an answer never gets that shape, and an answer that fell
 short says so at the top, where it cannot be mistaken for a whole one.
 
+When the answer goes, the messages it was made from do not. They say one thing
+more than it does - where each published copy was copied from - and that is the
+publisher's business rather than the proposal's. So the delivery is the job,
+what became of it, each published address and what the search said about it,
+and nothing else.
+
+That `source` is read, though: it is how a published copy is paired with what
+was said about the thing it was copied from. An answer that does not report it
+cannot have descriptions attached to it.
+
 Beside the message, never folded into it: those are other workers' messages and
 they stay as they were written. What ties them together is the job each names -
 `job_id`, `jobId`, `job`, or an Upwork link - so a worker that names no job

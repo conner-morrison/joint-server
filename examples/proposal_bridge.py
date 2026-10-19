@@ -535,7 +535,12 @@ class Bridge:
         read = msg.get("fields")
         if isinstance(read, dict) and read:
             body = {**(body if isinstance(body, dict) else {}), **read}
-        job = job_id_of(body)
+        # An answer composed by the relay arrives without the messages it was
+        # made from, so the job it is about is read from the fields beside it
+        # rather than from a body that is not there.
+        job = job_id_of(body) or (read or {}).get("jobId")
+        if job and isinstance(msg.get("reply"), str) and msg["reply"].strip():
+            return self.report(msg, job, body if isinstance(body, dict) else {})
         if job and isinstance(body, dict) and not body.get("jd") and not body.get("description"):
             return self.report(msg, job, body)
         return self.draft(msg)
