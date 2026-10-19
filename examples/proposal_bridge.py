@@ -117,6 +117,65 @@ def results_in(body: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+# What a search says about a repository, beyond the fact that it found it.
+# Everything but the bookkeeping: the url is already the heading, and a
+# similarity or a date tells a proposal nothing.
+NOT_ABOUT = {"url", "published", "source", "similarity", "created", "last_push",
+             "name", "status", "error", "id"}
+
+
+def humanise(key: str) -> str:
+    words = re.sub(r"([a-z\d])([A-Z])", r"\1 \2", str(key).replace("_", " ")).split()
+    return " ".join(words).capitalize() if words else str(key)
+
+
+def about(item: dict[str, Any]) -> str:
+    """One repository as the search described it, in full.
+
+    A proposal is written from this - what the project does, how it is built,
+    what was learned using it - so none of it is summarised away here. A list
+    stays a list, because that is how it was found useful.
+    """
+    said: list[str] = []
+    for key, value in item.items():
+        if key in NOT_ABOUT or value in (None, "", [], {}):
+            continue
+        if isinstance(value, (list, tuple)):
+            said.append(f"{humanise(key)}:")
+            said += [f"  - {line}" for line in value if line not in (None, "")]
+        elif isinstance(value, dict):
+            said.append(f"{humanise(key)}:")
+            said += [f"  - {k}: {v}" for k, v in value.items() if v not in (None, "")]
+        else:
+            said.append(f"{humanise(key)}: {value}")
+    return "\n".join(said)
+
+
+def searched(thread: Any) -> tuple[str, dict[str, dict[str, Any]]]:
+    """What the search said, from the messages carried alongside this one.
+
+    Returns what it said about the job as a whole, and what it said about each
+    repository, by url. A worker further down the line published the links; the
+    search that found them published why they matter, and a proposal needs
+    both.
+    """
+    overall = ""
+    by_url: dict[str, dict[str, Any]] = {}
+    for other in thread if isinstance(thread, list) else ():
+        body = other.get("body")
+        if not isinstance(body, dict):
+            continue
+        for key in ("summary", "report"):
+            said = body.get(key)
+            if isinstance(said, str) and said.strip() and len(said) > len(overall):
+                overall = said.strip()
+        for item in results_in(body):
+            url = item.get("url") or item.get("published") or item.get("source")
+            if isinstance(url, str):
+                by_url[url] = item
+    return overall, by_url
+
+
 def unfinished(body: dict[str, Any]) -> str:
     """What a reply says it could not do.
 
@@ -459,15 +518,25 @@ class Bridge:
         short = unfinished(body)
         note = said + (f" ({short})" if short else "") + (
             " \u00b7 " + published[0] if published else "")
+        # What the search said about these repositories, carried alongside this
+        # message because routing meant this worker never received it.
+        overall, by_url = searched(msg.get("thread"))
         text = f"From #{msg.get('channel')}: {said}"
         if short:
             # Said before the list, so it cannot be read as a complete answer.
             text += f"\nIncomplete: {short}"
+        if overall:
+            text += f"\n\n{overall}"
         for item in results_in(body):
             url = item.get("published")
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 name = item.get("name") or ""
-                text += f"\nPublished: {url}" + (f"  ({name})" if name else "")
+                text += f"\n\nPublished: {url}" + (f"  ({name})" if name else "")
+                # Matched on where it came from: the search knows the original,
+                # and what was published from it is a copy under another name.
+                found = by_url.get(item.get("source") or "") or by_url.get(url)
+                if found:
+                    text += f"\nFrom {item.get('source') or url}\n{about(found)}"
             elif item.get("error"):
                 text += f"\nNot published: {item.get('name') or 'one item'} - {item['error']}"
         if not results_in(body) and published:
