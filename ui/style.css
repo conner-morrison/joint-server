@@ -294,6 +294,9 @@ a.job-title::after { content: " ↗"; font-size: 12px; color: var(--muted); text
   font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
 }
 .src.invite { background: var(--accent); color: var(--accent-ink); }
+/* A second tag beside the first, rather than pushed away from it. */
+.src + .src { margin-left: 6px; }
+.src.job { text-transform: none; letter-spacing: 0; font-family: var(--mono, ui-monospace, monospace); }
 
 /* --- bots the server delivers to ----------------------------------------- */
 .bot-dot {

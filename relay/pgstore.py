@@ -413,6 +413,12 @@ def _message(row: dict[str, Any]) -> dict[str, Any]:
         read = reading(row["body"])
         if read:
             message["fields"] = read
+    # Which job this message was filed under, where the channel carries one.
+    # Not always the job the message names: an answer that forgot to echo the
+    # id is tied back by what it copied, and without this there is no way to
+    # see that it was - or that it was not.
+    if row.get("thread_key"):
+        message["job"] = row["thread_key"]
     return message
 
 
@@ -1690,7 +1696,7 @@ class WorkspaceStore:
     async def messages_after(self, channel: str, after: int, *, limit: int = 200,
                              exclude_sender: str | None = None) -> list[dict[str, Any]]:
         rows = await self.store._all("""
-            SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs
+            SELECT m.seq, m.channel, m.sender, m.body, m.ts, m.thread_key, c.reads_jobs
               FROM messages m JOIN channels c
                 ON c.workspace = m.workspace AND c.name = m.channel
              WHERE m.workspace = %s AND m.channel = %s AND m.seq > %s AND m.sender <> %s
@@ -1700,7 +1706,7 @@ class WorkspaceStore:
     async def messages_before(self, channel: str, before: int, *, limit: int = 100) -> list[dict[str, Any]]:
         """The newest `limit` messages below `before`, oldest first."""
         rows = await self.store._all("""
-            SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs
+            SELECT m.seq, m.channel, m.sender, m.body, m.ts, m.thread_key, c.reads_jobs
               FROM messages m JOIN channels c
                 ON c.workspace = m.workspace AND c.name = m.channel
              WHERE m.workspace = %s AND m.channel = %s AND m.seq < %s
@@ -1827,7 +1833,7 @@ class WorkspaceStore:
     async def message_at(self, channel: str, seq: int) -> dict[str, Any] | None:
         """One message, by where it sits in its channel."""
         row = await self.store._one(
-            "SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs "
+            "SELECT m.seq, m.channel, m.sender, m.body, m.ts, m.thread_key, c.reads_jobs "
             "  FROM messages m JOIN channels c "
             "    ON c.workspace = m.workspace AND c.name = m.channel "
             " WHERE m.workspace = %s AND m.channel = %s AND m.seq = %s",

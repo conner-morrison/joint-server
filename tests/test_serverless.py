@@ -1381,6 +1381,32 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
         self.assertNotIn("reply", got["messages"][0])
 
+    async def test_the_console_shows_which_job_a_message_was_filed_under(self) -> None:
+        """Whether an answer was tied to its job is otherwise invisible: the
+        reply is composed for the worker that asked, so the one place a person
+        looks shows a message that names no job and gives no sign of being
+        joined to one."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "88a2c2da", "event": "similar_repos",
+                                  "repos": [{"url": "https://github.com/d/knowledge-hub"}]}},
+                        token=ids["repo-finder"])
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": None, "event": "done",
+                                  "repos": [{"source": "https://github.com/d/knowledge-hub",
+                                             "published": "https://github.com/me/steady"}]}},
+                        token=ids["github-finder"])
+
+        _, feed = await self.call("GET", f"/{ws}/api/channels/github/messages", token="hunter2")
+        filed = [m.get("job") for m in feed]
+        self.assertEqual(filed, ["88a2c2da", "88a2c2da"],
+                         "the rescued answer is not shown as belonging to the job")
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,

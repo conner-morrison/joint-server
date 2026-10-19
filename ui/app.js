@@ -2527,6 +2527,10 @@ function messageRow(m, replies) {
       h("span", {}, "#" + m.seq),
       h("time", { datetime: new Date(m.ts * 1000).toISOString(), title: new Date(m.ts * 1000).toLocaleString() }, clock(m.ts)),
       sourceTag(m.body),
+      // The job this message was filed under. Worth showing on its own: an
+      // answer that forgot to echo the job id is tied back by what it copied,
+      // and this is where you can see whether that worked.
+      m.job ? h("span", { class: "src job", title: "Filed under job " + m.job }, "job " + m.job) : false,
       h("button", {
         class: "btn icon send-again", title: "Send this again, to a worker or a chat",
         "aria-label": "Send this again, to a worker or a chat", onclick: () => sendAgain(m),
