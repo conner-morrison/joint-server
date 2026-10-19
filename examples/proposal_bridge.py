@@ -107,6 +107,9 @@ def links_in(body: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 RESULT_KEYS = ("repos", "results", "items", "outputs", "created")
+# Enough to tell one bad job from a bridge pointed at something that is not
+# there. Low, because every one of them is a job dropped.
+REFUSALS_BEFORE_BLAMING_SETUP = 3
 
 
 def results_in(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -433,6 +436,9 @@ class Bridge:
         self.worker_id = args.id or self.state.get("worker_id") or ""
         self.ticket = self.state.get("ticket") or ""
         self.said_waiting = False
+        # The same refusal, over and over, is not about the messages.
+        self.refused = ""
+        self.refusals = 0
 
     def _load_state(self) -> dict[str, Any]:
         try:
@@ -578,10 +584,24 @@ class Bridge:
             say(f"proposal-writer is not answering ({exc}); will try #{msg['seq']} again")
             return False
         if status != 200:
-            # A rejection is about this message, not the connection: retrying
-            # forever would stop everything behind it.
-            say(f"proposal-writer refused #{msg['seq']}: {status} {body}")
+            # A rejection is normally about this message, and retrying it for
+            # ever would stop everything behind it. But the same rejection for
+            # every message is not about the messages: it is a profile that
+            # does not exist, a guide that was renamed, something misconfigured
+            # here. Treating that as "this one is bad" throws away every job
+            # that arrives until someone notices, and nothing says it happened.
+            said = f"{status} {body}"
+            self.refusals = self.refusals + 1 if said == self.refused else 1
+            self.refused = said
+            if self.refusals >= REFUSALS_BEFORE_BLAMING_SETUP:
+                say(f"proposal-writer has refused {self.refusals} in a row with the same "
+                    f"answer: {said}")
+                say("that is this bridge's setup, not the jobs - nothing more will be "
+                    "acknowledged until it is fixed, so none of it is lost")
+                return False
+            say(f"proposal-writer refused #{msg['seq']}: {said}")
             return True
+        self.refusals = 0
         made = body.get("job") or body.get("mode") or "written"
         words = described(msg.get("body"))
         say(f"#{msg['seq']} {as_title(jd)} -> {made} "
