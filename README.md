@@ -292,8 +292,8 @@ these" - worth knowing before making one. Removing the last route about a
 sender puts it back to reaching everyone rather than leaving it reaching
 nobody.
 
-In the console each member lists who it reaches, under its name in the
-channel's members panel.
+In the console it is in a member's settings, beside the other decisions about
+one worker in one channel: open the gear beside its name.
 
 Routing leaves the last step in a line of work needing what the first one
 found, because it never saw that message. **Carry the thread**, a checkbox on

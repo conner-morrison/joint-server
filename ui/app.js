@@ -1473,38 +1473,51 @@ async function removeTrigger(channel, trigger) {
   } catch (err) { handleError(err); }
 }
 
-// Who each worker reaches in this channel. A channel is normally a room, so
-// nothing is shown until there is more than one member to choose between, and
-// a worker with no routes is marked as reaching everyone - which is what it
-// does, and what it goes on doing until something is said about it.
-function routesRow(ch, member) {
-  const others = ch.members.filter((m) => m.worker_id !== member.worker_id);
-  if (others.length < 2) return false;
-  const reaches = (state.routes[ch.name] || {})[member.worker_id];
-  const everyone = !reaches || !reaches.length;
-  return h("div", { class: "hears" },
-    h("span", { class: "muted small" },
-      everyone ? "reaches everyone here" : "reaches"),
-    h("div", { class: "chips" }, others.map((m) => {
-      const on = !everyone && reaches.includes(m.worker_id);
-      return h("button", {
-        class: "chip toggle" + (everyone ? " faint" : (on ? "" : " off")),
-        title: everyone
-          ? `${member.name} reaches every member. Click to send only to ${m.name}.`
-          : (on ? `Click to stop sending ${member.name}'s posts to ${m.name}.`
-                : `Click to also send ${member.name}'s posts to ${m.name}.`),
-        onclick: () => setRoute(ch.name, member.worker_id, m.worker_id, everyone || !on),
-      }, m.name || m.worker_id);
-    })));
+async function setRoute(channel, sender, recipient, on) {
+  await api(on ? "PUT" : "DELETE",
+    `/api/channels/${enc(channel)}/routes/${enc(sender)}/${enc(recipient)}`);
 }
 
-async function setRoute(channel, sender, recipient, on) {
-  try {
-    await api(on ? "PUT" : "DELETE",
-      `/api/channels/${enc(channel)}/routes/${enc(sender)}/${enc(recipient)}`);
-    await loadRoutes(channel);
-    renderMembers();
-  } catch (err) { handleError(err); }
+// Who this worker reaches in this channel. A channel is normally a room, and
+// stays one until a name is clicked here: the first click is not "also send
+// to" but "send to these", so the wording says so before it is clicked rather
+// than after.
+function reachesField(channel, workerId) {
+  const ch = currentChannel();
+  const others = (ch?.members || []).filter((m) => m.worker_id !== workerId);
+  if (!others.length) return false;
+  let reaches = [...(((state.routes[channel] || {})[workerId]) || [])];
+  const chips = h("div", { class: "chips" });
+  const note = h("span", { class: "hint" });
+
+  const draw = () => {
+    const everyone = !reaches.length;
+    note.textContent = everyone
+      ? "Reaches every member here, as a channel does. Click a name to send only to it."
+      : "Reaches only the names chosen. Unclick them all to go back to everyone.";
+    fill(chips, others.map((m) => {
+      const on = !everyone && reaches.includes(m.worker_id);
+      return h("button", {
+        type: "button", class: "chip toggle" + (everyone ? " faint" : (on ? "" : " off")),
+        title: everyone ? `Send only to ${m.name}` : (on ? `Stop sending to ${m.name}`
+                                                         : `Also send to ${m.name}`),
+        onclick: async () => {
+          const want = everyone || !on;
+          try {
+            await setRoute(channel, workerId, m.worker_id, want);
+            reaches = everyone ? [m.worker_id]
+              : (want ? [...reaches, m.worker_id] : reaches.filter((x) => x !== m.worker_id));
+            draw();
+            await loadRoutes(channel);
+            renderMembers();
+          } catch (err) { handleError(err); }
+        },
+      }, m.name || m.worker_id);
+    }));
+  };
+  draw();
+  return h("div", { class: "field" },
+    h("span", { class: "field-label" }, `Reaches in #${channel}`), chips, note);
 }
 
 async function loadRoutes(channel) {
@@ -1541,8 +1554,7 @@ function renderMemberList() {
           class: "btn icon", title: `${shown}'s settings in #${ch.name}`,
           "aria-label": `${shown}'s settings in #${ch.name}`,
           onclick: () => openMemberSettings(ch.name, id, shown),
-        }, "\u2699"),
-        routesRow(ch, m));
+        }, "\u2699"));
     }))
     : h("p", { class: "muted small" }, "No members yet. Only members can post here and receive what is posted."));
 }
@@ -1584,6 +1596,7 @@ function openMemberSettings(channel, workerId, shown) {
       + "workers watching the same board post it once between them. Allowed, this worker posts "
       + "it anyway - for one whose point is what it says about a job, a decision or a reason, "
       + "because that is not the job again."),
+    reachesField(channel, workerId),
     h("label", { class: "check" }, everywhere,
       h("span", {},
         h("span", { class: "strong" }, "Allow it wherever this worker publishes"),
