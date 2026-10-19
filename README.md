@@ -295,6 +295,22 @@ nobody.
 In the console each member lists who it reaches, under its name in the
 channel's members panel.
 
+Routing leaves the last step in a line of work needing what the first one
+found, because it never saw that message. **Carry the thread**, a checkbox on
+the channel, hands a worker what others said about the same job alongside the
+message:
+
+```json
+{"seq": 3, "sender": "w-f2b6…", "body": { …the answer… },
+ "thread": [ {"seq": 2, "sender": "w-78d5…", "body": { …what the step before found… }} ]}
+```
+
+Beside the message, never folded into it: those are other workers' messages and
+they stay as they were written. What ties them together is the job each names -
+`job_id`, `jobId`, `job`, or an Upwork link - so a worker that names no job
+carries nothing and is carried nowhere. A worker's own messages are never
+carried back to it.
+
 Sending one message to one worker by hand ignores all of this. That is an act
 rather than a rule, and acts are honoured - otherwise a route could leave a
 channel impossible to repair from the console.

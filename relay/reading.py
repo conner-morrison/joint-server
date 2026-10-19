@@ -10,6 +10,7 @@ delivered; this is an extra way of looking at it, offered beside it.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -174,6 +175,30 @@ ALIASES = (
     ("jobId", ("jobId", "job_id")),
 )
 UPWORK_JOB = re.compile(r"upwork\.com/jobs/(~[0-9a-z]+)", re.I)
+
+
+# What ties a job item to the answers about it. A worker answering names the
+# job it is answering, which is the only thing the messages have in common:
+# they are written by different workers, in different shapes, minutes apart.
+THREAD_KEYS = ("jobId", "job_id", "job", "proposalId", "proposal_id")
+
+
+def thread_of(body: Any) -> str | None:
+    """The job a message belongs to, for tying a thread together.
+
+    Taken from what the publisher called it, and failing that from an Upwork
+    link, so a job item that names no id still gathers the answers that do.
+    """
+    found = body if isinstance(body, dict) else labelled(body) if isinstance(body, str) else None
+    if isinstance(found, dict):
+        for key in THREAD_KEYS:
+            said = found.get(key)
+            if isinstance(said, str) and said.strip():
+                return said.strip()
+            if isinstance(said, (int, float)) and not isinstance(said, bool):
+                return str(said)
+    seen = UPWORK_JOB.search(body if isinstance(body, str) else json.dumps(body, default=str))
+    return seen.group(1).lower() if seen else None
 
 
 def reading(body: Any) -> dict[str, Any]:

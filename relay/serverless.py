@@ -521,6 +521,19 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
             raise HTTPException(404, f"no channel {name!r}")
         return {"removed": True}
 
+    @app.post("/{ws}/api/channels/{name}/carries-thread")
+    async def set_carries_thread(name: str, body: ReadsJobsIn,
+                                 scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Whether a worker here is handed what others said about the same job.
+
+        For a channel where work is passed along: a job, what one worker found
+        about it, what the next chose from that. Each step needs the one before
+        it, and routing means it never saw it.
+        """
+        if not await scoped.set_carries_thread(name, body.reads):
+            raise HTTPException(404, f"no channel {name!r}")
+        return {"channel": name, "carries_thread": body.reads}
+
     @app.post("/{ws}/api/channels/{name}/reads-jobs")
     async def set_reads_jobs(name: str, body: ReadsJobsIn,
                              scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:

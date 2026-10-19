@@ -33,7 +33,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
-from relay.reading import reading
+from relay.reading import reading, thread_of
 from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
 
 log = logging.getLogger("relay.pgstore")
@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS channels (
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     created_at  DOUBLE PRECISION NOT NULL,
+    -- Whether a worker is handed what others said about the same job along
+    -- with the message. For a channel where work is passed along and each
+    -- step needs what the step before it found.
+    carries_thread BOOLEAN NOT NULL DEFAULT FALSE,
     -- Whether what is posted here is read as a job posting and handed to
     -- workers in parts. A channel carrying something else - replies, leads,
     -- anything - is left exactly as its publishers wrote it.
@@ -245,6 +249,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender      TEXT NOT NULL,              -- a worker id, or @server; not a foreign key so history survives
     client_id   TEXT,                       -- the publisher's id for this message, used to drop resends
     job_key     TEXT,                       -- the job this is about, read from its own link
+    thread_key  TEXT,                       -- what ties it to the answers about it
                                             -- (its index is made alongside the column, in a
                                             -- migration: an older table has neither)
     body        JSONB NOT NULL,
@@ -512,6 +517,12 @@ class PgStore:
                                    "may_repeat BOOLEAN")
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS "
                                    "reads_jobs BOOLEAN NOT NULL DEFAULT FALSE")
+                await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS "
+                                   "carries_thread BOOLEAN NOT NULL DEFAULT FALSE")
+                await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS "
+                                   "thread_key TEXT")
+                await conn.execute("CREATE INDEX IF NOT EXISTS messages_thread "
+                                   "ON messages(workspace, channel, thread_key)")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_job "
                                    "ON messages(workspace, channel, job_key)")
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
@@ -521,12 +532,18 @@ class PgStore:
         try:
             async with self.pool.connection() as conn:
                 missing = await (await conn.execute(
-                    "SELECT seq, body FROM messages WHERE job_key IS NULL")).fetchall()
-                read = [(job_of(row["body"]), row["seq"]) for row in missing]
-                found = [pair for pair in read if pair[0]]
-                for key, seq in found:
-                    await conn.execute("UPDATE messages SET job_key = %s WHERE seq = %s",
-                                       (key, seq))
+                    "SELECT seq, body FROM messages "
+                    " WHERE job_key IS NULL OR thread_key IS NULL")).fetchall()
+                found = []
+                for row in missing:
+                    key, thread = job_of(row["body"]), thread_of(row["body"])
+                    if key or thread:
+                        found.append((key, thread, row["seq"]))
+                for key, thread, seq in found:
+                    await conn.execute(
+                        "UPDATE messages SET job_key = COALESCE(job_key, %s), "
+                        "                    thread_key = COALESCE(thread_key, %s) WHERE seq = %s",
+                        (key, thread, seq))
                 if found:
                     log.info("read the job link of %d stored messages", len(found))
         except Exception as exc:                 # noqa: BLE001 - reported, never fatal
@@ -951,6 +968,17 @@ class WorkspaceStore:
         return await self.store._one("SELECT 1 FROM channels WHERE workspace = %s AND name = %s",
                                      (self.slug, name)) is not None
 
+    async def set_carries_thread(self, channel: str, carries: bool) -> bool:
+        """Whether a worker here is handed what others said about the same job.
+
+        For a channel where work is passed along: a job, what one worker found
+        about it, what the next chose from that. Each step needs the one before
+        it, and routing means it never saw it.
+        """
+        return await self.store._run(
+            "UPDATE channels SET carries_thread = %s WHERE workspace = %s AND name = %s",
+            (carries, self.slug, channel)) > 0
+
     async def set_reads_jobs(self, channel: str, reads: bool) -> bool:
         """Whether what is posted here is read as a job posting.
 
@@ -966,7 +994,7 @@ class WorkspaceStore:
 
     async def list_channels(self) -> list[dict[str, Any]]:
         rows = await self.store._all("""
-            SELECT c.name, c.description, c.created_at, c.reads_jobs,
+            SELECT c.name, c.description, c.created_at, c.reads_jobs, c.carries_thread,
                    (SELECT COUNT(*) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS messages,
                    (SELECT MAX(seq) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS last_seq
               FROM channels c WHERE c.workspace = %s ORDER BY c.name""", (self.slug,))
@@ -1382,10 +1410,11 @@ class WorkspaceStore:
                     if seen is not None:
                         return int(seen["seq"]), True
                 cur = await conn.execute(
-                    "INSERT INTO messages(workspace, channel, sender, client_id, job_key, body, ts) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING seq",
-                    (self.slug, channel, sender, client_id, key, json.dumps(body),
-                     time.time() if ts is None else ts))
+                    "INSERT INTO messages(workspace, channel, sender, client_id, job_key, "
+                    "                     thread_key, body, ts) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING seq",
+                    (self.slug, channel, sender, client_id, key, thread_of(body),
+                     json.dumps(body), time.time() if ts is None else ts))
                 row = await cur.fetchone()
                 await self._trim(conn, channel)
                 # Announced in the same transaction as the insert, so nobody is
@@ -1486,7 +1515,8 @@ class WorkspaceStore:
         oldest first, plus anything asked for again by hand. One query,
         because a poll should be one round trip."""
         rows = await self.store._all("""
-            SELECT m.seq, m.channel, m.sender, m.body, m.ts, c.reads_jobs
+            SELECT m.seq, m.channel, m.sender, m.body, m.ts, m.thread_key,
+                   c.reads_jobs, c.carries_thread
               FROM messages m
               JOIN channels c ON c.workspace = m.workspace AND c.name = m.channel
               JOIN members mem
@@ -1509,6 +1539,44 @@ class WorkspaceStore:
                                 WHERE r.workspace = m.workspace AND r.channel = m.channel
                                   AND r.worker_id = mem.worker_id AND r.seq = m.seq))
              ORDER BY m.seq LIMIT %s""", (self.slug, worker_id, worker_id, limit))
+        return await self._with_threads(rows, worker_id)
+
+    async def _with_threads(self, rows: list[dict[str, Any]],
+                            worker_id: str) -> list[dict[str, Any]]:
+        """Hand a worker what others said about the same job, where the channel
+        carries it.
+
+        A channel where work is passed along leaves each step needing what the
+        step before it found, and routing means a worker never saw it. Attached
+        beside the message rather than folded into it, because it is other
+        workers' messages and they are theirs as they wrote them.
+        """
+        found = [_message(row) for row in rows]
+        wanted = {(row["channel"], row["thread_key"]) for row in rows
+                  if row.get("carries_thread") and row.get("thread_key")}
+        if not wanted:
+            return found
+        siblings = await self.store._all("""
+            SELECT seq, channel, sender, body, ts, thread_key FROM messages
+             WHERE workspace = %s AND (channel, thread_key) IN (
+                   SELECT * FROM UNNEST(%s::text[], %s::text[]))
+               AND sender <> %s
+             ORDER BY seq""",
+            (self.slug, [c for c, _ in wanted], [t for _, t in wanted], worker_id))
+        by_thread: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in siblings:
+            by_thread.setdefault((row["channel"], row["thread_key"]), []).append(row)
+        for message, row in zip(found, rows):
+            if not (row.get("carries_thread") and row.get("thread_key")):
+                continue
+            # Everything else said about this job, by anyone but this worker
+            # and other than the message being handed over.
+            also = [{"seq": r["seq"], "sender": r["sender"], "body": r["body"], "ts": r["ts"]}
+                    for r in by_thread.get((row["channel"], row["thread_key"]), ())
+                    if r["seq"] != row["seq"]]
+            if also:
+                message["thread"] = also
+        return found
         return [_message(r) for r in rows]
 
     async def bot_member(self, channel: str, bot: str) -> dict[str, Any] | None:

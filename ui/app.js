@@ -1160,6 +1160,16 @@ function renderChannelHead() {
         onchange: (e) => setReadsJobs(ch.name, e.target.checked),
       }),
       h("span", { class: "muted small" }, "Read as job postings")),
+    h("label", { class: "check inline",
+                 title: "For a channel where work is passed along. On, a worker is handed what "
+                      + "others said about the same job alongside the message - so the one that "
+                      + "acts last still has what the one before it found, even though routing "
+                      + "means it never saw that message." },
+      h("input", {
+        type: "checkbox", ...(ch.carries_thread ? { checked: true } : {}),
+        onchange: (e) => setCarriesThread(ch.name, e.target.checked),
+      }),
+      h("span", { class: "muted small" }, "Carry the thread")),
     h("button", { class: "btn danger", onclick: () => removeChannel(ch.name) }, "Delete channel"));
 }
 
@@ -1618,6 +1628,15 @@ async function removeMember(channel, workerId) {
     await api("DELETE", `/api/channels/${enc(channel)}/members/${enc(workerId)}`);
     toast(`${workerName(workerId)} left #${channel}`);
     refreshAll();
+  } catch (err) { handleError(err); }
+}
+
+async function setCarriesThread(channel, carries) {
+  try {
+    await api("POST", `/api/channels/${enc(channel)}/carries-thread`, { reads: carries });
+    toast(carries ? `#${channel} carries what others said about the same job`
+      : `#${channel} hands over each message on its own`);
+    await refreshAll();
   } catch (err) { handleError(err); }
 }
 

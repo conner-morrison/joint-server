@@ -891,6 +891,82 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
         self.assertEqual(routes, {ids["writer"]: [ids["repo-finder"]]})
 
+    async def test_a_channel_can_carry_what_others_said_about_a_job(self) -> None:
+        """A line of work leaves the last step needing what the first found,
+        and routing means it never saw that message. Carried beside the one it
+        is handed, rather than folded into it: those are other workers'
+        messages and they are theirs as they wrote them."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        for sender, recipient in (("writer", "repo-finder"),
+                                  ("repo-finder", "github-finder"),
+                                  ("github-finder", "writer")):
+            await self.call(
+                "PUT", f"/{ws}/api/channels/github/routes/{ids[sender]}/{ids[recipient]}",
+                token="hunter2")
+
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "23646e37", "title": "A job"}}, token=ids["writer"])
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"job_id": "23646e37", "repos": [
+                             {"url": "https://github.com/a/one",
+                              "description": "does the sync"}]}}, token=ids["repo-finder"])
+        await self.heard_by(ws, ids)
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github",
+                         "body": {"event": "done", "job_id": "23646e37", "repos": [
+                             {"name": "one",
+                              "published": "https://github.com/me/one"}]}},
+                        token=ids["github-finder"])
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        message = got["messages"][0]
+        self.assertEqual(message["body"]["event"], "done")
+        # What repo-finder said, which routing never sent it.
+        carried = {m["sender"]: m["body"] for m in message["thread"]}
+        self.assertIn(ids["repo-finder"], carried)
+        self.assertEqual(carried[ids["repo-finder"]]["repos"][0]["description"], "does the sync")
+        # Not its own job item, and not the message it is being handed.
+        self.assertNotIn(ids["writer"], carried)
+        self.assertNotIn(ids["github-finder"], carried)
+
+    async def test_a_channel_that_does_not_carry_it_is_unchanged(self) -> None:
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        for who, body in (("repo-finder", {"job_id": "23646e37", "found": 1}),
+                          ("github-finder", {"job_id": "23646e37", "event": "done"})):
+            await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": body},
+                            token=ids[who])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        for message in got["messages"]:
+            self.assertNotIn("thread", message)
+
+    async def test_only_the_same_job_is_carried(self) -> None:
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github", "body": {"job_id": "other", "note": "elsewhere"}},
+                        token=ids["repo-finder"])
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github", "body": {"job_id": "23646e37", "note": "here"}},
+                        token=ids["repo-finder"])
+        await self.heard_by(ws, ids)
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github", "body": {"job_id": "23646e37", "event": "done"}},
+                        token=ids["github-finder"])
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        # Reading does not acknowledge, so everything it is owed is here; the
+        # one under test is the answer, not the messages that led to it.
+        done = next(m for m in got["messages"] if m["body"].get("event") == "done")
+        carried = [m["body"].get("note") for m in done.get("thread", [])]
+        self.assertEqual(carried, ["here"], "a different job was carried along")
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,
