@@ -58,8 +58,10 @@ def job_id_of(body: Any) -> str | None:
     return None
 
 
+# "event" belongs here: a worker reporting {"event": "done"} is saying what one
+# reporting {"status": "done"} says, and was read as having said nothing.
 def said_in(body: dict[str, Any]) -> str:
-    for key in ("status", "state", "result", "message", "text"):
+    for key in ("status", "state", "result", "event", "outcome", "message", "text"):
         value = body.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -89,7 +91,47 @@ def links_in(body: dict[str, Any]) -> list[tuple[str, str]]:
         take(body.get(key), label)
     take(body.get("links"))
     take(body.get("urls"))
+    # A worker that did several things reports them as a list, and the url of
+    # each published one is inside it. Looked at only at the top of a body,
+    # every one of them is lost - which is the whole of what the reply was
+    # carrying.
+    for key in RESULT_KEYS:
+        items = body.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                for named, label in NAMED_LINKS:
+                    take(item.get(named), label)
     return found
+
+
+RESULT_KEYS = ("repos", "results", "items", "outputs", "created")
+
+
+def results_in(body: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in RESULT_KEYS:
+        items = body.get(key)
+        if isinstance(items, list) and any(isinstance(i, dict) for i in items):
+            return [i for i in items if isinstance(i, dict)]
+    return []
+
+
+def unfinished(body: dict[str, Any]) -> str:
+    """What a reply says it could not do.
+
+    A reply carrying fewer results than were asked for, or a failure count
+    above zero, reads as a complete answer unless it says otherwise - and a
+    proposal written from a partial answer looks finished too.
+    """
+    failed = body.get("failed")
+    trouble = [f"{item.get('name') or 'one item'}: {item.get('error')}"
+               for item in results_in(body) if item.get("error")]
+    said = []
+    if isinstance(failed, int) and failed > 0:
+        said.append(f"{failed} failed")
+    said += trouble
+    return "; ".join(said)
 
 
 def http(method: str, url: str, body: Any = None, token: str = "", timeout: float = 60.0
@@ -414,9 +456,21 @@ class Bridge:
         # business, not the proposal's: what a client can be shown is the
         # running thing, not the repository.
         published = [url for label, url in links_in(body) if label == "Published"]
-        note = said + (" \u00b7 " + published[0] if published else "")
+        short = unfinished(body)
+        note = said + (f" ({short})" if short else "") + (
+            " \u00b7 " + published[0] if published else "")
         text = f"From #{msg.get('channel')}: {said}"
-        if published:
+        if short:
+            # Said before the list, so it cannot be read as a complete answer.
+            text += f"\nIncomplete: {short}"
+        for item in results_in(body):
+            url = item.get("published")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                name = item.get("name") or ""
+                text += f"\nPublished: {url}" + (f"  ({name})" if name else "")
+            elif item.get("error"):
+                text += f"\nNot published: {item.get('name') or 'one item'} - {item['error']}"
+        if not results_in(body) and published:
             text += "\n" + "\n".join(f"Published: {url}" for url in published)
         try:
             status, _ = http("POST", f"{self.local()}/api/job/{job}/message",
