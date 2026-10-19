@@ -31,6 +31,7 @@ from pydantic import BaseModel, field_validator
 from relay import telegram
 from relay.notify import Notifier, key as notify_key
 from relay.hooks import HookSender, check_url
+from relay.kinds import listed as listed_kinds
 from relay.sender import BotSender
 from relay.pgstore import PgStore, WorkspaceStore, check_name, slugify
 
@@ -98,6 +99,12 @@ class RenameIn(BaseModel):
 
 class RepeatsIn(BaseModel):
     allowed: bool
+
+
+class KindIn(BaseModel):
+    """What a worker is. None takes the kind away and leaves every switch that
+    followed from it exactly as it stands."""
+    kind: str | None = None
 
 
 class ReadsJobsIn(BaseModel):
@@ -402,6 +409,30 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         if name is None:
             raise HTTPException(404, f"no worker {worker_id!r}")
         return {"worker_id": worker_id, "name": name}
+
+    @app.get("/api/kinds")
+    async def kinds() -> list[dict[str, Any]]:
+        """What a worker can be, and what follows from each. Read by the
+        console so it does not have to carry a second copy of the rules."""
+        return listed_kinds()
+
+    @app.post("/{ws}/api/workers/{worker_id}/kind")
+    async def set_kind(worker_id: str, body: KindIn,
+                       scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Say what a worker is, and put everything that follows from it in
+        order: whether it may repeat a job, whether a chat here is told what it
+        publishes, and who it hands work to in each channel it is in.
+
+        Done for the workspace at once, because half of it is about pairs, and
+        again whenever anything changes - so naming a worker is also how a
+        channel is put back in order after something was changed by hand.
+        """
+        try:
+            if not await scoped.set_kind(worker_id, body.kind):
+                raise HTTPException(404, f"no worker {worker_id!r}")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"worker_id": worker_id, "kind": body.kind}
 
     @app.post("/{ws}/api/workers/{worker_id}/repeats")
     async def set_repeats(worker_id: str, body: RepeatsIn,

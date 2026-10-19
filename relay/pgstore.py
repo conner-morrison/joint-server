@@ -33,6 +33,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from relay.notify import CHANNEL as NOTIFY_CHANNEL, key as notify_key
+from relay.kinds import KINDS, check_kind
 from relay.reading import reading, thread_of
 from relay.store import NAME_RE, _hash, check_name  # one definition of a valid name
 
@@ -63,6 +64,10 @@ CREATE TABLE IF NOT EXISTS workers (
     -- But a worker whose whole contribution is what it says *about* a job -
     -- a decision, a reason - is not repeating the job when it posts it again.
     may_repeat  BOOLEAN NOT NULL DEFAULT FALSE,
+    -- What this worker is. Every switch that follows from it is set when it
+    -- is named, and set again whenever anything about the workspace changes,
+    -- so a channel can be put back in order by naming its workers.
+    kind        TEXT,
     label       TEXT NOT NULL DEFAULT '',
     created_at  DOUBLE PRECISION NOT NULL,
     last_seen   DOUBLE PRECISION,
@@ -519,6 +524,7 @@ class PgStore:
                                    "reads_jobs BOOLEAN NOT NULL DEFAULT FALSE")
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS "
                                    "carries_thread BOOLEAN NOT NULL DEFAULT FALSE")
+                await conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS kind TEXT")
                 await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS "
                                    "thread_key TEXT")
                 await conn.execute("CREATE INDEX IF NOT EXISTS messages_thread "
@@ -778,6 +784,76 @@ class WorkspaceStore:
             " WHERE workspace = %s AND channel = %s AND worker_id = %s",
             (allowed, self.slug, channel, worker_id)) > 0
 
+    async def set_kind(self, worker_id: str, kind: str | None) -> bool:
+        """Say what a worker is, and put everything that follows from it in
+        order. None takes the kind away and leaves every switch as it stands:
+        forgetting what something is should not undo what was decided."""
+        kind = check_kind(kind)
+        changed = await self.store._run(
+            "UPDATE workers SET kind = %s WHERE workspace = %s AND worker_id = %s",
+            (kind, self.slug, worker_id)) > 0
+        if changed and kind:
+            await self.apply_kinds()
+        return changed
+
+    async def apply_kinds(self) -> None:
+        """Set every switch that follows from what the workers here are.
+
+        Done for the whole workspace at once, because half of it is about pairs
+        - who hands work to whom - and naming one worker settles nothing until
+        the other is named too. Idempotent on purpose: running it twice is the
+        same as running it once, which is what makes it a repair.
+
+        A worker with no kind is left alone, and so is every switch about it.
+        """
+        workers = {w["worker_id"]: w for w in await self.store._all(
+            "SELECT worker_id, kind FROM workers WHERE workspace = %s AND kind IS NOT NULL",
+            (self.slug,))}
+        if not workers:
+            return
+        for worker_id, row in workers.items():
+            rules = KINDS.get(row["kind"])
+            if rules:
+                await self.store._run(
+                    "UPDATE workers SET may_repeat = %s WHERE workspace = %s AND worker_id = %s",
+                    (bool(rules["repeats"]), self.slug, worker_id))
+
+        members: dict[str, list[str]] = {}
+        for row in await self.store._all(
+                "SELECT channel, worker_id FROM members WHERE workspace = %s", (self.slug,)):
+            members.setdefault(row["channel"], []).append(row["worker_id"])
+
+        for channel, here in members.items():
+            typed = [w for w in here if w in workers]
+            for worker_id in typed:
+                rules = KINDS.get(workers[worker_id]["kind"], {})
+                wanted = {other for other in typed
+                          if workers[other]["kind"] in rules.get("sends_to", ())
+                          and other != worker_id}
+                await self.store._run(
+                    "DELETE FROM routes WHERE workspace = %s AND channel = %s AND sender = %s",
+                    (self.slug, channel, worker_id))
+                for recipient in sorted(wanted):
+                    await self.store._run("""
+                        INSERT INTO routes(workspace, channel, sender, recipient, made_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (workspace, channel, sender, recipient) DO NOTHING""",
+                        (self.slug, channel, worker_id, recipient, time.time()))
+            # Which publishers a chat here is not told about. Only the typed
+            # ones are decided: a chat told to ignore something untyped was
+            # told so by a person, and that stands.
+            deaf = sorted(w for w in typed
+                          if not KINDS.get(workers[w]["kind"], {}).get("chats_hear", True))
+            keep_typed = {w for w in typed}
+            for bot in await self.store._all(
+                    "SELECT bot, deaf_to FROM bot_members WHERE workspace = %s AND channel = %s",
+                    (self.slug, channel)):
+                by_hand = [w for w in (bot["deaf_to"] or ()) if w not in keep_typed]
+                await self.store._run(
+                    "UPDATE bot_members SET deaf_to = %s "
+                    " WHERE workspace = %s AND channel = %s AND bot = %s",
+                    (sorted(set(by_hand) | set(deaf)), self.slug, channel, bot["bot"]))
+
     async def set_repeats(self, worker_id: str, allowed: bool) -> bool:
         """Whether this worker may post a job the channel already has.
 
@@ -896,7 +972,7 @@ class WorkspaceStore:
         """Name first: it is what a person reads. The id comes too, because it
         is what the worker was given and what it is identified by here."""
         rows = await self.store._all(
-            "SELECT worker_id, name, label, created_at, last_seen, may_repeat, "
+            "SELECT worker_id, name, label, created_at, last_seen, may_repeat, kind, "
             "       (token_hash IS NOT NULL) AS legacy, "
             "       (last_seen IS NOT NULL AND last_seen > %s) AS online "
             "  FROM workers WHERE workspace = %s ORDER BY name, worker_id",
@@ -1062,6 +1138,8 @@ class WorkspaceStore:
             (self.slug, channel, worker_id, cursor, time.time())) > 0
         if joined:
             await self.tell_worker(worker_id, "joined", channel)
+            # Who hands work to whom is settled by who is in the channel.
+            await self.apply_kinds()
         return joined
 
     async def leave(self, channel: str, worker_id: str) -> bool:

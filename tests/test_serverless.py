@@ -1010,6 +1010,118 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["github-finder"])
         self.assertEqual([m["body"] for m in got["messages"]], ["a job"])
 
+    # --- what a worker is ---------------------------------------------------
+    async def test_naming_what_a_worker_is_sets_what_follows(self) -> None:
+        """Six switches set one at a time are easy to get wrong and impossible
+        to remember, and a wrong one is quiet: the worker goes on working while
+        what it publishes stops arriving."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        for who, kind in (("writer", "proposal-writer"), ("repo-finder", "repo-finder"),
+                          ("github-finder", "github-editor")):
+            status, said = await self.call("POST", f"/{ws}/api/workers/{ids[who]}/kind",
+                                           {"kind": kind}, token="hunter2")
+            self.assertEqual((status, said["kind"]), (200, kind), who)
+
+        _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        self.assertEqual(routes, {
+            ids["writer"]: [ids["repo-finder"]],
+            ids["repo-finder"]: [ids["github-finder"]],
+            ids["github-finder"]: [ids["writer"]],
+        }, "the line of work was not drawn from what each worker is")
+
+        # And it works: each reaches the next and nobody else.
+        for who, body in (("writer", "a job"), ("repo-finder", "some repos"),
+                          ("github-finder", "the chosen urls")):
+            await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": body},
+                            token=ids[who])
+        got = await self.heard_by(ws, ids)
+        self.assertEqual(got["repo-finder"], ["a job"])
+        self.assertEqual(got["github-finder"], ["some repos"])
+        self.assertEqual(got["writer"], ["the chosen urls"])
+
+    async def test_a_kind_decides_repeats(self) -> None:
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/workers/{ids['writer']}/kind",
+                        {"kind": "vollna-scraper"}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers/{ids['repo-finder']}/kind",
+                        {"kind": "gmail-alert"}, token="hunter2")
+        _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        by_id = {w["worker_id"]: w for w in workers}
+        self.assertTrue(by_id[ids["writer"]]["may_repeat"], "a scraper's judgement was refused")
+        self.assertFalse(by_id[ids["repo-finder"]]["may_repeat"])
+
+    async def test_naming_one_settles_nothing_until_the_other_is_named(self) -> None:
+        """Half of what a kind means is about pairs, so it is applied for the
+        workspace each time rather than for the worker just named."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/workers/{ids['writer']}/kind",
+                        {"kind": "proposal-writer"}, token="hunter2")
+        _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        self.assertEqual(routes, {}, "it was routed to a worker that is not there yet")
+
+        await self.call("POST", f"/{ws}/api/workers/{ids['repo-finder']}/kind",
+                        {"kind": "repo-finder"}, token="hunter2")
+        _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        self.assertEqual(routes.get(ids["writer"]), [ids["repo-finder"]])
+
+    async def test_saying_it_again_puts_a_channel_back_in_order(self) -> None:
+        """Which is the point of it being a bundle rather than six switches."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        for who, kind in (("writer", "proposal-writer"), ("repo-finder", "repo-finder")):
+            await self.call("POST", f"/{ws}/api/workers/{ids[who]}/kind", {"kind": kind},
+                            token="hunter2")
+        # Somebody changes it by hand, and gets it wrong.
+        await self.call("DELETE",
+                        f"/{ws}/api/channels/github/routes/{ids['writer']}/{ids['repo-finder']}",
+                        token="hunter2")
+        await self.call("PUT",
+                        f"/{ws}/api/channels/github/routes/{ids['writer']}/{ids['github-finder']}",
+                        token="hunter2")
+
+        await self.call("POST", f"/{ws}/api/workers/{ids['writer']}/kind",
+                        {"kind": "proposal-writer"}, token="hunter2")
+        _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        self.assertEqual(routes.get(ids["writer"]), [ids["repo-finder"]])
+
+    async def test_forgetting_what_it_is_undoes_nothing(self) -> None:
+        """Taking a kind away says "I no longer want to describe this", not
+        "undo everything it implied" - which would be a quiet way to break a
+        working channel."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        for who, kind in (("writer", "proposal-writer"), ("repo-finder", "repo-finder")):
+            await self.call("POST", f"/{ws}/api/workers/{ids[who]}/kind", {"kind": kind},
+                            token="hunter2")
+        await self.call("POST", f"/{ws}/api/workers/{ids['writer']}/kind", {"kind": None},
+                        token="hunter2")
+        _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        self.assertEqual(routes.get(ids["writer"]), [ids["repo-finder"]])
+        _, workers = await self.call("GET", f"/{ws}/api/workers", token="hunter2")
+        self.assertIsNone({w["worker_id"]: w for w in workers}[ids["writer"]]["kind"])
+
+    async def test_a_kind_that_is_not_one_is_refused(self) -> None:
+        """A typo that silently did nothing would be worse than a refusal."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        status, said = await self.call("POST", f"/{ws}/api/workers/{ids['writer']}/kind",
+                                       {"kind": "proposal_writer"}, token="hunter2")
+        self.assertEqual(status, 400)
+        self.assertIn("no such kind", said["detail"])
+
+    async def test_the_kinds_are_published(self) -> None:
+        """The console asks rather than carrying its own, older copy."""
+        status, kinds = await self.call("GET", "/api/kinds")
+        self.assertEqual(status, 200)
+        names = {k["kind"] for k in kinds}
+        self.assertEqual(names, {"gmail-alert", "vollna-scraper", "proposal-writer",
+                                 "repo-finder", "github-editor", "linkedin-harvester"})
+        for k in kinds:
+            self.assertTrue(k["label"] and k["about"])
+
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
         the next when it returns. Online therefore means heard from lately,
@@ -1917,6 +2029,59 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         status, _ = await self.call("DELETE", "/acme/api/channels/jobs/bots/phone/hears/anyone",
                                     token="p")
         self.assertEqual(status, 404)
+
+    async def test_a_kind_decides_whether_a_chat_hears_it(self) -> None:
+        """A search that has already decided is worth a phone buzzing; one that
+        sifts everything is not. Said once, as what each worker is."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        made = {}
+        for who, kind in (("alerts", "gmail-alert"), ("scraper", "vollna-scraper")):
+            made[who] = (await self.call("POST", "/acme/api/workers", {"name": who},
+                                         token="p"))[1]["worker_id"]
+            await self.call("PUT", f"/acme/api/channels/jobs/members/{made[who]}", {}, token="p")
+            await self.call("POST", f"/acme/api/workers/{made[who]}/kind", {"kind": kind},
+                            token="p")
+
+        await self.call("POST", "/acme/publish",
+                        {"channel": "jobs", "body": {"title": "From the alerts"}},
+                        token=made["alerts"])
+        await self.call("POST", "/acme/publish",
+                        {"channel": "jobs", "body": {"title": "From the scraper"}},
+                        token=made["scraper"])
+        await self.eventually(1)
+        await asyncio.sleep(1.2)
+        said = [s["text"] for s in self.telegram.sent]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("From the alerts", said[0])
+
+        # Both are still in the channel; only the phone was spared one of them.
+        _, stored = await self.call("GET", "/acme/api/channels/jobs/messages", token="p")
+        self.assertEqual(len(stored), 2)
+
+    async def test_what_a_person_silenced_by_hand_stays_silenced(self) -> None:
+        """Applying the kinds must not undo a decision nobody asked it to make."""
+        await self.ready()
+        await self.register("phone", "555", "1:abc")
+        quiet = (await self.call("POST", "/acme/api/workers", {"name": "quiet"},
+                                 token="p"))[1]["worker_id"]
+        typed = (await self.call("POST", "/acme/api/workers", {"name": "alerts"},
+                                 token="p"))[1]["worker_id"]
+        for who in (quiet, typed):
+            await self.call("PUT", f"/acme/api/channels/jobs/members/{who}", {}, token="p")
+        await self.call("DELETE", f"/acme/api/channels/jobs/bots/phone/hears/{quiet}", token="p")
+        await self.call("POST", f"/acme/api/workers/{typed}/kind", {"kind": "gmail-alert"},
+                        token="p")
+
+        await self.call("POST", "/acme/publish", {"channel": "jobs", "body": {"title": "Quiet"}},
+                        token=quiet)
+        await self.call("POST", "/acme/publish", {"channel": "jobs", "body": {"title": "Loud"}},
+                        token=typed)
+        await self.eventually(1)
+        await asyncio.sleep(1.2)
+        said = [s["text"] for s in self.telegram.sent]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("Loud", said[0])
 
     async def test_bots_belong_to_their_channel(self) -> None:
         await self.ready()

@@ -356,6 +356,39 @@ is not muting a job, and not taking the chat out of the channel. The chat's
 place in the channel moves past what it was not told about, so a backlog that
 never clears cannot build up behind it.
 
+### What a worker is
+
+Every rule here is a switch somewhere: whether a worker may post a job the
+channel already has, whether a chat is told what it publishes, who hears what
+it says. Set one at a time they are easy to get wrong and impossible to
+remember, and a wrong one is quiet - the worker goes on working while what it
+publishes stops arriving.
+
+Saying what a worker **is** sets all of them:
+
+| | repeats a job | a chat hears it | reaches |
+|---|---|---|---|
+| Gmail alert | no | yes | everyone |
+| Vollna scraper | **yes** | no | everyone |
+| Proposal writer | no | yes | the repo finder |
+| Repo finder | no | no | the GitHub editor |
+| GitHub editor | no | no | the proposal writer |
+| LinkedIn harvester | no | yes | everyone |
+
+```
+GET  /api/kinds
+POST /{ws}/api/workers/{worker_id}/kind   {"kind": "repo-finder"}
+```
+
+Applied for the workspace each time, because half of it is about pairs: naming
+a proposal writer settles nothing until something is a repo finder too. And
+applied again on every change, so naming a worker is also how a channel is put
+back in order after something was changed by hand.
+
+Taking a kind away (`null`) says "I no longer want to describe this", not "undo
+everything it implied" - the second would be a quiet way to break a working
+channel. What a person set by hand about an untyped worker is never touched.
+
 ### A worker that may repeat a job
 
 A channel keeps one copy of a job, decided by the job's own link. That is right

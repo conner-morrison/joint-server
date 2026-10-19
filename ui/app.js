@@ -24,6 +24,7 @@ const state = {
   muted: [],
   hooks: {},
   routes: {},
+  kinds: [],
   view: { kind: "channels" },
   feed: { channel: null, messages: [], hasOlder: false },
   unread: new Map(),
@@ -658,6 +659,14 @@ async function refreshAll({ rethrow = false } = {}) {
       state.muted = Array.isArray(rows) ? rows : [];
       renderMembers();
     }).catch(() => { state.muted = []; });
+    // What a worker can be. Asked of the server rather than written out here,
+    // so the console never carries a second, older copy of the rules. Not on
+    // the workspace, so it is read without one.
+    if (!state.kinds.length) {
+      fetch(basePath() + "/api/kinds").then((r) => r.ok ? r.json() : [])
+        .then((rows) => { state.kinds = Array.isArray(rows) ? rows : []; })
+        .catch(() => { state.kinds = []; });
+    }
     state.workers = workers;
     state.channels = channels;
     state.pending = Array.isArray(pending) ? pending : [];
@@ -880,13 +889,13 @@ function renderWorkersTable() {
         h("td", { class: "muted nowrap" }, online ? "online now" : ago(w.last_seen)),
         h("td", { class: "actions" },
           h("button", {
-            class: "btn small" + (w.may_repeat ? " on" : ""),
-            title: w.may_repeat
-              ? "Posts a job even when this channel already has it. Click to stop."
-              : "A job this channel already has is refused. Click to allow repeats, for a "
-                + "worker whose point is what it says about a job rather than the job.",
-            onclick: () => setRepeats(w.worker_id, w.name || w.worker_id, !w.may_repeat),
-          }, w.may_repeat ? "Repeats allowed" : "Repeats"),
+            class: "btn small" + (w.kind ? " on" : ""),
+            title: w.kind
+              ? "What this worker is. Everything that follows from it - repeats, what a chat "
+                + "here is told, who it hands work to - is set from this."
+              : "Say what this worker is, and every rule that follows from it is set at once.",
+            onclick: () => openKind(w.worker_id, w.name || w.worker_id, w.kind || ""),
+          }, kindLabel(w.kind) || "Type"),
           h("button", { class: "btn small", onclick: () => renameWorker(w.worker_id, w.name || "") }, "Rename"),
           h("button", { class: "btn small", onclick: () => reissueId(w.worker_id, w.name || w.worker_id) }, "New id"),
           h("button", { class: "btn small danger", onclick: () => removeWorker(w.worker_id, w.name || w.worker_id) }, "Remove")));
@@ -1040,6 +1049,63 @@ function showId(name, workerId, how) {
     h("h3", {}, "How a worker uses it"),
     copyBlock(`Authorization: Bearer ${workerId}`),
   ], [h("button", { class: "btn primary", type: "submit" }, "Done")]);
+}
+
+function kindLabel(kind) {
+  return (state.kinds.find((k) => k.kind === kind) || {}).label || "";
+}
+
+// What a worker is, and what follows from it. Said once here instead of six
+// switches set one at a time, each of which is quiet when it is wrong.
+function openKind(workerId, name, current) {
+  const pick = h("select", { "aria-label": "What this worker is" },
+    h("option", { value: "", ...(current ? {} : { selected: true }) }, "No type"),
+    state.kinds.map((k) => h("option", { value: k.kind, ...(k.kind === current ? { selected: true } : {}) },
+      k.label)));
+  const note = h("p", { class: "hint" });
+  const err = h("p", { class: "error", hidden: true });
+
+  const draw = () => {
+    const k = state.kinds.find((x) => x.kind === pick.value);
+    if (!k) {
+      note.textContent = "Nothing is set from this, and nothing already set is undone. "
+        + "Every rule about this worker stays where you put it.";
+      return;
+    }
+    const said = [k.about,
+      k.repeats ? "May post a job a channel already has."
+        : "A job a channel already has is refused.",
+      k.chats_hear ? "A Telegram chat in its channels is told what it publishes."
+        : "A Telegram chat in its channels is not told what it publishes.",
+      (k.sends_to || []).length
+        ? `In a channel it shares with one, it reaches only: ${k.sends_to.join(", ")}.`
+        : "Reaches every member of its channels."];
+    note.textContent = said.join(" ");
+  };
+  pick.addEventListener("change", draw);
+  draw();
+
+  openDialog(`What is ${name}?`, [
+    field("Type", pick), note,
+    h("p", { class: "muted small" },
+      "Saying this sets every rule that follows from it, here and in each channel this "
+      + "worker is in - and sets them again each time, so it is also how a channel is put "
+      + "back in order after something was changed by hand."),
+    err,
+  ], [cancel(), h("button", { class: "btn primary", type: "submit" }, "Save")],
+    async (dlg) => {
+      try {
+        await api("POST", `/api/workers/${enc(workerId)}/kind`, { kind: pick.value || null });
+        dlg.close();
+        toast(pick.value ? `${name} is a ${kindLabel(pick.value).toLowerCase()}`
+          : `${name} has no type`);
+        await refreshAll();
+      } catch (ex) {
+        if (ex.status === 401) return handleError(ex);
+        err.textContent = ex.message;
+        err.hidden = false;
+      }
+    });
 }
 
 async function setRepeats(workerId, name, allowed) {
