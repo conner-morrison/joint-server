@@ -660,13 +660,8 @@ async function refreshAll({ rethrow = false } = {}) {
       renderMembers();
     }).catch(() => { state.muted = []; });
     // What a worker can be. Asked of the server rather than written out here,
-    // so the console never carries a second, older copy of the rules. Not on
-    // the workspace, so it is read without one.
-    if (!state.kinds.length) {
-      fetch(basePath() + "/api/kinds").then((r) => r.ok ? r.json() : [])
-        .then((rows) => { state.kinds = Array.isArray(rows) ? rows : []; })
-        .catch(() => { state.kinds = []; });
-    }
+    // so the console never carries a second, older copy of the rules.
+    if (!state.kinds.length) loadKinds();
     state.workers = workers;
     state.channels = channels;
     state.pending = Array.isArray(pending) ? pending : [];
@@ -1051,13 +1046,34 @@ function showId(name, workerId, how) {
   ], [h("button", { class: "btn primary", type: "submit" }, "Done")]);
 }
 
+// Not under the workspace, so it is read without its password. The trailing
+// slash matters: at a deployment root basePath() is "/", and "/" + "/api/..."
+// is "//api/...", which a browser reads as a host rather than a path and sends
+// the request to a machine that does not exist.
+async function loadKinds() {
+  try {
+    const root = basePath().replace(/\/+$/, "");
+    const res = await fetch(root + "/api/kinds", { cache: "no-store" });
+    const rows = res.ok ? await res.json() : [];
+    state.kinds = Array.isArray(rows) ? rows : [];
+  } catch { state.kinds = []; }
+  return state.kinds;
+}
+
 function kindLabel(kind) {
   return (state.kinds.find((k) => k.kind === kind) || {}).label || "";
 }
 
 // What a worker is, and what follows from it. Said once here instead of six
 // switches set one at a time, each of which is quiet when it is wrong.
-function openKind(workerId, name, current) {
+async function openKind(workerId, name, current) {
+  if (!state.kinds.length) await loadKinds();
+  if (!state.kinds.length) {
+    return openDialog("Types could not be loaded", [
+      h("p", {}, "The server did not answer with the list of what a worker can be. "
+        + "It may be an older deployment, or still restarting - try again in a moment."),
+    ], [h("button", { class: "btn primary", type: "submit" }, "Close")]);
+  }
   const pick = h("select", { "aria-label": "What this worker is" },
     h("option", { value: "", ...(current ? {} : { selected: true }) }, "No type"),
     state.kinds.map((k) => h("option", { value: k.kind, ...(k.kind === current ? { selected: true } : {}) },
