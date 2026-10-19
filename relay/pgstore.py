@@ -817,13 +817,42 @@ class WorkspaceStore:
                 await conn.execute(
                     "UPDATE redeliveries SET worker_id = %s WHERE workspace = %s AND worker_id = %s",
                     (fresh, self.slug, worker_id))
+                # Everything else keyed by who this worker is. A new id that
+                # left these behind would be the quietest kind of breakage:
+                # the worker still works, and what it posts stops arriving.
+                await conn.execute(
+                    "UPDATE routes SET sender = %s WHERE workspace = %s AND sender = %s",
+                    (fresh, self.slug, worker_id))
+                await conn.execute(
+                    "UPDATE routes SET recipient = %s WHERE workspace = %s AND recipient = %s",
+                    (fresh, self.slug, worker_id))
+                await conn.execute(
+                    "UPDATE bot_members SET deaf_to = array_replace(deaf_to, %s, %s) "
+                    " WHERE workspace = %s AND %s = ANY(deaf_to)",
+                    (worker_id, fresh, self.slug, worker_id))
                 await conn.execute("DELETE FROM workers WHERE workspace = %s AND worker_id = %s",
                                    (self.slug, worker_id))
         return {"worker_id": fresh, "name": row["name"]}
 
     async def remove_worker(self, worker_id: str) -> bool:
-        return await self.store._run("DELETE FROM workers WHERE workspace = %s AND worker_id = %s",
-                                     (self.slug, worker_id)) > 0
+        """Takes its memberships with it, and everything said about it.
+
+        A route naming a worker that is gone would go on narrowing the sender
+        it mentions - a channel quietly delivering to nobody - so it goes too.
+        """
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM routes WHERE workspace = %s AND (sender = %s OR recipient = %s)",
+                    (self.slug, worker_id, worker_id))
+                await conn.execute(
+                    "UPDATE bot_members SET deaf_to = array_remove(deaf_to, %s) "
+                    " WHERE workspace = %s AND %s = ANY(deaf_to)",
+                    (worker_id, self.slug, worker_id))
+                cur = await conn.execute(
+                    "DELETE FROM workers WHERE workspace = %s AND worker_id = %s",
+                    (self.slug, worker_id))
+                return cur.rowcount > 0
 
     async def worker_exists(self, worker_id: str) -> bool:
         return await self.store._one("SELECT 1 FROM workers WHERE workspace = %s AND worker_id = %s",
