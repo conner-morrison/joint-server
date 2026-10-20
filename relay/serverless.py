@@ -497,11 +497,12 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         """
         # Asked before the welcome is sent, so a registration that is going to
         # be refused does not put a message in the chat saying it worked.
-        twin = await scoped.bot_for_chat(body.chat_id)
+        twin = await scoped.bot_for_chat(body.chat_id, body.token)
         if twin is not None:
-            raise HTTPException(409, f"bot {twin!r} already sends to that chat. Add it to "
-                                     "more channels instead: a second one here would send "
-                                     "everything twice")
+            raise HTTPException(409, f"bot {twin!r} is already registered for that chat with "
+                                     "that same token. Add it to more channels instead: a "
+                                     "second registration of one bot would send everything "
+                                     "twice")
         try:
             who = await telegram.check(body.token)
             await telegram.send(body.token, body.chat_id, telegram.WELCOME)

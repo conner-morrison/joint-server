@@ -2239,25 +2239,32 @@ class BotDeliveryTest(unittest.IsolatedAsyncioTestCase):
         _, bots = await self.call("GET", "/acme/api/bots", token="p")
         self.assertEqual(bots, [])
 
-    async def test_one_chat_is_only_ever_registered_once(self) -> None:
-        """Two registrations sending to one chat is two copies of every alert,
-        and the console has no way to show that it is what happened. The chat
-        decides, not the token: a second token for the same bot, or a second
-        bot in the same chat, arrives on the phone just as twice."""
+    async def test_one_bot_is_only_ever_registered_once_for_a_chat(self) -> None:
+        """Registering one bot twice for one chat is two copies of every alert
+        and nothing gained - it is the same bot, and a bot joins as many
+        channels as it likes. A second, different bot in that chat is the
+        owner's call: it arrives under its own name, where they can see it."""
         await self.ready()
         await self.register("phone", "555", "1:abc", join=False)
-        for name, token in (("phone-again", "1:abc"), ("other-bot", "2:xyz")):
-            status, body = await self.call("POST", "/acme/api/bots",
-                                           {"name": name, "chat_id": "555", "token": token},
-                                           token="p")
-            self.assertEqual(status, 409, f"{name} was allowed a second time")
-            self.assertIn("phone", body["detail"])
-            self.assertIn("twice", body["detail"])
-        # A different chat is a different place to be told, so it is fine.
+        status, body = await self.call("POST", "/acme/api/bots",
+                                       {"name": "phone-again", "chat_id": "555", "token": "1:abc"},
+                                       token="p")
+        self.assertEqual(status, 409, "the same bot was registered twice for one chat")
+        self.assertIn("phone", body["detail"])
+        self.assertIn("twice", body["detail"])
+
+        # A different bot in the same chat: allowed.
         status, _ = await self.call("POST", "/acme/api/bots",
-                                    {"name": "laptop", "chat_id": "556", "token": "2:xyz"},
+                                    {"name": "other-bot", "chat_id": "555", "token": "2:xyz"},
+                                    token="p")
+        self.assertEqual(status, 201, "a second bot was refused its own registration")
+        # A different chat is a different place to be told, so it is fine too.
+        status, _ = await self.call("POST", "/acme/api/bots",
+                                    {"name": "laptop", "chat_id": "556", "token": "3:pqr"},
                                     token="p")
         self.assertEqual(status, 201)
+        _, bots = await self.call("GET", "/acme/api/bots", token="p")
+        self.assertEqual(sorted(b["name"] for b in bots), ["laptop", "other-bot", "phone"])
 
     async def test_a_pasted_chat_id_with_spaces_is_the_same_chat(self) -> None:
         """How the second registration gets made in practice: the id is pasted

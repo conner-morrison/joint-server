@@ -1404,18 +1404,22 @@ class WorkspaceStore:
         chat_id, bot_token = chat_id.strip(), bot_token.strip()
         if not chat_id or not bot_token:
             raise ValueError("a bot needs a chat id and a token")
-        # Two registrations sending to one chat is two copies of every alert,
-        # and the chat is what decides that - not the token, because a second
-        # token for the same bot, or a second bot in the same chat, arrives
-        # just as twice. A bot is workspace-wide and joins as many channels as
-        # it likes, so there is never a reason for two pointing at one chat.
+        # The same bot registered twice for one chat is two copies of every
+        # alert and nothing gained: it is one bot, and a bot is workspace-wide
+        # and joins as many channels as it likes. So that is refused.
+        #
+        # Two different bots in one chat is allowed. It is the owner's call:
+        # they may want alerts arriving under a second name, and if both are
+        # put in the same channel the chat is told twice - which is visible in
+        # the chat, under two names, rather than silent.
         twin = await self.store._one(
-            "SELECT name FROM bots WHERE workspace = %s AND chat_id = %s",
-            (self.slug, chat_id))
+            "SELECT name FROM bots WHERE workspace = %s AND chat_id = %s AND bot_token = %s",
+            (self.slug, chat_id, bot_token))
         if twin is not None:
             raise ValueError(
-                f"bot {twin['name']!r} already sends to that chat. Add it to more "
-                "channels instead: a second one here would send everything twice")
+                f"bot {twin['name']!r} is already registered for that chat with that same "
+                "token. Add it to more channels instead: a second registration of one bot "
+                "would send everything twice")
         try:
             await self.store._run(
                 "INSERT INTO bots(workspace, name, kind, chat_id, bot_token, label, created_at) "
@@ -1443,11 +1447,17 @@ class WorkspaceStore:
         return [{**r, "channels": channels.get(r["name"], []),
                  "deaf_to": deaf.get(r["name"], {})} for r in rows]
 
-    async def bot_for_chat(self, chat_id: str) -> str | None:
-        """The bot already sending to a chat, if there is one. One chat, one
-        bot: a second is two copies of every alert on the same phone."""
-        row = await self.store._one("SELECT name FROM bots WHERE workspace = %s AND chat_id = %s",
-                                    (self.slug, chat_id.strip()))
+    async def bot_for_chat(self, chat_id: str, token: str) -> str | None:
+        """The same bot already registered for this chat, if it is.
+
+        The chat alone does not decide it: a second, different bot in one chat
+        is the owner's business, and arrives under its own name where they can
+        see it. The same token twice is the one that gains nothing and doubles
+        every alert, so that is what this finds.
+        """
+        row = await self.store._one(
+            "SELECT name FROM bots WHERE workspace = %s AND chat_id = %s AND bot_token = %s",
+            (self.slug, chat_id.strip(), token.strip()))
         return None if row is None else str(row["name"])
 
     async def bot_exists(self, name: str) -> bool:
