@@ -806,26 +806,72 @@ function renderMain() {
   else renderChannelView(state.view.name);
 }
 
-// Two bots pointing at one chat is two copies of every alert on the same
-// phone. Registering a second one is refused now, but a pair made before that
-// rule existed is still there and still sending twice, and the only way
-// anyone finds out is by counting notifications. So it is said plainly.
-function sharedChats() {
+// Two bots in one chat AND in one channel is two copies of every message in
+// that channel. Sharing a chat is allowed and may be meant - alerts arriving
+// under a second name - so what is worth saying is the doubling, not the
+// sharing: only where their channels overlap, naming those channels, and only
+// until it is waved away.
+const HUSH_KEY = "relay.console.hushed";
+
+function hushed() {
+  try { return new Set(JSON.parse(storage("local")?.getItem(HUSH_KEY) || "[]")); }
+  catch { return new Set(); }
+}
+
+function hush(key) {
+  const keys = hushed();
+  keys.add(key);
+  try { storage("local")?.setItem(HUSH_KEY, JSON.stringify([...keys])); } catch { /* private mode */ }
+}
+
+function doubledChats() {
   const byChat = new Map();
   for (const b of state.bots) {
     const chat = String(b.chat_id || "");
     if (!byChat.has(chat)) byChat.set(chat, []);
-    byChat.get(chat).push(b.name);
+    byChat.get(chat).push(b);
   }
-  const shared = [...byChat.entries()].filter(([, names]) => names.length > 1);
-  if (!shared.length) return null;
+  const found = [];
+  for (const [chat, bots] of byChat) {
+    if (bots.length < 2) continue;
+    // Only the channels more than one of them is in: elsewhere each bot is
+    // the only one sending, and nothing arrives twice.
+    const times = new Map();
+    for (const b of bots) for (const c of b.channels || []) times.set(c, (times.get(c) || 0) + 1);
+    const both = [...times.entries()].filter(([, n]) => n > 1).map(([c]) => c);
+    if (both.length) found.push({ chat, names: bots.map((b) => b.name).sort(), channels: both.sort() });
+  }
+  return found;
+}
+
+// "a and b", "a, b and c".
+function listed(words) {
+  return words.length < 3 ? words.join(" and ")
+    : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+function sharedChats() {
+  const quiet = hushed();
+  const found = doubledChats()
+    // Keyed by who and where: waving this away does not hide a different pair,
+    // or the same pair once it reaches another channel.
+    .map((d) => ({ ...d, key: `${d.chat}:${d.names.join(",")}:${d.channels.join(",")}` }))
+    .filter((d) => !quiet.has(d.key));
+  if (!found.length) return null;
   return h("div", { class: "notice" },
-    h("strong", {}, "More than one bot sends to the same chat"),
-    shared.map(([chat, names]) => h("div", {},
-      `Chat ${chat} is sent to by ${names.join(" and ")}. `
-      + `Every alert arrives ${names.length} times there.`)),
-    h("div", {}, "Remove all but one of them below. Which one you keep makes no "
-      + "difference; a bot can be in as many channels as you like."));
+    h("div", { class: "notice-head" },
+      h("strong", { class: "grow" }, "The same message arrives more than once"),
+      h("button", {
+        class: "btn icon hush", title: "Hide this", "aria-label": "Hide this",
+        onclick: () => { found.forEach((d) => hush(d.key)); renderWorkersTable(); },
+      }, "\u00d7")),
+    found.map((d) => h("div", {},
+      `${listed(d.names)} ${d.names.length > 2 ? "all" : "both"} send to chat ${d.chat}, `
+      + `and ${d.names.length > 2 ? "all" : "both"} are in `
+      + `${listed(d.channels.map((c) => "#" + c))}. `
+      + `Every message there arrives ${d.names.length} times, once under each name.`)),
+    h("div", {}, "If that is what you want, hide this. If not, take all but one of "
+      + "them out of those channels - a bot can be in as many channels as you like."));
 }
 
 // --- workers ---------------------------------------------------------------

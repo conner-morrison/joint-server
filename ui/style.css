@@ -230,6 +230,13 @@ tr:last-child td { border-bottom: 0; }
   padding: 10px 12px; font-size: 13px;
 }
 .notice code { font: 12px/1.5 var(--mono); word-break: break-word; opacity: .85; }
+.notice-head { display: flex; align-items: center; gap: 8px; }
+/* Sits on the notice's own colours, not the page's. */
+.btn.icon.hush {
+  flex: none; border-color: transparent; background: transparent; color: inherit;
+  font-size: 16px; line-height: 1; padding: 0 4px; opacity: .65;
+}
+.btn.icon.hush:hover { opacity: 1; background: rgba(0, 0, 0, .06); }
 
 /* --- an address with nothing at it --------------------------------------- */
 .notfound-code {
