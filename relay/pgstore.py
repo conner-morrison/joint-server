@@ -1231,6 +1231,16 @@ class WorkspaceStore:
             "DELETE FROM members WHERE workspace = %s AND channel = %s AND worker_id = %s",
             (self.slug, channel, worker_id)) > 0
         if left:
+            # Its routes here go with it. A route to a worker that has left is
+            # worse than none: a sender routed only to it reaches nobody, and
+            # nothing says so.
+            await self.store._run(
+                "DELETE FROM routes WHERE workspace = %s AND channel = %s "
+                "   AND (sender = %s OR recipient = %s)",
+                (self.slug, channel, worker_id, worker_id))
+            # And whoever handed work to it is re-wired by type, so the line of
+            # work closes over the gap instead of ending at it.
+            await self.apply_kinds()
             await self.tell_worker(worker_id, "left", channel)
         return left
 

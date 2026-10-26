@@ -49,7 +49,9 @@ KINDS: dict[str, dict[str, Any]] = {
     "repo-finder": {
         "label": "Repo finder",
         "about": "Finds repositories for a job and says why each one matters.",
-        "repeats": False, "chats_hear": False, "sends_to": ["github-editor"],
+        # Its answer goes straight back to whoever asked. Nothing is published
+        # in between any more, so there is no one else for it to hand to.
+        "repeats": False, "chats_hear": False, "sends_to": ["proposal-writer"],
     },
     "github-editor": {
         "label": "GitHub editor",

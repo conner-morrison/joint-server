@@ -1107,9 +1107,11 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((status, said["kind"]), (200, kind), who)
 
         _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        # The repo finder answers whoever asked; nothing publishes in between.
+        # A GitHub editor still in the channel answers the writer too.
         self.assertEqual(routes, {
             ids["writer"]: [ids["repo-finder"]],
-            ids["repo-finder"]: [ids["github-finder"]],
+            ids["repo-finder"]: [ids["writer"]],
             ids["github-finder"]: [ids["writer"]],
         }, "the line of work was not drawn from what each worker is")
 
@@ -1120,8 +1122,8 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
                             token=ids[who])
         got = await self.heard_by(ws, ids)
         self.assertEqual(got["repo-finder"], ["a job"])
-        self.assertEqual(got["github-finder"], ["some repos"])
-        self.assertEqual(got["writer"], ["the chosen urls"])
+        self.assertEqual(got["github-finder"], [])
+        self.assertEqual(got["writer"], ["some repos", "the chosen urls"])
 
     async def test_a_kind_decides_repeats(self) -> None:
         ws = await self.workspace()
@@ -1489,6 +1491,43 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("fields", answer)
         self.assertNotIn("thread", answer)
         self.assertEqual(sorted(answer), ["channel", "job", "reply", "sender", "seq", "ts"])
+
+    async def test_a_search_goes_straight_back_to_whoever_asked(self) -> None:
+        """The line of work is two steps now: the proposal writer asks, the
+        repo finder answers it. With the publisher gone the answer goes back
+        as the repo finder wrote it, and taking the publisher out of the
+        channel re-wires the line rather than leaving it ending at a gap."""
+        ws = await self.workspace()
+        ids = await self.line_of_work(ws)
+        await self.call("POST", f"/{ws}/api/channels/github/carries-thread", {"reads": True},
+                        token="hunter2")
+        for who, kind in (("writer", "proposal-writer"), ("repo-finder", "repo-finder"),
+                          ("github-finder", "github-editor")):
+            await self.call("POST", f"/{ws}/api/workers/{ids[who]}/kind", {"kind": kind},
+                            token="hunter2")
+        status, _ = await self.call("DELETE",
+                                    f"/{ws}/api/channels/github/members/{ids['github-finder']}",
+                                    token="hunter2")
+        self.assertEqual(status, 200)
+        _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
+        self.assertEqual(routes, {ids["writer"]: [ids["repo-finder"]],
+                                  ids["repo-finder"]: [ids["writer"]]})
+
+        await self.heard_by(ws, ids)
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "github", "body": {"job": "aa11", "title": "Some work"}},
+                        token=ids["writer"])
+        search = {"job_id": "aa11", "event": "similar_repos", "summary": "They want an intranet.",
+                  "repos": [{"url": "https://github.com/d/hub", "fit": "Use its navigation."}]}
+        await self.call("POST", f"/{ws}/publish", {"channel": "github", "body": search},
+                        token=ids["repo-finder"])
+
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=ids["writer"])
+        answer = [m for m in got["messages"] if m["sender"] == ids["repo-finder"]]
+        self.assertEqual(len(answer), 1, got["messages"])
+        self.assertEqual(answer[0]["body"], search, "the search was not handed over as written")
+        self.assertNotIn("reply", answer[0])
+        self.assertEqual(answer[0]["job"], "aa11")
 
     async def test_a_worker_is_online_while_it_keeps_in_touch(self) -> None:
         """Nothing stays connected here: a worker holds one request and opens
