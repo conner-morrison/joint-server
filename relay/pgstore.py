@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS channels (
     -- workers in parts. A channel carrying something else - replies, leads,
     -- anything - is left exactly as its publishers wrote it.
     reads_jobs  BOOLEAN NOT NULL DEFAULT FALSE,
+    -- How many messages this channel keeps: NULL for the deployment's
+    -- default, 0 for all of them.
+    keep        INTEGER,
     PRIMARY KEY (workspace, name)
 );
 
@@ -288,7 +291,8 @@ __all__ = ["PgStore", "WorkspaceStore", "SCHEMA", "NAME_RE", "check_name", "slug
 
 # How many messages a channel keeps. The oldest go when the newest arrives,
 # so a channel is the last hundred things that happened rather than everything
-# that ever did. 0 keeps them all.
+# that ever did. 0 keeps them all. A channel can choose its own; this is what
+# one that has not chosen keeps.
 CHANNEL_MAX = int(os.environ.get("RELAY_CHANNEL_MAX", "100"))
 
 # How recently a worker must have been in touch to count as online.
@@ -540,6 +544,7 @@ class PgStore:
                                    "reads_jobs BOOLEAN NOT NULL DEFAULT FALSE")
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS "
                                    "carries_thread BOOLEAN NOT NULL DEFAULT FALSE")
+                await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS keep INTEGER")
                 await conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS kind TEXT")
                 await conn.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS "
                                    "refused_at DOUBLE PRECISION")
@@ -1168,6 +1173,27 @@ class WorkspaceStore:
             "UPDATE channels SET carries_thread = %s WHERE workspace = %s AND name = %s",
             (carries, self.slug, channel)) > 0
 
+    async def set_keep(self, channel: str, keep: int | None) -> bool:
+        """How many messages this channel keeps: None for the default, 0 for
+        all of them.
+
+        Lowering it drops what is now over the limit straight away, rather
+        than on the next message, so the channel is never longer than it says
+        it keeps.
+        """
+        if keep is not None and keep < 0:
+            raise ValueError("keep must be 0 (no limit) or more")
+        await self.store.ready()
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                cur = await conn.execute(
+                    "UPDATE channels SET keep = %s WHERE workspace = %s AND name = %s",
+                    (keep, self.slug, channel))
+                if cur.rowcount == 0:
+                    return False
+                await self._trim(conn, channel)
+        return True
+
     async def set_reads_jobs(self, channel: str, reads: bool) -> bool:
         """Whether what is posted here is read as a job posting.
 
@@ -1184,9 +1210,11 @@ class WorkspaceStore:
     async def list_channels(self) -> list[dict[str, Any]]:
         rows = await self.store._all("""
             SELECT c.name, c.description, c.created_at, c.reads_jobs, c.carries_thread,
+                   COALESCE(c.keep, %s) AS keep,
                    (SELECT COUNT(*) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS messages,
                    (SELECT MAX(seq) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS last_seq
-              FROM channels c WHERE c.workspace = %s ORDER BY c.name""", (self.slug,))
+              FROM channels c WHERE c.workspace = %s ORDER BY c.name""",
+            (CHANNEL_MAX, self.slug))
         # Each member as both of its names: the one a person reads, and the id
         # every request about that member is made with.
         members: dict[str, list[dict[str, Any]]] = {}
@@ -1690,7 +1718,8 @@ class WorkspaceStore:
         return None
 
     async def _trim(self, conn: Any, channel: str) -> None:
-        """Drop the oldest so the channel keeps only its newest CHANNEL_MAX.
+        """Drop the oldest so the channel keeps only its newest: as many as it
+        has chosen to keep, or CHANNEL_MAX if it has not chosen.
 
         In the same transaction as the message that pushed it over, so the
         channel is never briefly longer than it is allowed to be. A member
@@ -1698,12 +1727,16 @@ class WorkspaceStore:
         is a statement that they are no longer worth delivering, and a cursor
         below them simply has nothing there to find.
         """
-        if CHANNEL_MAX <= 0:
+        chosen = await (await conn.execute(
+            "SELECT keep FROM channels WHERE workspace = %s AND name = %s",
+            (self.slug, channel))).fetchone()
+        keep = CHANNEL_MAX if chosen is None or chosen["keep"] is None else int(chosen["keep"])
+        if keep <= 0:
             return
         cutoff = await (await conn.execute(
             "SELECT seq FROM messages WHERE workspace = %s AND channel = %s "
             " ORDER BY seq DESC OFFSET %s LIMIT 1",
-            (self.slug, channel, CHANNEL_MAX))).fetchone()
+            (self.slug, channel, keep))).fetchone()
         if cutoff is None:
             return
         await conn.execute(

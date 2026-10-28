@@ -193,6 +193,34 @@ class PgStoreTest(unittest.IsolatedAsyncioTestCase):
         finally:
             pgstore.CHANNEL_MAX = was
 
+    async def test_a_channel_chooses_how_many_it_keeps(self) -> None:
+        """Each channel can keep more than the default, or everything, and
+        lowering the limit drops what is over it at once."""
+        from relay import pgstore
+        was, pgstore.CHANNEL_MAX = pgstore.CHANNEL_MAX, 3
+        try:
+            await self.store.add_channel("archive")
+            self.assertTrue(await self.store.set_keep("archive", 0))
+            for n in range(6):
+                await self.store.append("archive", self.alice, {"n": n})
+                await self.store.append("jobs", self.alice, {"n": n})
+            self.assertEqual(len(await self.store.messages_after("archive", 0)), 6)
+            self.assertEqual(len(await self.store.messages_after("jobs", 0)), 3)
+            listed = {c["name"]: c["keep"] for c in await self.store.list_channels()}
+            self.assertEqual(listed, {"archive": 0, "jobs": 3})
+
+            await self.store.set_keep("archive", 2)
+            kept = await self.store.messages_after("archive", 0)
+            self.assertEqual([m["body"]["n"] for m in kept], [4, 5])
+
+            await self.store.set_keep("archive", None)
+            for n in range(6, 9):
+                await self.store.append("archive", self.alice, {"n": n})
+            self.assertEqual(len(await self.store.messages_after("archive", 0)), 3)
+            self.assertFalse(await self.store.set_keep("nowhere", 5))
+        finally:
+            pgstore.CHANNEL_MAX = was
+
     async def test_the_head_survives_the_cap(self) -> None:
         """Dropping the oldest must not rewind the sequence, or a new member
         would start below messages that still exist and be handed old ones."""

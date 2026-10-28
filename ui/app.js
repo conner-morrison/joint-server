@@ -1325,6 +1325,11 @@ function renderMembers() {
   const history = h("input", { type: "checkbox" });
 
   fill(el,
+    h("div", { class: "panel-top" },
+      h("button", {
+        class: "btn small", title: `Settings for #${ch.name}`,
+        onclick: () => openChannelSettings(ch.name),
+      }, "\u2699 Settings")),
     h("h2", {}, "Members"),
     h("div", { id: "member-list" }),
 
@@ -1788,6 +1793,45 @@ async function setReadsJobs(channel, reads) {
       : `#${channel} is passed on exactly as written`);
     await refreshAll();
   } catch (err) { handleError(err); }
+}
+
+// How many messages a channel keeps. 0 is everything.
+const KEEP_CHOICES = [[100, "100 (default)"], [1000, "1000"], [0, "No limit"]];
+const keepLabel = (n) => (n === 0 ? "no limit" : `${n}`);
+
+function openChannelSettings(name) {
+  const ch = state.channels.find((c) => c.name === name);
+  if (!ch) return;
+  const current = ch.keep ?? 100;
+  const choices = KEEP_CHOICES.some(([n]) => n === current)
+    ? KEEP_CHOICES : [...KEEP_CHOICES, [current, `${current}`]];
+  const keep = h("select", { "aria-label": "Messages kept" },
+    choices.map(([n, label]) => h("option", { value: String(n), ...(n === current ? { selected: true } : {}) }, label)));
+  const err = h("p", { class: "error", hidden: true });
+  openDialog(`#${name} settings`,
+    [field("Messages kept", keep,
+      `When a new message arrives over the limit, the oldest is deleted. Now holding ${ch.messages}.`),
+     err],
+    [cancel(), h("button", { class: "btn primary", type: "submit" }, "Save")],
+    async (dlg) => {
+      const n = Number(keep.value);
+      if (n === current) return dlg.close();
+      const over = n > 0 ? ch.messages - n : 0;
+      if (over > 0 && !confirm(`Keep only ${n} messages in #${name}?\n\nThe oldest ${over} are deleted now. This cannot be undone.`)) return;
+      try {
+        await api("PUT", `/api/channels/${enc(name)}/keep`, { keep: n });
+        dlg.close();
+        toast(`#${name} keeps ${keepLabel(n)} messages`);
+        await refreshAll();
+        // The feed may still be showing messages that were just dropped.
+        if (over > 0 && state.feed.channel === name) renderChannelView(name);
+      } catch (ex) {
+        if (ex.status === 401) return handleError(ex);
+        err.textContent = ex.message;
+        err.hidden = false;
+      }
+    });
+  keep.focus();
 }
 
 async function removeChannel(name) {

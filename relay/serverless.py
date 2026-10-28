@@ -26,7 +26,7 @@ from typing import Any, AsyncIterator
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg import Error as PgError
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from relay import telegram
 from relay.notify import Notifier, key as notify_key
@@ -109,6 +109,12 @@ class KindIn(BaseModel):
 
 class ReadsJobsIn(BaseModel):
     reads: bool
+
+
+class KeepIn(BaseModel):
+    """How many messages a channel keeps. 0 keeps them all; None goes back
+    to the deployment's default."""
+    keep: int | None = Field(default=None, ge=0)
 
 
 class MemberRepeatsIn(BaseModel):
@@ -574,6 +580,15 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         if not await scoped.set_carries_thread(name, body.reads):
             raise HTTPException(404, f"no channel {name!r}")
         return {"channel": name, "carries_thread": body.reads}
+
+    @app.put("/{ws}/api/channels/{name}/keep")
+    async def set_keep(name: str, body: KeepIn,
+                       scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """How many messages the channel keeps. Lowering it drops the oldest
+        over the new limit at once."""
+        if not await scoped.set_keep(name, body.keep):
+            raise HTTPException(404, f"no channel {name!r}")
+        return {"channel": name, "keep": body.keep}
 
     @app.post("/{ws}/api/channels/{name}/reads-jobs")
     async def set_reads_jobs(name: str, body: ReadsJobsIn,

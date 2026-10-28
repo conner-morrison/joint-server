@@ -970,6 +970,26 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, routes = await self.call("GET", f"/{ws}/api/channels/github/routes", token="hunter2")
         self.assertEqual(routes, {ids["writer"]: [ids["repo-finder"]]})
 
+    async def test_the_console_sets_how_many_messages_a_channel_keeps(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "leads"}, token="hunter2")
+        _, chans = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+        self.assertEqual({c["name"]: c["keep"] for c in chans}["leads"], 100)
+        for keep in (1000, 0):
+            status, _ = await self.call("PUT", f"/{ws}/api/channels/leads/keep",
+                                        {"keep": keep}, token="hunter2")
+            self.assertEqual(status, 200)
+            _, chans = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+            self.assertEqual({c["name"]: c["keep"] for c in chans}["leads"], keep)
+        status, _ = await self.call("PUT", f"/{ws}/api/channels/leads/keep",
+                                    {"keep": -1}, token="hunter2")
+        self.assertEqual(status, 422)
+        status, _ = await self.call("PUT", f"/{ws}/api/channels/nowhere/keep",
+                                    {"keep": 5}, token="hunter2")
+        self.assertEqual(status, 404)
+        status, _ = await self.call("PUT", f"/{ws}/api/channels/leads/keep", {"keep": 5})
+        self.assertEqual(status, 401)
+
     async def test_a_channel_can_carry_what_others_said_about_a_job(self) -> None:
         """A line of work leaves the last step needing what the first found,
         and routing means it never saw that message. Carried beside the one it
