@@ -135,6 +135,18 @@ class PgStoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first, again), (False, True))
         self.assertEqual(len(await self.store.messages_after("jobs", 0)), 1)
 
+    async def test_the_same_id_in_another_channel_is_another_message(self) -> None:
+        """Dedupe is per channel: a job posted to one channel must not stop the
+        same job going to another."""
+        await self.store.add_channel("github")
+        a, first = await self.store.append("jobs", self.alice, 1, "shared")
+        b, other = await self.store.append("github", self.alice, 1, "shared")
+        c, again = await self.store.append("github", self.bob, 1, "shared")
+        self.assertNotEqual(a, b)
+        self.assertEqual((first, other), (False, False))
+        self.assertEqual((c, again), (b, True), "within a channel it is still one message")
+        self.assertEqual(len(await self.store.messages_after("github", 0)), 1)
+
     async def test_ack_never_moves_back_or_past_the_log(self) -> None:
         seq, _ = await self.store.append("jobs", self.bob, {"n": 1})
         await self.store.ack("jobs", self.alice, seq)
@@ -482,8 +494,8 @@ class WorkspaceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slugify("Rele-vant_1.0"), "rele-vant_1.0")
 
 
-class WidenDedupeTest(unittest.IsolatedAsyncioTestCase):
-    """Moving a database made before dedupe covered every publisher.
+class DedupePerChannelTest(unittest.IsolatedAsyncioTestCase):
+    """Moving a database made under an older dedupe rule to per channel.
 
     `CREATE INDEX IF NOT EXISTS` does nothing when an index of that name
     exists, whatever its definition, so the old rule survives a deploy unless
@@ -495,34 +507,48 @@ class WidenDedupeTest(unittest.IsolatedAsyncioTestCase):
         _server.psql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
         self.db = PgStore(_server.get_uri(), min_size=1, max_size=4)
         await self.db.open()
-        async with self.db.pool.connection() as conn:       # as an older deploy left it
-            await conn.execute("DROP INDEX IF EXISTS messages_dedupe_workspace")
-            await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS messages_dedupe "
-                               "ON messages(workspace, sender, client_id) "
-                               "WHERE client_id IS NOT NULL")
         await self.db.create_workspace("acme", "p", "Acme")
         self.ws = self.db.ws("acme")
         await self.ws.add_channel("jobs")
+        await self.ws.add_channel("github")
 
     async def asyncTearDown(self) -> None:
         await self.db.close()
+
+    async def as_older_deploy_left_it(self, name: str, columns: str) -> None:
+        async with self.db.pool.connection() as conn:
+            await conn.execute("DROP INDEX IF EXISTS messages_dedupe_channel")
+            await conn.execute(f"CREATE UNIQUE INDEX {name} ON messages({columns}) "
+                               "WHERE client_id IS NOT NULL")
 
     async def dedupe_indexes(self) -> list[str]:
         rows = await self.db._all(
             "SELECT indexname FROM pg_indexes WHERE tablename = 'messages'")
         return sorted(r["indexname"] for r in rows if "dedupe" in r["indexname"])
 
-    async def test_a_restart_widens_it(self) -> None:
-        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe"])
-        await self.db.setup()
-        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe_workspace"])
-        await self.ws.append("jobs", "one", 1, "job:~123")
-        seq, dup = await self.ws.append("jobs", "two", 1, "job:~123")
-        self.assertTrue(dup, "a second publisher with that id is the same message")
+    async def test_a_new_database_dedupes_per_channel(self) -> None:
+        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe_channel"])
 
-    async def test_history_that_cannot_be_widened_is_left_alone(self) -> None:
-        """Two senders already share an id. Those messages are history and not
-        this code's to delete, so the old rule stays and the deployment runs."""
+    async def test_a_restart_narrows_workspace_wide_dedupe(self) -> None:
+        await self.as_older_deploy_left_it("messages_dedupe_workspace", "workspace, client_id")
+        await self.ws.append("jobs", "one", 1, "job:~123")
+        await self.db.setup()
+        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe_channel"])
+        _, dup = await self.ws.append("github", "one", 1, "job:~123")
+        self.assertFalse(dup, "another channel takes its own copy")
+        _, dup = await self.ws.append("github", "two", 1, "job:~123")
+        self.assertTrue(dup, "a second publisher in that channel is the same message")
+
+    async def test_a_restart_replaces_per_sender_dedupe(self) -> None:
+        await self.as_older_deploy_left_it("messages_dedupe", "workspace, sender, client_id")
+        await self.db.setup()
+        self.assertEqual(await self.dedupe_indexes(), ["messages_dedupe_channel"])
+
+    async def test_history_that_cannot_be_moved_is_left_alone(self) -> None:
+        """Two senders already share an id in one channel. Those messages are
+        history and not this code's to delete, so the old rule stays and the
+        deployment runs."""
+        await self.as_older_deploy_left_it("messages_dedupe", "workspace, sender, client_id")
         await self.ws.append("jobs", "one", 1, "job:~123")
         await self.ws.append("jobs", "two", 1, "job:~123")
         await self.db.setup()
