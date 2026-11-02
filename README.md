@@ -415,6 +415,7 @@ Saying what a worker **is** sets all of them:
 | Repo finder | no | no | the GitHub editor |
 | GitHub editor | no | no | the proposal writer |
 | LinkedIn harvester | no | yes | everyone |
+| LinkedIn handler | no | no | everyone |
 
 ```
 GET  /api/kinds

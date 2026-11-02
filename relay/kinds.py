@@ -63,6 +63,12 @@ KINDS: dict[str, dict[str, Any]] = {
         "about": "Posts leads it has found.",
         "repeats": False, "chats_hear": True, "sends_to": [],
     },
+    "linkedin-handler": {
+        "label": "LinkedIn handler",
+        "about": "Takes leads and works them, and reports what became of each.",
+        # The harvester's post already buzzed a phone for this lead.
+        "repeats": False, "chats_hear": False, "sends_to": [],
+    },
 }
 
 

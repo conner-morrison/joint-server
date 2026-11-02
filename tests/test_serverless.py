@@ -1223,7 +1223,8 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         names = {k["kind"] for k in kinds}
         self.assertEqual(names, {"gmail-alert", "vollna-scraper", "proposal-writer",
-                                 "repo-finder", "github-editor", "linkedin-harvester"})
+                                 "repo-finder", "github-editor", "linkedin-harvester",
+                                 "linkedin-handler"})
         for k in kinds:
             self.assertTrue(k["label"] and k["about"])
 
