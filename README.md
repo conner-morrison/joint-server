@@ -356,6 +356,38 @@ Sending one message to one worker by hand ignores all of this. That is an act
 rather than a rule, and acts are honoured - otherwise a route could leave a
 channel impossible to repair from the console.
 
+## A channel that hands each message to one taker
+
+Several handlers working the same leads should not all work every lead. Tick
+**One taker per message** on the channel, and give each handler a **turn** in
+its member settings (1 is asked first):
+
+```
+POST /{ws}/api/channels/{channel}/queue                       {"on": true}
+PUT  /{ws}/api/channels/{channel}/members/{worker_id}/priority  {"priority": 1}
+```
+
+Members with a turn are takers. Everything posted by anyone else is queued and
+handed to one taker at a time, up to 10 at once (`RELAY_QUEUE_BATCH`):
+
+- **The first idle taker in line takes it.** Idle means holding a poll open
+  right now; a taker that is busy with what it took is not asking. So with
+  handlers 1 and 2 both waiting, a new lead is handler 1's; while handler 1 is
+  busy, the next is handler 2's; and 25 leads waiting go 10, 10 and 5.
+- **Acknowledging settles it.** A taker that asks again before acknowledging
+  gets what it holds, not more. Anything not acknowledged within
+  `RELAY_QUEUE_LEASE` seconds (300) goes back to the queue for someone else.
+- **A taker's own posts are not work.** What a handler says about a lead - a
+  `fetched` mark - reaches the other members as in any room, and never another
+  taker, which would read it as a lead.
+- **It starts at the head.** Turning it on queues what is posted from then on;
+  turning it off starts every taker from that moment.
+
+Workers need no change: they poll and acknowledge as they always did. Naming a
+worker a **LinkedIn handler** gives it the next turn in each of its channels.
+Keep a queue's channel unlimited (`keep` 0), or a backlog longer than the
+channel keeps is dropped before anyone takes it.
+
 ## Being told about itself
 
 A poll answers with what is waiting in the worker's channels, and with anything

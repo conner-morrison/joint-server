@@ -1141,7 +1141,9 @@ async function openKind(workerId, name, current) {
         : "A Telegram chat in its channels is not told what it publishes.",
       (k.sends_to || []).length
         ? `In a channel it shares with one, it reaches only: ${k.sends_to.join(", ")}.`
-        : "Reaches every member of its channels."];
+        : "Reaches every member of its channels.",
+      k.takes_turns ? "Takes a turn where a channel hands each message to one taker." : ""]
+      .filter(Boolean);
     note.textContent = said.join(" ");
   };
   pick.addEventListener("change", draw);
@@ -1298,6 +1300,16 @@ function renderChannelHead() {
         onchange: (e) => setCarriesThread(ch.name, e.target.checked),
       }),
       h("span", { class: "muted small" }, "Carry the thread")),
+    h("label", { class: "check inline",
+                 title: "On, each message goes to one taker instead of to every member. Takers "
+                      + "are the members with a turn (set in a member's settings): the first in "
+                      + "line that is idle takes up to 10, and the next takes what is left. "
+                      + "Everyone else still hears everything." },
+      h("input", {
+        type: "checkbox", ...(ch.queue ? { checked: true } : {}),
+        onchange: (e) => setQueue(ch.name, e.target.checked),
+      }),
+      h("span", { class: "muted small" }, "One taker per message")),
     h("button", { class: "btn danger", onclick: () => removeChannel(ch.name) }, "Delete channel"));
 }
 
@@ -1668,6 +1680,23 @@ function renderMemberList() {
       const id = m.worker_id;
       const shown = m.name || id;
       const waiting = waitingFor(id);
+      // A taker is owed nothing in particular, so there is no backlog to skip
+      // or last message to resend: only its turn, the queue, and what it holds.
+      if (ch.queue && m.priority != null) {
+        const row = state.delivery.find((r) => r.worker_id === id) || {};
+        return h("li", {},
+          dot(state.online.has(id)),
+          h("span", { class: "muted small", title: "Its turn among the takers" }, `#${m.priority}`),
+          h("span", { class: "truncate", title: id }, shown),
+          h("span", { class: "muted small",
+                      title: "Waiting in the queue for it / handed to it and not yet acknowledged" },
+            `${Number(row.waiting) || 0} queued · ${Number(row.holding) || 0} held`),
+          h("button", {
+            class: "btn icon", title: `${shown}'s settings in #${ch.name}`,
+            "aria-label": `${shown}'s settings in #${ch.name}`,
+            onclick: () => openMemberSettings(ch.name, id, shown),
+          }, "⚙"));
+      }
       return h("li", {},
         dot(state.online.has(id)),
         h("span", { class: "truncate", title: id }, shown),
@@ -1720,10 +1749,17 @@ function openMemberSettings(channel, workerId, shown) {
     h("option", { value: "false", ...(here === "false" ? { selected: true } : {}) },
       "Refuse in this channel"));
   const everywhere = h("input", { type: "checkbox", ...(byWorker ? { checked: true } : {}) });
+  const turnWas = member.priority == null ? "" : String(member.priority);
+  const turn = h("input", { type: "number", min: "1", step: "1", value: turnWas,
+                            placeholder: "Not a taker", "aria-label": "Turn" });
   const err = h("p", { class: "error", hidden: true });
 
   const dlg = openDialog(`${shown} in #${channel}`, [
     h("p", { class: "muted small mono truncate", title: workerId }, workerId),
+    field("Turn", turn,
+      "Where this channel hands each message to one taker, this worker's place in line: 1 is "
+      + "asked first, and the next is asked when everyone ahead is busy or away. Empty, it is "
+      + "not a taker and hears everything posted here."),
     field("Posting a job already here", repeats,
       "Refused, a job this channel already has is turned away however it is written, so two "
       + "workers watching the same board post it once between them. Allowed, this worker posts "
@@ -1758,6 +1794,10 @@ function openMemberSettings(channel, workerId, shown) {
           await api("POST", `/api/channels/${enc(channel)}/members/${enc(workerId)}/repeats`,
             { allowed: repeats.value === "" ? null : repeats.value === "true" });
         }
+        if (turn.value.trim() !== turnWas) {
+          await api("PUT", `/api/channels/${enc(channel)}/members/${enc(workerId)}/priority`,
+            { priority: turn.value.trim() === "" ? null : Number(turn.value) });
+        }
         self.close();
         await refreshAll();
         renderMembers();
@@ -1782,6 +1822,20 @@ async function setCarriesThread(channel, carries) {
     await api("POST", `/api/channels/${enc(channel)}/carries-thread`, { reads: carries });
     toast(carries ? `#${channel} carries what others said about the same job`
       : `#${channel} hands over each message on its own`);
+    await refreshAll();
+  } catch (err) { handleError(err); }
+}
+
+async function setQueue(channel, on) {
+  if (on && !confirm(`Hand each message in #${channel} to one taker?\n\n`
+    + "Takers are the members with a turn. They stop hearing everything and take their share "
+    + "of what is posted from now on; what is already here is left alone.")) {
+    return renderChannelHead();
+  }
+  try {
+    await api("POST", `/api/channels/${enc(channel)}/queue`, { on });
+    toast(on ? `#${channel} hands each message to one taker`
+      : `#${channel} hands every message to every member`);
     await refreshAll();
   } catch (err) { handleError(err); }
 }

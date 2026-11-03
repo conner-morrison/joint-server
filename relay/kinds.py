@@ -26,6 +26,9 @@ from typing import Any
 # `sends_to`    the kinds it hands work to, where they are in the same
 #               channel. Empty means it reaches every member, which is what a
 #               channel does when nothing is said.
+# `takes_turns` given a turn among the takers of each channel it is in, after
+#               those already there, unless it has one. Matters only where
+#               the channel hands each message to one taker.
 KINDS: dict[str, dict[str, Any]] = {
     "gmail-alert": {
         "label": "Gmail alert",
@@ -68,6 +71,8 @@ KINDS: dict[str, dict[str, Any]] = {
         "about": "Takes leads and works them, and reports what became of each.",
         # The harvester's post already buzzed a phone for this lead.
         "repeats": False, "chats_hear": False, "sends_to": [],
+        # Where a channel hands each lead to one taker, this is one of them.
+        "takes_turns": True,
     },
 }
 

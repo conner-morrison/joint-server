@@ -117,6 +117,16 @@ class KeepIn(BaseModel):
     keep: int | None = Field(default=None, ge=0)
 
 
+class QueueIn(BaseModel):
+    on: bool
+
+
+class PriorityIn(BaseModel):
+    """A member's turn among a queue's takers, 1 first. None makes it an
+    ordinary member again."""
+    priority: int | None = Field(default=None, ge=1)
+
+
 class MemberRepeatsIn(BaseModel):
     """None puts the question back to the worker's own setting, which is not
     the same as answering no."""
@@ -362,25 +372,35 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         # workspace. A publish elsewhere is not its business.
         watching = [notify_key(scoped.slug, channel)
                     for channel in await scoped.channels_of(worker_id)]
-        while True:
-            found = await scoped.waiting_for(worker_id, limit=min(max(limit, 1), 1000))
-            # What the server has to say about this worker rather than to the
-            # channels it is in: that it has been added to one, or taken out of
-            # one. Worth ending a wait for, because both change what the worker
-            # should be doing next.
-            notices = await scoped.notices_for(worker_id)
-            left = deadline - time.monotonic()
-            if found or notices or left <= 0:
-                await scoped.redelivered(worker_id, [int(m["seq"]) for m in found])
-                await scoped.notices_taken([int(n["id"]) for n in notices])
-                return {"messages": found, "notices": notices, "worker_id": worker_id}
-            # Woken by the publish itself. The timeout is a safety net for a
-            # notification that never arrives, not the thing doing the work,
-            # which is why it can afford to be long.
-            if notifier is not None:
-                await notifier.wait(watching, timeout=min(left, POLL_INTERVAL))
-            else:
-                await asyncio.sleep(min(left, POLL_INTERVAL))
+        # A taker in a queue is idle while it waits here, and an idle taker is
+        # the one a queue asks first. Said in the database, because the taker
+        # behind it may be waiting on another instance.
+        waiting = deadline > time.monotonic()
+        if waiting:
+            await scoped.polling(worker_id, time.time() + (deadline - time.monotonic()))
+        try:
+            while True:
+                found = await scoped.waiting_for(worker_id, limit=min(max(limit, 1), 1000))
+                # What the server has to say about this worker rather than to the
+                # channels it is in: that it has been added to one, or taken out of
+                # one. Worth ending a wait for, because both change what the worker
+                # should be doing next.
+                notices = await scoped.notices_for(worker_id)
+                left = deadline - time.monotonic()
+                if found or notices or left <= 0:
+                    await scoped.redelivered(worker_id, [int(m["seq"]) for m in found])
+                    await scoped.notices_taken([int(n["id"]) for n in notices])
+                    return {"messages": found, "notices": notices, "worker_id": worker_id}
+                # Woken by the publish itself. The timeout is a safety net for a
+                # notification that never arrives, not the thing doing the work,
+                # which is why it can afford to be long.
+                if notifier is not None:
+                    await notifier.wait(watching, timeout=min(left, POLL_INTERVAL))
+                else:
+                    await asyncio.sleep(min(left, POLL_INTERVAL))
+        finally:
+            if waiting:
+                await scoped.polling(worker_id, 0)
 
     @app.post("/{ws}/ack")
     async def ack(body: AckIn, who: tuple[WorkspaceStore, str] = Depends(worker)) -> dict[str, Any]:
@@ -603,6 +623,23 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         if not await scoped.set_reads_jobs(name, body.reads):
             raise HTTPException(404, f"no channel {name!r}")
         return {"channel": name, "reads_jobs": body.reads}
+
+    @app.post("/{ws}/api/channels/{name}/queue")
+    async def set_queue(name: str, body: QueueIn,
+                        scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        """Whether each message here goes to one taker rather than to every
+        member. Takers are the members with a turn; the others still hear
+        everything, as in any room."""
+        if not await scoped.set_queue(name, body.on):
+            raise HTTPException(404, f"no channel {name!r}")
+        return {"channel": name, "queue": body.on}
+
+    @app.put("/{ws}/api/channels/{name}/members/{worker_id}/priority")
+    async def set_priority(name: str, worker_id: str, body: PriorityIn,
+                           scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.set_priority(name, worker_id, body.priority):
+            raise HTTPException(404, f"{worker_id!r} is not in channel {name!r}")
+        return {"channel": name, "worker_id": worker_id, "priority": body.priority}
 
     @app.put("/{ws}/api/channels/{name}/members/{worker_id}")
     async def add_member(name: str, worker_id: str, body: JoinIn | None = None,

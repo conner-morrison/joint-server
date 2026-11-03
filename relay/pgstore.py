@@ -114,6 +114,9 @@ CREATE TABLE IF NOT EXISTS channels (
     -- How many messages this channel keeps: NULL for the deployment's
     -- default, 0 for all of them.
     keep        INTEGER,
+    -- Set, each message is handed to one taker rather than to every member,
+    -- and the queue holds what was posted after this seq. NULL is a room.
+    queue_from  BIGINT,
     PRIMARY KEY (workspace, name)
 );
 
@@ -127,11 +130,32 @@ CREATE TABLE IF NOT EXISTS members (
     -- decided in this channel and the worker's own setting stands, which is
     -- what lets one answer serve every channel until one of them differs.
     may_repeat  BOOLEAN,
+    -- Its turn among the takers of a queue: 1 is asked first. NULL means it is
+    -- not a taker, and is handed everything as in any room.
+    priority    INTEGER,
+    -- Until when it is holding a poll open, which is what makes it idle and
+    -- therefore first in line. A worker that is busy is not asking.
+    polling_until DOUBLE PRECISION NOT NULL DEFAULT 0,
     PRIMARY KEY (workspace, channel, worker_id),
     FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE,
     FOREIGN KEY (workspace, worker_id) REFERENCES workers(workspace, worker_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS members_worker ON members(workspace, worker_id);
+
+-- Which taker a queued message was handed to. One row per message, so a
+-- message cannot be handed to two of them, whichever instance asks. A claim
+-- not acknowledged within the lease goes back to the queue.
+CREATE TABLE IF NOT EXISTS claims (
+    workspace   TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    seq         BIGINT NOT NULL,
+    worker_id   TEXT NOT NULL,
+    handed_at   DOUBLE PRECISION NOT NULL,
+    acked_at    DOUBLE PRECISION,
+    PRIMARY KEY (workspace, channel, seq),
+    FOREIGN KEY (workspace, channel) REFERENCES channels(workspace, name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS claims_worker ON claims(workspace, channel, worker_id);
 
 -- Somewhere the server itself delivers to. Not a worker: nothing connects, so
 -- there is nobody to approve and no token to hand out. A bot is registered
@@ -300,6 +324,31 @@ ONLINE_WINDOW = float(os.environ.get("RELAY_ONLINE_WINDOW", "75"))
 # loop cannot wear a person down; short enough that a change of mind costs a
 # wait rather than a support request.
 REFUSAL_STANDS = float(os.environ.get("RELAY_REFUSAL_STANDS", str(24 * 3600)))
+# The most a taker is handed from a queue at once, whatever it asks for: a
+# worker that asks for 200 and works through 10 would otherwise sit on the rest.
+QUEUE_BATCH = int(os.environ.get("RELAY_QUEUE_BATCH", "10"))
+# How long a taker has to acknowledge what it was handed before it goes back to
+# the queue for someone else. Covers a hand-out that never arrived, or a taker
+# that died holding it.
+QUEUE_LEASE = float(os.environ.get("RELAY_QUEUE_LEASE", "300"))
+
+# What is waiting in a queue for one taker: posted since the queue started, by
+# someone who is not a taker there - a taker's own word is about the work, not
+# more of it - held by nobody, and not routed away from it. Parameters:
+# workspace, channel, queue_from, taker, taker.
+QUEUED = """g.workspace = %s AND g.channel = %s AND g.seq > %s AND g.sender <> %s
+       AND NOT EXISTS (SELECT 1 FROM members s
+                        WHERE s.workspace = g.workspace AND s.channel = g.channel
+                          AND s.worker_id = g.sender AND s.priority IS NOT NULL)
+       AND NOT EXISTS (SELECT 1 FROM claims k
+                        WHERE k.workspace = g.workspace AND k.channel = g.channel
+                          AND k.seq = g.seq)
+       AND (NOT EXISTS (SELECT 1 FROM routes t
+                         WHERE t.workspace = g.workspace AND t.channel = g.channel
+                           AND t.sender = g.sender)
+            OR EXISTS (SELECT 1 FROM routes t
+                        WHERE t.workspace = g.workspace AND t.channel = g.channel
+                          AND t.sender = g.sender AND t.recipient = %s))"""
 
 
 # Upwork names a job in its own links: ~021987abc. Two links to one job differ
@@ -548,6 +597,10 @@ class PgStore:
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS "
                                    "carries_thread BOOLEAN NOT NULL DEFAULT FALSE")
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS keep INTEGER")
+                await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS queue_from BIGINT")
+                await conn.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS priority INTEGER")
+                await conn.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS "
+                                   "polling_until DOUBLE PRECISION NOT NULL DEFAULT 0")
                 await conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS kind TEXT")
                 await conn.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS "
                                    "refused_at DOUBLE PRECISION")
@@ -872,13 +925,23 @@ class WorkspaceStore:
 
         members: dict[str, list[str]] = {}
         for row in await self.store._all(
-                "SELECT channel, worker_id FROM members WHERE workspace = %s", (self.slug,)):
+                "SELECT channel, worker_id FROM members WHERE workspace = %s "
+                " ORDER BY joined_at, worker_id", (self.slug,)):
             members.setdefault(row["channel"], []).append(row["worker_id"])
 
         for channel, here in members.items():
             typed = [w for w in here if w in workers]
             for worker_id in typed:
                 rules = KINDS.get(workers[worker_id]["kind"], {})
+                # Next in line, in the order they joined. A turn already given,
+                # by hand or before, is kept.
+                if rules.get("takes_turns"):
+                    await self.store._run("""
+                        UPDATE members m SET priority = (
+                               SELECT COALESCE(MAX(o.priority), 0) + 1 FROM members o
+                                WHERE o.workspace = m.workspace AND o.channel = m.channel)
+                         WHERE m.workspace = %s AND m.channel = %s AND m.worker_id = %s
+                           AND m.priority IS NULL""", (self.slug, channel, worker_id))
                 wanted = {other for other in typed
                           if workers[other]["kind"] in rules.get("sends_to", ())
                           and other != worker_id}
@@ -1210,9 +1273,148 @@ class WorkspaceStore:
             "UPDATE channels SET reads_jobs = %s WHERE workspace = %s AND name = %s",
             (reads, self.slug, channel)) > 0
 
+    async def set_queue(self, channel: str, on: bool) -> bool:
+        """Whether each message here is handed to one taker rather than to
+        every member.
+
+        On, the queue starts at the head: what is already here was posted to a
+        room and may already have been handed to every taker. Off, every taker
+        starts from now as well, for the same reason the other way round -
+        below the head is what the queue already shared out.
+        """
+        head = await self.head()
+        await self.store.ready()
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                cur = await conn.execute(
+                    "UPDATE channels SET queue_from = "
+                    + ("COALESCE(queue_from, %s)" if on else "NULL")
+                    + " WHERE workspace = %s AND name = %s",
+                    ((head,) if on else ()) + (self.slug, channel))
+                if cur.rowcount == 0:
+                    return False
+                if not on:
+                    await conn.execute(
+                        "UPDATE members SET cursor = GREATEST(cursor, %s) "
+                        " WHERE workspace = %s AND channel = %s AND priority IS NOT NULL",
+                        (head, self.slug, channel))
+                    await conn.execute("DELETE FROM claims WHERE workspace = %s AND channel = %s",
+                                       (self.slug, channel))
+        return True
+
+    async def set_priority(self, channel: str, worker_id: str, priority: int | None) -> bool:
+        """A member's turn among the takers of a queue, 1 first. None makes it
+        an ordinary member again, and what it held but never acknowledged goes
+        back to the queue rather than waiting out its lease."""
+        changed = await self.store._run(
+            "UPDATE members SET priority = %s WHERE workspace = %s AND channel = %s AND worker_id = %s",
+            (priority, self.slug, channel, worker_id)) > 0
+        if changed and priority is None:
+            await self._release(channel, worker_id)
+        return changed
+
+    async def _release(self, channel: str, worker_id: str) -> None:
+        await self.store._run(
+            "DELETE FROM claims WHERE workspace = %s AND channel = %s AND worker_id = %s "
+            "   AND acked_at IS NULL", (self.slug, channel, worker_id))
+
+    async def polling(self, worker_id: str, until: float) -> None:
+        """Say that a taker is holding a poll open until `until`, or, with 0,
+        that it no longer is. Only a taker that is waiting is idle, and only an
+        idle one is first in line."""
+        await self.store._run(
+            "UPDATE members SET polling_until = %s "
+            " WHERE workspace = %s AND worker_id = %s AND priority IS NOT NULL",
+            (until, self.slug, worker_id))
+
+    async def _take(self, worker_id: str, limit: int) -> list[int]:
+        """Hand this taker its share of every queue it is in, and say which
+        messages those are."""
+        queues = await self.store._all("""
+            SELECT m.channel FROM members m
+              JOIN channels c ON c.workspace = m.workspace AND c.name = m.channel
+             WHERE m.workspace = %s AND m.worker_id = %s
+               AND m.priority IS NOT NULL AND c.queue_from IS NOT NULL""",
+            (self.slug, worker_id))
+        taken: list[int] = []
+        for q in queues:
+            taken += await self._take_from(q["channel"], worker_id, min(limit, QUEUE_BATCH))
+        return taken
+
+    async def _take_from(self, channel: str, worker_id: str, limit: int) -> list[int]:
+        """One taker's share of one queue.
+
+        What it already holds comes back again: a taker that asks while
+        holding something did not receive it, or is asking again before it
+        acknowledged, and either way it is still its to do. Otherwise it takes
+        what nobody holds - unless a taker ahead of it is idle and asking,
+        because then the work is that one's.
+
+        Decided under a lock per channel, so two instances cannot both
+        conclude that their taker is first.
+        """
+        await self.store.ready()
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                                   (f"queue:{self.slug}:{channel}",))
+                now = time.time()
+                await conn.execute(
+                    "DELETE FROM claims WHERE workspace = %s AND channel = %s "
+                    "   AND acked_at IS NULL AND handed_at < %s",
+                    (self.slug, channel, now - QUEUE_LEASE))
+                held = await (await conn.execute(
+                    "SELECT seq FROM claims WHERE workspace = %s AND channel = %s "
+                    "   AND worker_id = %s AND acked_at IS NULL ORDER BY seq",
+                    (self.slug, channel, worker_id))).fetchall()
+                if held:
+                    return [int(r["seq"]) for r in held]
+                me = await (await conn.execute("""
+                    SELECT m.priority, c.queue_from FROM members m
+                      JOIN channels c ON c.workspace = m.workspace AND c.name = m.channel
+                     WHERE m.workspace = %s AND m.channel = %s AND m.worker_id = %s""",
+                    (self.slug, channel, worker_id))).fetchone()
+                if me is None or me["priority"] is None or me["queue_from"] is None:
+                    return []
+                ahead = await (await conn.execute("""
+                    SELECT 1 FROM members o
+                     WHERE o.workspace = %s AND o.channel = %s AND o.worker_id <> %s
+                       AND o.priority IS NOT NULL
+                       AND (o.priority < %s OR (o.priority = %s AND o.worker_id < %s))
+                       AND o.polling_until > %s
+                       AND NOT EXISTS (SELECT 1 FROM claims k
+                                        WHERE k.workspace = o.workspace AND k.channel = o.channel
+                                          AND k.worker_id = o.worker_id AND k.acked_at IS NULL)
+                     LIMIT 1""",
+                    (self.slug, channel, worker_id, me["priority"], me["priority"], worker_id,
+                     now))).fetchone()
+                if ahead is not None:
+                    return []
+                rows = await (await conn.execute(f"""
+                    INSERT INTO claims(workspace, channel, seq, worker_id, handed_at)
+                    SELECT g.workspace, g.channel, g.seq, %s, %s FROM messages g
+                     WHERE {QUEUED}
+                     ORDER BY g.seq LIMIT %s
+                    RETURNING seq""",
+                    (worker_id, now, self.slug, channel, me["queue_from"], worker_id,
+                     worker_id, limit))).fetchall()
+                if rows:
+                    # Whoever is behind this one and waiting looks again: if
+                    # more is left, this taker is busy now and it is theirs.
+                    await conn.execute("SELECT pg_notify(%s, %s)",
+                                       (NOTIFY_CHANNEL, notify_key(self.slug, channel)))
+                return sorted(int(r["seq"]) for r in rows)
+
+    async def _queued(self, channel: str, queue_from: int, worker_id: str) -> int:
+        """How many messages in a queue nobody holds and this taker could take."""
+        row = await self.store._one(f"SELECT COUNT(*) AS n FROM messages g WHERE {QUEUED}",
+                                    (self.slug, channel, queue_from, worker_id, worker_id))
+        return int(row["n"]) if row else 0
+
     async def list_channels(self) -> list[dict[str, Any]]:
         rows = await self.store._all("""
             SELECT c.name, c.description, c.created_at, c.reads_jobs, c.carries_thread,
+                   c.queue_from IS NOT NULL AS queue,
                    COALESCE(c.keep, %s) AS keep,
                    (SELECT COUNT(*) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS messages,
                    (SELECT MAX(seq) FROM messages m WHERE m.workspace = c.workspace AND m.channel = c.name) AS last_seq
@@ -1223,13 +1425,13 @@ class WorkspaceStore:
         members: dict[str, list[dict[str, Any]]] = {}
         for m in await self.store._all("""
                 SELECT m.channel, m.worker_id, COALESCE(NULLIF(w.name, ''), m.worker_id) AS name,
-                       m.may_repeat
+                       m.may_repeat, m.priority
                   FROM members m LEFT JOIN workers w
                     ON w.workspace = m.workspace AND w.worker_id = m.worker_id
                  WHERE m.workspace = %s ORDER BY name, m.worker_id""", (self.slug,)):
             members.setdefault(m["channel"], []).append(
                 {"worker_id": m["worker_id"], "name": m["name"],
-                 "may_repeat": m["may_repeat"]})
+                 "may_repeat": m["may_repeat"], "priority": m["priority"]})
         return [{**r, "members": members.get(r["name"], [])} for r in rows]
 
     # --- membership ------------------------------------------------------
@@ -1269,6 +1471,8 @@ class WorkspaceStore:
                 "DELETE FROM routes WHERE workspace = %s AND channel = %s "
                 "   AND (sender = %s OR recipient = %s)",
                 (self.slug, channel, worker_id, worker_id))
+            # What it was handed and never acknowledged is somebody else's now.
+            await self._release(channel, worker_id)
             # And whoever handed work to it is re-wired by type, so the line of
             # work closes over the gap instead of ending at it.
             await self.apply_kinds()
@@ -1415,6 +1619,24 @@ class WorkspaceStore:
                 ON w.workspace = m.workspace AND w.worker_id = m.worker_id
              WHERE m.workspace = %s AND m.channel = %s
              ORDER BY w.name, m.worker_id""", (self.slug, channel))
+        # A taker in a queue is not behind by what is above its cursor: it is
+        # owed nothing in particular. What it could take, and what it holds.
+        queue = await self.store._one(
+            "SELECT queue_from FROM channels WHERE workspace = %s AND name = %s",
+            (self.slug, channel))
+        if queue and queue["queue_from"] is not None:
+            takers = {r["worker_id"]: int(r["priority"]) for r in await self.store._all(
+                "SELECT worker_id, priority FROM members WHERE workspace = %s AND channel = %s "
+                "   AND priority IS NOT NULL", (self.slug, channel))}
+            holding = {r["worker_id"]: int(r["n"]) for r in await self.store._all(
+                "SELECT worker_id, COUNT(*) AS n FROM claims WHERE workspace = %s AND channel = %s "
+                "   AND acked_at IS NULL GROUP BY worker_id", (self.slug, channel))}
+            for row in workers:
+                if row["worker_id"] in takers:
+                    row["waiting"] = await self._queued(channel, int(queue["queue_from"]),
+                                                        row["worker_id"])
+                    row["priority"] = takers[row["worker_id"]]
+                    row["holding"] = holding.get(row["worker_id"], 0)
         bots = await self.store._all("""
             SELECT b.bot AS worker_id, b.bot AS name, b.cursor,
                    (SELECT COUNT(*) FROM messages g
@@ -1434,6 +1656,12 @@ class WorkspaceStore:
                SET cursor = GREATEST(cursor, LEAST(%s, (SELECT COALESCE(MAX(seq), 0) FROM messages)))
              WHERE workspace = %s AND channel = %s AND worker_id = %s""",
             (seq, self.slug, channel, worker_id))
+        # In a queue the same acknowledgement settles what it was handed: done
+        # is done, and nothing up to here goes back to anyone.
+        await self.store._run(
+            "UPDATE claims SET acked_at = %s WHERE workspace = %s AND channel = %s "
+            "   AND worker_id = %s AND seq <= %s AND acked_at IS NULL",
+            (time.time(), self.slug, channel, worker_id, seq))
 
     # --- bots ------------------------------------------------------------
     # Registered once for the workspace, then added to channels like a worker.
@@ -1750,6 +1978,9 @@ class WorkspaceStore:
         await conn.execute(
             "DELETE FROM redeliveries WHERE workspace = %s AND channel = %s AND seq <= %s",
             (self.slug, channel, cutoff["seq"]))
+        await conn.execute(
+            "DELETE FROM claims WHERE workspace = %s AND channel = %s AND seq <= %s",
+            (self.slug, channel, cutoff["seq"]))
 
     async def messages_after(self, channel: str, after: int, *, limit: int = 200,
                              exclude_sender: str | None = None) -> list[dict[str, Any]]:
@@ -1802,7 +2033,11 @@ class WorkspaceStore:
     async def waiting_for(self, worker_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         """Everything above this worker's cursors, across all its channels,
         oldest first, plus anything asked for again by hand. One query,
-        because a poll should be one round trip."""
+        because a poll should be one round trip.
+
+        A taker in a queue is the exception: from that channel it is handed
+        only its share of the queue, never the room's copy of everything."""
+        taken = await self._take(worker_id, limit)
         rows = await self.store._all("""
             SELECT m.seq, m.channel, m.sender, m.body, m.ts, m.thread_key,
                    c.reads_jobs, c.carries_thread
@@ -1827,7 +2062,20 @@ class WorkspaceStore:
                     OR EXISTS (SELECT 1 FROM redeliveries r
                                 WHERE r.workspace = m.workspace AND r.channel = m.channel
                                   AND r.worker_id = mem.worker_id AND r.seq = m.seq))
+               AND (c.queue_from IS NULL OR mem.priority IS NULL
+                    OR EXISTS (SELECT 1 FROM redeliveries r
+                                WHERE r.workspace = m.workspace AND r.channel = m.channel
+                                  AND r.worker_id = mem.worker_id AND r.seq = m.seq))
              ORDER BY m.seq LIMIT %s""", (self.slug, worker_id, worker_id, limit))
+        if taken:
+            have = {int(r["seq"]) for r in rows}
+            rows = sorted(rows + await self.store._all("""
+                SELECT m.seq, m.channel, m.sender, m.body, m.ts, m.thread_key,
+                       c.reads_jobs, c.carries_thread
+                  FROM messages m
+                  JOIN channels c ON c.workspace = m.workspace AND c.name = m.channel
+                 WHERE m.workspace = %s AND m.seq = ANY(%s)""",
+                (self.slug, [s for s in taken if s not in have])), key=lambda r: int(r["seq"]))
         return await self._with_threads(rows, worker_id)
 
     async def _with_threads(self, rows: list[dict[str, Any]],

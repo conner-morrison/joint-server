@@ -877,6 +877,188 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
             got[who] = [m["body"] for m in said["messages"] if "body" in m]
         return got
 
+    # --- a queue: each message to one taker -------------------------------
+    async def queue(self, ws: str, takers: int = 2) -> dict[str, str]:
+        """A harvester and some handlers in one channel, each handler with a
+        turn in the order it is named, and the channel handing each lead to one
+        of them."""
+        await self.call("POST", f"/{ws}/api/channels", {"name": "leads"}, token="hunter2")
+        ids = {"harvester": await self.enrol(ws, "harvester")}
+        for n in range(1, takers + 1):
+            ids[f"h{n}"] = await self.enrol(ws, f"handler-{n}")
+        for who, worker in ids.items():
+            await self.call("PUT", f"/{ws}/api/channels/leads/members/{worker}", {}, token="hunter2")
+            await self.call("GET", f"/{ws}/messages", token=worker)      # take the join notice
+            if who != "harvester":
+                status, _ = await self.call(
+                    "PUT", f"/{ws}/api/channels/leads/members/{worker}/priority",
+                    {"priority": int(who[1:])}, token="hunter2")
+                self.assertEqual(status, 200)
+        status, _ = await self.call("POST", f"/{ws}/api/channels/leads/queue", {"on": True},
+                                    token="hunter2")
+        self.assertEqual(status, 200)
+        return ids
+
+    async def lead(self, ws: str, ids: dict[str, str], n: int) -> int:
+        _, said = await self.call("POST", f"/{ws}/publish",
+                                  {"channel": "leads", "body": {"url": f"https://li/{n}"}},
+                                  token=ids["harvester"])
+        return int(said["seq"])
+
+    async def taken(self, ws: str, worker: str, wait: float = 0) -> list[str]:
+        _, said = await self.call("GET", f"/{ws}/messages?wait={wait}", token=worker)
+        return [m["body"]["url"] for m in said["messages"]]
+
+    async def test_a_queued_message_goes_to_one_taker(self) -> None:
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        for n in range(3):
+            await self.lead(ws, ids, n)
+        # Nobody is idle and waiting, so whoever asks first takes it.
+        self.assertEqual(await self.taken(ws, ids["h2"]), ["https://li/0", "https://li/1",
+                                                          "https://li/2"])
+        self.assertEqual(await self.taken(ws, ids["h1"]), [], "a lead was handed out twice")
+
+    async def test_a_taker_is_handed_ten_at_most_and_the_next_takes_the_rest(self) -> None:
+        ws = await self.workspace()
+        ids = await self.queue(ws, takers=3)
+        for n in range(25):
+            await self.lead(ws, ids, n)
+        first = await self.taken(ws, ids["h1"])
+        second = await self.taken(ws, ids["h2"])
+        third = await self.taken(ws, ids["h3"])
+        self.assertEqual((len(first), len(second), len(third)), (10, 10, 5))
+        self.assertEqual(len(set(first + second + third)), 25)
+        # Asking again before acknowledging is the same ten, not ten more.
+        self.assertEqual(await self.taken(ws, ids["h1"]), first)
+
+    async def test_the_first_idle_taker_in_line_takes_a_new_lead(self) -> None:
+        """Both waiting: the lead is the first one's, and the second keeps
+        waiting. Then the first is busy, and the next lead is the second's."""
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+
+        async def soon(n: int) -> None:
+            await asyncio.sleep(0.7)
+            await self.lead(ws, ids, n)
+
+        h1, h2, _ = await asyncio.gather(self.taken(ws, ids["h1"], wait=3),
+                                         self.taken(ws, ids["h2"], wait=3), soon(0))
+        self.assertEqual((h1, h2), (["https://li/0"], []))
+
+        # h1 holds it and has not come back: it is busy, so h2 is next.
+        h2, _ = await asyncio.gather(self.taken(ws, ids["h2"], wait=3), soon(1))
+        self.assertEqual(h2, ["https://li/1"])
+
+    async def test_a_taker_behind_one_that_is_away_is_not_kept_waiting(self) -> None:
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+
+        async def soon() -> None:
+            await asyncio.sleep(0.5)
+            await self.lead(ws, ids, 0)
+
+        started = time.monotonic()
+        h2, _ = await asyncio.gather(self.taken(ws, ids["h2"], wait=5), soon())
+        self.assertEqual(h2, ["https://li/0"])
+        self.assertLess(time.monotonic() - started, 3)
+
+    async def test_an_acknowledged_lead_is_done_and_an_unacknowledged_one_comes_back(self) -> None:
+        from relay import pgstore
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        a = await self.lead(ws, ids, 0)
+        await self.lead(ws, ids, 1)
+        self.assertEqual(len(await self.taken(ws, ids["h1"])), 2)
+        status, _ = await self.call("POST", f"/{ws}/ack", {"channel": "leads", "seq": a},
+                                    token=ids["h1"])
+        self.assertEqual(status, 200)
+
+        was, pgstore.QUEUE_LEASE = pgstore.QUEUE_LEASE, 0.3
+        try:
+            await asyncio.sleep(0.5)
+            # The one it never acknowledged went back, and is h2's to take.
+            self.assertEqual(await self.taken(ws, ids["h2"]), ["https://li/1"])
+        finally:
+            pgstore.QUEUE_LEASE = was
+        self.assertEqual(await self.taken(ws, ids["h1"]), [])
+
+    async def test_a_queue_starts_at_the_head(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "leads"}, token="hunter2")
+        harvester = await self.enrol(ws, "harvester")
+        handler = await self.enrol(ws, "handler")
+        for worker in (harvester, handler):
+            await self.call("PUT", f"/{ws}/api/channels/leads/members/{worker}", {}, token="hunter2")
+            await self.call("GET", f"/{ws}/messages", token=worker)
+        await self.call("POST", f"/{ws}/publish", {"channel": "leads", "body": {"url": "https://li/old"}},
+                        token=harvester)
+        await self.call("PUT", f"/{ws}/api/channels/leads/members/{handler}/priority",
+                        {"priority": 1}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/leads/queue", {"on": True}, token="hunter2")
+        await self.call("POST", f"/{ws}/publish", {"channel": "leads", "body": {"url": "https://li/new"}},
+                        token=harvester)
+        self.assertEqual(await self.taken(ws, handler), ["https://li/new"])
+
+    async def test_a_takers_mark_reaches_the_harvester_and_no_other_taker(self) -> None:
+        """A handler's word about a lead looks like a lead. Handed to another
+        handler, it would be worked as one."""
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "leads",
+                         "body": {"url": "https://li/0", "status": "fetched", "reply_to": 1}},
+                        token=ids["h1"])
+        self.assertEqual(await self.taken(ws, ids["h2"]), [])
+        self.assertEqual(await self.taken(ws, ids["harvester"]), ["https://li/0"])
+
+    async def test_switching_the_queue_off_starts_takers_from_now(self) -> None:
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        await self.lead(ws, ids, 0)
+        self.assertEqual(len(await self.taken(ws, ids["h1"])), 1)
+        await self.call("POST", f"/{ws}/api/channels/leads/queue", {"on": False}, token="hunter2")
+        self.assertEqual(await self.taken(ws, ids["h2"]), [], "what the queue shared out came again")
+        await self.lead(ws, ids, 1)
+        self.assertEqual(await self.taken(ws, ids["h1"]), ["https://li/1"])
+        self.assertEqual(await self.taken(ws, ids["h2"]), ["https://li/1"])
+
+    async def test_the_console_shows_turns_and_the_queue(self) -> None:
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        for n in range(3):
+            await self.lead(ws, ids, n)
+        await self.taken(ws, ids["h1"])
+        await self.lead(ws, ids, 3)
+        _, channels = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+        leads = next(c for c in channels if c["name"] == "leads")
+        self.assertTrue(leads["queue"])
+        turns = {m["worker_id"]: m["priority"] for m in leads["members"]}
+        self.assertEqual((turns[ids["h1"]], turns[ids["h2"]], turns[ids["harvester"]]), (1, 2, None))
+        _, rows = await self.call("GET", f"/{ws}/api/channels/leads/delivery", token="hunter2")
+        by = {r["worker_id"]: r for r in rows}
+        self.assertEqual((by[ids["h1"]]["holding"], by[ids["h1"]]["waiting"]), (3, 1))
+        self.assertEqual((by[ids["h2"]]["holding"], by[ids["h2"]]["waiting"]), (0, 1))
+
+    async def test_a_handler_takes_the_next_turn_by_being_named(self) -> None:
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "leads"}, token="hunter2")
+        handlers = [await self.enrol(ws, f"handler-{n}") for n in range(2)]
+        for worker in handlers:
+            await self.call("PUT", f"/{ws}/api/channels/leads/members/{worker}", {}, token="hunter2")
+        for worker in handlers:
+            status, _ = await self.call("POST", f"/{ws}/api/workers/{worker}/kind",
+                                        {"kind": "linkedin-handler"}, token="hunter2")
+            self.assertEqual(status, 200)
+        _, channels = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+        turns = {m["worker_id"]: m["priority"] for m in channels[0]["members"]}
+        self.assertEqual([turns[w] for w in handlers], [1, 2])
+        # Named again, a handler keeps the turn it has.
+        await self.call("POST", f"/{ws}/api/workers/{handlers[1]}/kind",
+                        {"kind": "linkedin-handler"}, token="hunter2")
+        _, channels = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+        self.assertEqual({m["priority"] for m in channels[0]["members"]}, {1, 2})
+
     async def test_a_channel_is_a_room_until_something_is_said(self) -> None:
         """Nothing changes for a channel nobody has routed: everything posted
         reaches every member but the one that posted it."""
