@@ -2094,13 +2094,42 @@ function jobIdOf(body) {
 // worker that forgets to echo the job id is tied back by what it copied, and
 // reading the id out of the body again would undo exactly that - the answer
 // would stand on its own as though it had answered nothing.
-function thread(messages) {
+//
+// A message naming the one it answers, as a handler's mark names its lead with
+// `reply_to`, goes under that one - or under whatever that one went under, so
+// an answer to an answer stays with the card it is all about.
+const REPLY_TO_KEYS = ["reply_to", "replyTo", "in_reply_to", "inReplyTo"];
+
+function replyToOf(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  for (const key of REPLY_TO_KEYS) {
+    const said = String(body[key] ?? "").trim();
+    if (/^\d+$/.test(said)) return Number(said);
+  }
+  return null;
+}
+
+//
+// What it answers may be older than anything loaded: a handler working through
+// a backlog marks leads from days ago. Then the card is brought down to the
+// answer, from `earlier` (seq -> message, fetched for the purpose), so the two
+// are read together; loading far enough back puts both where the card was.
+function thread(messages, earlier = new Map()) {
   const sources = new Map();          // job id -> the message that introduced it
   const replies = new Map();          // seq of that message -> answers to it
+  const under = new Map();            // seq -> the card it is shown in
   const top = [];
   for (const m of messages) {
+    const answers = replyToOf(m.body);
+    if (answers !== null && !under.has(answers) && earlier.get(answers)) {
+      const card = { ...earlier.get(answers), forward: true };
+      under.set(answers, card);
+      top.push(card);
+    }
     const id = m.job || jobIdOf(m.body);
-    const source = id ? sources.get(id) : null;
+    const source = answers !== null && under.has(answers) ? under.get(answers)
+      : id ? sources.get(id) : null;
+    under.set(m.seq, source || m);
     if (!source) {
       if (id) sources.set(id, m);
       top.push(m);
@@ -2112,12 +2141,37 @@ function thread(messages) {
   return { top, replies };
 }
 
+// The messages loaded answers name and the feed does not have, fetched once
+// each. One that no longer exists is remembered as null, so it is not asked
+// for on every render; the answer then simply stands on its own.
+async function fetchEarlier(messages, earlier) {
+  const channel = state.feed.channel;
+  const loaded = new Set(messages.map((m) => m.seq));
+  const missing = [...new Set(messages.map((m) => replyToOf(m.body)))]
+    .filter((seq) => seq !== null && !loaded.has(seq) && !earlier.has(seq));
+  if (!missing.length) return;
+  for (const seq of missing) earlier.set(seq, undefined);      // asked for, not yet answered
+  const found = await Promise.all(missing.map(async (seq) => {
+    try {
+      const [m] = await api("GET", `/api/channels/${enc(channel)}/messages?after=${seq - 1}&limit=1`);
+      return [seq, m && m.seq === seq ? m : null];
+    } catch {
+      return [seq, null];
+    }
+  }));
+  if (state.feed.channel !== channel || state.feed.earlier !== earlier) return;
+  for (const [seq, m] of found) earlier.set(seq, m);
+  if (found.some(([, m]) => m)) renderFeed(false);
+}
+
 function renderFeed(stick) {
   const feed = $("#feed");
   if (!feed) return;
   const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
   const { messages, hasOlder } = state.feed;
-  const { top, replies } = thread(messages);
+  const earlier = state.feed.earlier || (state.feed.earlier = new Map());
+  const { top, replies } = thread(messages, earlier);
+  fetchEarlier(messages, earlier);
   fill(feed,
     hasOlder && h("div", { class: "older" }, h("button", { class: "btn small", onclick: loadOlder }, "Load older messages")),
     top.length ? top.map((m) => messageRow(m, replies.get(m.seq)))
@@ -2680,13 +2734,18 @@ function messageRow(m, replies) {
       // answer that forgot to echo the job id is tied back by what it copied,
       // and this is where you can see whether that worked.
       m.job ? h("span", { class: "src job", title: "Filed under job " + m.job }, "job " + m.job) : false,
+      m.forward
+        ? h("span", { class: "src", title: "Older than what is loaded, brought down to the answer "
+                                           + "below. Load older messages to see it in its place." },
+          "posted earlier")
+        : false,
       h("button", {
         class: "btn icon send-again", title: "Send this again, to a worker or a chat",
         "aria-label": "Send this again, to a worker or a chat", onclick: () => sendAgain(m),
       }, "\u2192")),
     messageBody(m.body),
     replies && replies.length
-      ? h("div", { class: "replies" }, replies.map(replyRow))
+      ? h("div", { class: "replies" }, replies.map((r) => replyRow(r, m)))
       : false);
 }
 
@@ -2711,7 +2770,7 @@ function resultsIn(body) {
   return [];
 }
 
-function replyRow(m) {
+function replyRow(m, parent) {
   const body = m.body;
   const plain = body && typeof body === "object" && !Array.isArray(body);
   const said = plain
@@ -2719,7 +2778,10 @@ function replyRow(m) {
       || "")
     : String(body ?? "");
   const done = /^(done|ok|complete|completed|success|succeeded|finished|merged)$/i.test(said.trim());
-  const links = linksOf(body);
+  // A link the card above already shows says nothing more here: a mark that
+  // echoes its lead's profile is about that profile, which is the card.
+  const shown = new Set(linksOf(parent?.body).map((l) => l.url));
+  const links = linksOf(body).filter((l) => !shown.has(l.url));
   const results = resultsIn(body);
   // What it managed, where a worker counted. A failure above zero is the one
   // number that must not be read as a complete answer.
