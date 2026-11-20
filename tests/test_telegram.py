@@ -136,6 +136,19 @@ class RoughBodyTest(unittest.TestCase):
         self.assertIn("Company: <b>Northwind</b>", sent)
         self.assertNotIn("<i>Client</i>", sent)
 
+    def test_skills_are_a_line_of_their_own(self) -> None:
+        """Not a fact, a leftover, or the last screening question."""
+        raw = ("Job title: Brand Designer\nJob description:\nA rebrand.\n\n"
+               "Screening Questions:\n  1. Why you?\n\n"
+               "Skills: Logo Design, Brand Identity Design")
+        sent = "\n".join(render(raw, channel="jobs"))
+        self.assertIn("Skills: <b>Logo Design</b> · <b>Brand Identity Design</b>", sent)
+        self.assertIn("1. Why you?", sent)
+        self.assertNotIn("2. ", sent)
+        sent = "\n".join(render({"title": "A job", "skills": ["Go", "SQL"]}, channel="jobs"))
+        self.assertIn("Skills: <b>Go</b> · <b>SQL</b>", sent)
+        self.assertEqual(sent.count("Go"), 1)
+
 
 class LabelledTextTest(unittest.TestCase):
     """A job sent as a block of labelled text rather than as fields.

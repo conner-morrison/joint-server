@@ -1991,6 +1991,7 @@ const LABELS = [
   [["client info", "client details", "about the client"], "clientInfo"],
   [["work history", "client history", "history", "hire history"], "workHistory"],
   [["client name", "client"], "clientName"],
+  [["skills", "skill", "required skills", "skills required"], "skills"],
   [["decision"], "decision"],
   [["reason", "why"], "reason"],
   [["project id", "projectid"], "projectId"],
@@ -2033,6 +2034,19 @@ function labelOf(head) {
   return LABEL_OF.get(head.replace(COUNTED, "").trim().toLowerCase());
 }
 
+// Which line, if any, is the posting's skills. Descriptions say "Skills:" too -
+// a heading over a list of what the client wants - and taking that for the
+// label would cut the description off there. A scraper puts its own after the
+// posting, on one line with the skills on it, so only the last such line is.
+function skillsLine(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const at = lines[i].indexOf(":");
+    if (at > 0 && at <= LABEL_MAX && labelOf(lines[i].slice(0, at)) === "skills"
+        && lines[i].slice(at + 1).trim()) return i;
+  }
+  return -1;
+}
+
 function labelled(text) {
   if (typeof text !== "string" || !text.includes(":")) return null;
   // A worker that encoded its text once too often sends the newlines as two
@@ -2044,14 +2058,24 @@ function labelled(text) {
   const found = {};
   const lead = [];
   let current = null;
-  for (const line of text.split(/\r?\n/)) {
+  const lines = text.split(/\r?\n/);
+  const skillsAt = skillsLine(lines);
+  lines.forEach((line, i) => {
     const at = line.indexOf(":");
     // A label counts the first time it appears and not after: a description
     // that happens to say "Reason:" partway through is still the description.
     let key = at > 0 && at <= LABEL_MAX ? labelOf(line.slice(0, at)) : null;
     if (key && found[key] !== undefined) key = null;
     if (key && SECTION_KEYS.has(current) && WEAK_LABELS.has(key)) key = null;
-    if (key) {
+    // Inside a section it must also stand apart from it, after a blank line,
+    // as a scraper's does: one ending a description is the client's own words.
+    if (key === "skills" && (i !== skillsAt
+        || (SECTION_KEYS.has(current) && i && lines[i - 1].trim()))) key = null;
+    if (key === "skills") {
+      // One line, and no section of its own: what follows it belongs to
+      // whatever it interrupted.
+      found[key] = line.slice(at + 1).trim();
+    } else if (key) {
       current = key;
       found[key] = line.slice(at + 1).trim();
     } else if (current) {
@@ -2059,7 +2083,7 @@ function labelled(text) {
     } else {
       lead.push(line);
     }
-  }
+  });
   if (Object.keys(found).length < 2) return null;
   for (const key of Object.keys(found)) found[key] = found[key].trim();
   // Anything said before the first label is the posting speaking for itself.
@@ -2197,7 +2221,7 @@ function httpUrl(value) {
 // a person is reading the card for.
 const FACTS = [["Decision", "decision"], ["Verdict", "verdict"], ["Reason", "reason"],
                ["Budget", "budget"], ["Terms", "terms"], ["Published", "published"],
-               ["Posted", "posted"], ["Project", "projectId"], ["Skills", "skills"]];
+               ["Posted", "posted"], ["Project", "projectId"]];
 
 // Every field a publisher might put a link in. An invitation carries its own,
 // and `links` holds however many an item has.
@@ -2277,6 +2301,37 @@ const JD_KEYS = ["description", "jobDescription", "job_description", "jd", "snip
 // to whatever the leftovers happen to do with it.
 const QUESTION_KEYS = ["screeningQuestions", "screening_questions", "screening", "questions"];
 
+// What the work calls for, as the job board tagged it. A category of its own,
+// shown as tags: it is what a proposal is matched against, and a pill holding
+// a comma-separated sentence is hard to scan.
+const SKILL_KEYS = ["skills", "requiredSkills", "required_skills", "skill"];
+
+function skillsOf(body) {
+  if (!body || typeof body !== "object") return [];
+  for (const key of SKILL_KEYS) {
+    const said = body[key];
+    const parts = Array.isArray(said) ? said.filter((v) => v !== null && v !== undefined).map(String)
+      : (typeof said === "string" ? said.split(/[,;|\n\u2022]/) : null);
+    if (!parts) continue;
+    const seen = new Set();
+    const found = [];
+    for (const part of parts) {
+      const skill = part.replace(/^\s*[-*]\s*/, "").trim();
+      if (skill && !seen.has(skill.toLowerCase())) { seen.add(skill.toLowerCase()); found.push(skill); }
+    }
+    if (found.length) return found;
+  }
+  return [];
+}
+
+function skillsBlock(body) {
+  const skills = skillsOf(body);
+  if (!skills.length) return null;
+  return h("div", { class: "skills" },
+    h("div", { class: "client-head" }, "Skills"),
+    h("div", { class: "skill-tags" }, skills.map((s) => h("span", { class: "skill" }, s))));
+}
+
 function questionsIn(body) {
   if (!body || typeof body !== "object") return [];
   for (const key of QUESTION_KEYS) {
@@ -2294,7 +2349,8 @@ function questionsIn(body) {
 }
 
 const SHOWN = new Set([...FACTS.map(([, key]) => key), ...JD_KEYS, ...LINK_KEYS,
-                       ...JOB_ID_KEYS, ...TITLE_KEYS, ...QUESTION_KEYS, "links", "urls",
+                       ...JOB_ID_KEYS, ...TITLE_KEYS, ...QUESTION_KEYS, ...SKILL_KEYS,
+                       "links", "urls",
                        "client_name", "clientName",
                        "type", "source", "index", "emailId", "receivedAt",
                        "client", ...CLIENT_FIELDS.map(([, key]) => "client" + key[0].toUpperCase() + key.slice(1))]);
@@ -2440,6 +2496,7 @@ function jobCard(body) {
     jdBox || false,
     askedBox || false,
     extra.panels.map(([, box]) => box),
+    skillsBlock(body),
     clientBlock(body),
     extra.blocks);
 }

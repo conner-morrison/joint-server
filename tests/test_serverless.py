@@ -797,6 +797,38 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read["clientName"], "Comunicazione")
         self.assertEqual(read["screeningQuestions"], ["Why you?"])
 
+    async def test_the_skills_a_job_calls_for_are_handed_over_as_a_list(self) -> None:
+        """A proposal writer matches a job by its skills, so it is handed them
+        as a list of their own - not as one more screening question, which is
+        where the line after the questions used to end up."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "jobs"}, token="hunter2")
+        who = await self.enrol(ws, "writer")
+        await self.call("PUT", f"/{ws}/api/channels/jobs/members/{who}", {}, token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/reads-jobs", {"reads": True},
+                        token="hunter2")
+        raw = ("Decision: bid\nJob title: Brand Designer\n"
+               "Job link: https://www.upwork.com/jobs/~0222\n\n"
+               "Job description:\nWe want a rebrand.\nRequired Skills:\n- Illustrator\n"
+               "Skills: you tell us\nThanks.\n\n"
+               "Screening Questions:\n  1. Why you?\n\n"
+               "Skills: Brand Identity Design, Logo Design, Logo Design\n\n"
+               "Project info:\n  Project period: 1 to 3 months")
+        await self.call("POST", f"/{ws}/api/channels/jobs/messages", {"body": raw},
+                        token="hunter2")
+        await self.call("POST", f"/{ws}/api/channels/jobs/messages",
+                        {"body": {"title": "DevOps", "skills": ["DevOps", "SQLite"]}},
+                        token="hunter2")
+        _, got = await self.call("GET", f"/{ws}/messages?wait=5", token=who)
+        read = got["messages"][0]["fields"]
+        self.assertEqual(read["skills"], ["Brand Identity Design", "Logo Design"])
+        self.assertEqual(read["screeningQuestions"], ["Why you?"])
+        # The client's own "Skills:" lines are still the description.
+        self.assertIn("Required Skills:\n- Illustrator\nSkills: you tell us\nThanks.",
+                      read["description"])
+        self.assertEqual(read["projectInfo"], "Project period: 1 to 3 months")
+        self.assertEqual(got["messages"][1]["fields"]["skills"], ["DevOps", "SQLite"])
+
     async def test_a_channel_is_not_read_as_jobs_unless_it_says_so(self) -> None:
         """A channel carrying replies, or leads, or anything else is not a
         channel of job postings, and reading one into job-shaped parts would be

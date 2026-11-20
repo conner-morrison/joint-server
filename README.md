@@ -247,10 +247,16 @@ the server's reading of it:
     "clientInfo": "Location: Italy\nPayment: verified",
     "workHistory": "18 jobs posted, 72% hire rate",
     "clientName": "Comunicazione",
-    "screeningQuestions": ["Why you?", "When can you start?"]
+    "screeningQuestions": ["Why you?", "When can you start?"],
+    "skills": ["Community Management", "Social Media Marketing"]
   }
 }
 ```
+
+`skills` is always a list, whether the publisher sent one or a
+`Skills: a, b, c` line. In text it is the last `Skills:` line with skills on
+it, standing apart after a blank line; a "Skills:" heading inside the client's
+description stays part of the description.
 
 One publisher sends a block of labelled text, another sends `job_title` and
 `client_name`, a third sends `title` and a nested client. Every worker that

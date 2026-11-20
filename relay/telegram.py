@@ -53,8 +53,8 @@ JD_KEYS = ("description", "jobDescription", "job_description", "jd", "snippet", 
 # Reading a posting is not formatting one, and two copies of the reading would
 # drift apart. The notification uses the same reading every worker is handed.
 from relay.reading import (
-    CLIENT_NAME_KEYS, QUESTION_KEYS, SECTIONS, TITLE_KEYS,
-    labelled, questions_in, title_of,
+    CLIENT_NAME_KEYS, QUESTION_KEYS, SECTIONS, SKILL_KEYS, TITLE_KEYS,
+    labelled, questions_in, skills_in, title_of,
 )
 
 INVITATION_WORDS = ("invit", "interview", "asked you to apply", "wants to interview")
@@ -172,7 +172,7 @@ def fit(text: str, budget: int) -> tuple[str, str]:
 # Everything the message already says somewhere, so the rest can be added
 # without repeating any of it.
 SHOWN = ({key for _, key in FACTS} | set(JD_KEYS) | set(LINK_KEYS) | set(TITLE_KEYS)
-         | set(QUESTION_KEYS) | {key for key, _ in SECTIONS}
+         | set(QUESTION_KEYS) | set(SKILL_KEYS) | {key for key, _ in SECTIONS}
          | set(CLIENT_NAME_KEYS) | {"client", "type", "source", "links", "urls", "index",
                                     "emailId", "receivedAt", "id"}
          | {"client" + key[0].upper() + key[1:] for _, key in CLIENT_FIELDS})
@@ -301,6 +301,9 @@ def render(body: Any, channel: str = "", source: str = "") -> list[str]:
     facts += leftovers(body)
     if facts:
         lines.append(" · ".join(facts))
+    skills = skills_in(body)
+    if skills:
+        lines.append("Skills: " + " · ".join(f"<b>{esc(skill)}</b>" for skill in skills))
 
     client = client_of(body)
     about = []

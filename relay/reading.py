@@ -21,6 +21,10 @@ CLIENT_NAME_KEYS = ("client_name", "clientName")
 # posting a proposal is judged on, so it is never one of the fields quietly
 # dropped for being too long to fit on a pill.
 QUESTION_KEYS = ("screeningQuestions", "screening_questions", "screening", "questions")
+# What the work calls for, as the job board tagged it. Its own category rather
+# than a fact on a pill: it is what a proposal is matched against, so a worker
+# writing one is handed a list, not a sentence to split.
+SKILL_KEYS = ("skills", "requiredSkills", "required_skills", "skill")
 # Sections a richer scraper sends alongside the posting. Each is shown under
 # its own heading rather than being left to the leftovers, which drop anything
 # longer than a pill - and these are all longer than a pill.
@@ -47,6 +51,29 @@ def questions_in(body: dict[str, Any]) -> list[str]:
             return found
     return []
 
+def skills_in(body: dict[str, Any]) -> list[str]:
+    """The skills, however they were sent: a list, or one line of them split by
+    commas. Each once, in the order given."""
+    for key in SKILL_KEYS:
+        said = body.get(key)
+        if isinstance(said, (list, tuple)):
+            parts = [str(item) for item in said if item not in (None, "")]
+        elif isinstance(said, str):
+            parts = re.split(r"[,;|\n\u2022]", said)
+        else:
+            continue
+        found: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            skill = re.sub(r"^\s*[-*]\s*", "", part).strip()
+            if skill and skill.lower() not in seen:
+                seen.add(skill.lower())
+                found.append(skill)
+        if found:
+            return found
+    return []
+
+
 # A worker may send a job as a block of labelled text rather than as fields:
 # "Job title: …" on one line, "Job description:" and then the posting. It is
 # the same job, said differently, and reading the labels is all it takes to
@@ -65,6 +92,7 @@ LABELS = (
     (("client info", "client details", "about the client"), "clientInfo"),
     (("work history", "client history", "history", "hire history"), "workHistory"),
     (("client name", "client"), "clientName"),
+    (("skills", "skill", "required skills", "skills required"), "skills"),
     (("decision",), "decision"),
     (("reason", "why"), "reason"),
     (("project id", "projectid"), "projectId"),
@@ -108,6 +136,22 @@ def label_of(head: str) -> str | None:
     return LABEL_OF.get(COUNTED.sub("", head.strip()).strip().lower())
 
 
+def skills_line(lines: list[str]) -> int:
+    """Which line, if any, is the posting's skills.
+
+    Descriptions say "Skills:" too - a heading over a list of what the client
+    wants - and taking that for the label would cut the description off there.
+    A scraper puts its own after the posting, on one line with the skills on
+    it, so only the last such line is the label.
+    """
+    for i in range(len(lines) - 1, -1, -1):
+        at = lines[i].find(":")
+        if 0 < at <= LABEL_MAX and label_of(lines[i][:at]) == "skills" \
+                and lines[i][at + 1:].strip():
+            return i
+    return -1
+
+
 def labelled(text: Any) -> dict[str, Any] | None:
     """A job written as labelled lines, read back as fields.
 
@@ -124,14 +168,26 @@ def labelled(text: Any) -> dict[str, Any] | None:
     found: dict[str, Any] = {}
     lead: list[str] = []
     current: str | None = None
-    for line in text.splitlines():
+    lines = text.splitlines()
+    skills_at = skills_line(lines)
+    for i, line in enumerate(lines):
         at = line.find(":")
         key = None
         if 0 < at <= LABEL_MAX:
             key = label_of(line[:at])
             if key in found or (current in SECTION_KEYS and key in WEAK_LABELS):
                 key = None                # said once; after that it is prose
-        if key:
+            # Inside a section it must also stand apart from it, after a blank
+            # line, as a scraper's does: one ending a description is the
+            # client's own words.
+            if key == "skills" and (i != skills_at or (
+                    current in SECTION_KEYS and i and lines[i - 1].strip())):
+                key = None
+        if key == "skills":
+            # One line, and no section of its own: what follows it belongs to
+            # whatever it interrupted.
+            found[key] = line[at + 1:].strip()
+        elif key:
             current = key
             found[key] = line[at + 1:].strip()
         elif current:
@@ -238,6 +294,10 @@ def reading(body: Any) -> dict[str, Any]:
     asked = questions_in(body)
     if asked:
         read["screeningQuestions"] = asked
+
+    skills = skills_in(body)
+    if skills:
+        read["skills"] = skills
 
     client = body.get("client")
     if isinstance(client, dict) and client:
