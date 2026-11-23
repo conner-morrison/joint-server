@@ -148,7 +148,7 @@ tr:last-child td { border-bottom: 0; }
 .msg:last-child { border-bottom: 0; }
 .lead-actions { margin-top: 6px; }
 @keyframes focused { from { background: var(--accent-soft); } to { background: transparent; } }
-.msg.focused { animation: focused 2.5s ease-out; border-radius: 8px; }
+.msg.focused { animation: focused 4s ease-out; border-radius: 8px; }
 .msg-meta { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: var(--muted); }
 .msg-sender { font-weight: 600; color: var(--text); font-size: 13px; }
 .msg-sender.server { color: var(--accent); }

@@ -2141,27 +2141,20 @@ function replyToOf(body) {
 
 //
 // What it answers may be older than anything loaded: a handler working through
-// a backlog marks leads from days ago. Then the card is fetched for the purpose
-// (`earlier`, seq -> message) so the answer has somewhere to go.
-//
-// Cards are listed by their own number, never by when they were last answered:
-// a lead fetched today is still the lead posted last week, and a card brought
-// in from before the loaded page goes above it, in its order.
-function thread(messages, earlier = new Map()) {
+// a backlog marks leads from days ago. Then the answer is not shown at all
+// until its card is: the feed is the channel's newest cards in their order,
+// and a card from last week is not pulled up into it because it was fetched
+// today. Loading older messages - or "Last fetched" - brings both in together.
+function thread(messages) {
   const sources = new Map();          // job id -> the message that introduced it
   const replies = new Map();          // seq of that message -> answers to it
   const under = new Map();            // seq -> the card it is shown in
   const top = [];
   for (const m of messages) {
     const answers = replyToOf(m.body);
-    if (answers !== null && !under.has(answers) && earlier.get(answers)) {
-      const card = { ...earlier.get(answers), forward: true };
-      under.set(answers, card);
-      top.push(card);
-    }
+    if (answers !== null && !under.has(answers)) continue;     // its card is not loaded
     const id = m.job || jobIdOf(m.body);
-    const source = answers !== null && under.has(answers) ? under.get(answers)
-      : id ? sources.get(id) : null;
+    const source = answers !== null ? under.get(answers) : id ? sources.get(id) : null;
     under.set(m.seq, source || m);
     if (!source) {
       if (id) sources.set(id, m);
@@ -2171,31 +2164,7 @@ function thread(messages, earlier = new Map()) {
     if (!replies.has(source.seq)) replies.set(source.seq, []);
     replies.get(source.seq).push(m);
   }
-  top.sort((a, b) => a.seq - b.seq);
   return { top, replies };
-}
-
-// The messages loaded answers name and the feed does not have, fetched once
-// each. One that no longer exists is remembered as null, so it is not asked
-// for on every render; the answer then simply stands on its own.
-async function fetchEarlier(messages, earlier) {
-  const channel = state.feed.channel;
-  const loaded = new Set(messages.map((m) => m.seq));
-  const missing = [...new Set(messages.map((m) => replyToOf(m.body)))]
-    .filter((seq) => seq !== null && !loaded.has(seq) && !earlier.has(seq));
-  if (!missing.length) return;
-  for (const seq of missing) earlier.set(seq, undefined);      // asked for, not yet answered
-  const found = await Promise.all(missing.map(async (seq) => {
-    try {
-      const [m] = await api("GET", `/api/channels/${enc(channel)}/messages?after=${seq - 1}&limit=1`);
-      return [seq, m && m.seq === seq ? m : null];
-    } catch {
-      return [seq, null];
-    }
-  }));
-  if (state.feed.channel !== channel || state.feed.earlier !== earlier) return;
-  for (const [seq, m] of found) earlier.set(seq, m);
-  if (found.some(([, m]) => m)) renderFeed(false);
 }
 
 function renderFeed(stick) {
@@ -2203,9 +2172,7 @@ function renderFeed(stick) {
   if (!feed) return;
   const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
   const { messages, hasOlder } = state.feed;
-  const earlier = state.feed.earlier || (state.feed.earlier = new Map());
-  const { top, replies } = thread(messages, earlier);
-  fetchEarlier(messages, earlier);
+  const { top, replies } = thread(messages);
   fill(feed,
     hasOlder && h("div", { class: "older" }, h("button", { class: "btn small", onclick: loadOlder }, "Load older messages")),
     top.length ? top.map((m) => messageRow(m, replies.get(m.seq)))
@@ -2866,7 +2833,6 @@ async function deleteMessage(m, replies) {
     const gone = new Set(deleted);
     if (state.feed.channel === m.channel) {
       state.feed.messages = state.feed.messages.filter((x) => !gone.has(x.seq));
-      state.feed.earlier?.delete(m.seq);
       renderFeed(false);
     }
     toast(`#${m.seq} deleted`);
@@ -2893,7 +2859,7 @@ async function focusLastFetched() {
     if (!el) return toast(`#${last.seq} is no longer in this channel.`, true);
     // Kept on the feed, not the element: the feed is redrawn as messages
     // arrive, and the highlight should outlive that.
-    state.feed.focus = { seq: last.seq, until: Date.now() + 2500 };
+    state.feed.focus = { seq: last.seq, until: Date.now() + 4000 };
     el.classList.add("focused");
     el.scrollIntoView({ block: "center" });
     toast(`Last fetched: #${last.seq}, marked by ${workerName(last.by) === "@server"
@@ -2915,12 +2881,6 @@ function messageRow(m, replies) {
       // answer that forgot to echo the job id is tied back by what it copied,
       // and this is where you can see whether that worked.
       m.job ? h("span", { class: "src job", title: "Filed under job " + m.job }, "job " + m.job) : false,
-      m.forward
-        ? h("span", { class: "src", title: "Older than what is loaded, shown so its replies have "
-                                           + "a card to sit under. Load older messages to see what "
-                                           + "was posted around it." },
-          "posted earlier")
-        : false,
       h("button", {
         class: "btn icon send-again", title: "Send this again, to a worker or a chat",
         "aria-label": "Send this again, to a worker or a chat", onclick: () => sendAgain(m),
