@@ -2141,9 +2141,12 @@ function replyToOf(body) {
 
 //
 // What it answers may be older than anything loaded: a handler working through
-// a backlog marks leads from days ago. Then the card is brought down to the
-// answer, from `earlier` (seq -> message, fetched for the purpose), so the two
-// are read together; loading far enough back puts both where the card was.
+// a backlog marks leads from days ago. Then the card is fetched for the purpose
+// (`earlier`, seq -> message) so the answer has somewhere to go.
+//
+// Cards are listed by their own number, never by when they were last answered:
+// a lead fetched today is still the lead posted last week, and a card brought
+// in from before the loaded page goes above it, in its order.
 function thread(messages, earlier = new Map()) {
   const sources = new Map();          // job id -> the message that introduced it
   const replies = new Map();          // seq of that message -> answers to it
@@ -2168,6 +2171,7 @@ function thread(messages, earlier = new Map()) {
     if (!replies.has(source.seq)) replies.set(source.seq, []);
     replies.get(source.seq).push(m);
   }
+  top.sort((a, b) => a.seq - b.seq);
   return { top, replies };
 }
 
@@ -2912,8 +2916,9 @@ function messageRow(m, replies) {
       // and this is where you can see whether that worked.
       m.job ? h("span", { class: "src job", title: "Filed under job " + m.job }, "job " + m.job) : false,
       m.forward
-        ? h("span", { class: "src", title: "Older than what is loaded, brought down to the answer "
-                                           + "below. Load older messages to see it in its place." },
+        ? h("span", { class: "src", title: "Older than what is loaded, shown so its replies have "
+                                           + "a card to sit under. Load older messages to see what "
+                                           + "was posted around it." },
           "posted earlier")
         : false,
       h("button", {
