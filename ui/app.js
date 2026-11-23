@@ -1942,7 +1942,9 @@ function mergeMessages(list) {
   const bySeq = new Map(state.feed.messages.map((m) => [m.seq, m]));
   for (const m of list) bySeq.set(m.seq, m);
   let merged = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
-  if (merged.length > FEED_MAX) {
+  // Pages the user loaded stay loaded: trimming them dropped the lead being
+  // looked at the moment anything new arrived, a mark made on it included.
+  if (merged.length > FEED_MAX && !state.feed.older) {
     merged = merged.slice(-FEED_MAX);
     state.feed.hasOlder = true;
   }
@@ -1965,6 +1967,7 @@ async function loadOlder() {
     const fromBottom = feed.scrollHeight - feed.scrollTop;
     state.feed.messages = [...page, ...messages];      // older pages are not capped: the user asked for them
     state.feed.hasOlder = page.length === PAGE;
+    state.feed.older = true;
     renderFeed(false);
     feed.scrollTop = feed.scrollHeight - fromBottom;
   } catch (err) { handleError(err); }
@@ -2171,13 +2174,22 @@ function renderFeed(stick) {
   const feed = $("#feed");
   if (!feed) return;
   const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+  // The card at the top of the view stays where it is on screen, however the
+  // cards above it change: a mark grows its card, a delete removes one.
+  const view = feed.getBoundingClientRect().top;
+  const anchor = [...feed.querySelectorAll("article.msg[data-seq]")]
+    .find((el) => el.getBoundingClientRect().bottom > view);
+  const anchorSeq = anchor && anchor.dataset.seq;
+  const anchorAt = anchor && anchor.getBoundingClientRect().top;
   const { messages, hasOlder } = state.feed;
   const { top, replies } = thread(messages);
   fill(feed,
     hasOlder && h("div", { class: "older" }, h("button", { class: "btn small", onclick: loadOlder }, "Load older messages")),
     top.length ? top.map((m) => messageRow(m, replies.get(m.seq)))
       : empty("No messages yet", "What members post appears here as it happens. You can also post below."));
-  if (stick || nearBottom) feed.scrollTop = feed.scrollHeight;
+  if (stick || nearBottom) { feed.scrollTop = feed.scrollHeight; return; }
+  const again = anchorSeq && feed.querySelector(`article.msg[data-seq="${anchorSeq}"]`);
+  if (again) feed.scrollTop += again.getBoundingClientRect().top - anchorAt;
 }
 
 // Bodies are written by workers and the server never looks inside them, so a
