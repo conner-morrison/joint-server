@@ -1341,7 +1341,13 @@ function renderMembers() {
       h("button", {
         class: "btn small", title: `Settings for #${ch.name}`,
         onclick: () => openChannelSettings(ch.name),
-      }, "\u2699 Settings")),
+      }, "\u2699 Settings"),
+      handlerChannel(ch)
+        ? h("button", {
+          class: "btn small", title: "Show the lead fetched most recently, by a handler or by hand",
+          onclick: focusLastFetched,
+        }, "Last fetched")
+        : false),
     h("h2", {}, "Members"),
     h("div", { id: "member-list" }),
 
@@ -2779,8 +2785,103 @@ async function deliverAgain(channel, worker, m, isBot) {
   loadDelivery(channel);
 }
 
+// A lead is a card with a LinkedIn profile on it that answers nothing itself.
+function linkedinOf(body) {
+  return linksOf(body).map((l) => l.url).find((url) => /^https?:\/\/([a-z]+\.)?linkedin\.com\//i.test(url))
+    || null;
+}
+
+// A channel a LinkedIn handler works in. Only there does marking a lead as
+// fetched mean anything: it is what such a handler skips.
+function handlerChannel(ch) {
+  return Boolean(ch && ch.members.some((mem) =>
+    state.workers.find((w) => w.worker_id === mem.worker_id)?.kind === "linkedin-handler"));
+}
+
+function copyButton(text, label) {
+  const btn = h("button", {
+    class: "btn small", type: "button", title: text,
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = "Copied";
+      } catch {
+        prompt("Copy the URL:", text);
+      }
+      setTimeout(() => { btn.textContent = label; }, 1600);
+    },
+  }, label);
+  return btn;
+}
+
+// Marked as fetched from here, as a handler's own mark is: an answer naming
+// the lead with `reply_to`. Every handler skips a lead something has answered,
+// whoever that was. The id makes a second click the same mark, not another.
+async function markFetched(m, url, btn) {
+  btn.disabled = true;
+  try {
+    const body = { status: "fetched manually", reply_to: m.seq, by: "console", url };
+    const name = m.body && (m.body.name || m.body.first_name || m.body.firstName);
+    if (name) body.name = name;
+    const done = await api("POST", `/api/channels/${enc(m.channel)}/messages`,
+      { body, id: `fetched-manually-${m.channel}-${m.seq}` });
+    if (done.seq != null) {
+      addMessage({ seq: done.seq, channel: m.channel, sender: "@server", body, ts: Date.now() / 1000 });
+    }
+    toast(`#${m.seq} marked as fetched`);
+  } catch (err) {
+    btn.disabled = false;
+    handleError(err);
+  }
+}
+
+function leadActions(m, replies) {
+  if (replyToOf(m.body) !== null) return false;
+  const url = linkedinOf(m.body);
+  if (!url) return false;
+  const fetched = (replies || []).some((r) => replyToOf(r.body) === m.seq);
+  const mark = handlerChannel(currentChannel()) && !fetched
+    ? h("button", {
+      class: "btn small", type: "button",
+      title: "Reply \"fetched manually\": every LinkedIn handler skips this lead from now on",
+      onclick: (e) => markFetched(m, url, e.currentTarget),
+    }, "Mark fetched")
+    : false;
+  return h("div", { class: "job-actions lead-actions" }, copyButton(url, "Copy LinkedIn URL"), mark);
+}
+
+// The lead most recently fetched here, by a handler or by hand, brought into
+// view. Older pages are loaded until it is there, because a handler working a
+// backlog fetches leads from long before anything on screen.
+async function focusLastFetched() {
+  const channel = state.feed.channel;
+  try {
+    const { last } = await api("GET", `/api/channels/${enc(channel)}/last-fetched`);
+    if (!last) return toast("Nothing in this channel has been fetched yet.");
+    const find = () => document.querySelector(`#feed article.msg[data-seq="${last.seq}"]`);
+    let el = find();
+    while (!el && state.feed.channel === channel && state.feed.hasOlder
+           && state.feed.messages.length && state.feed.messages[0].seq > last.seq) {
+      const before = state.feed.messages[0].seq;
+      await loadOlder();
+      if (state.feed.messages[0].seq === before) break;
+      el = find();
+    }
+    if (!el) return toast(`#${last.seq} is no longer in this channel.`, true);
+    // Kept on the feed, not the element: the feed is redrawn as messages
+    // arrive, and the highlight should outlive that.
+    state.feed.focus = { seq: last.seq, until: Date.now() + 2500 };
+    el.classList.add("focused");
+    el.scrollIntoView({ block: "center" });
+    toast(`Last fetched: #${last.seq}, marked by ${workerName(last.by) === "@server"
+      ? "hand" : workerName(last.by)} ${clock(last.ts)}`);
+  } catch (err) { handleError(err); }
+}
+
 function messageRow(m, replies) {
-  return h("article", { class: "msg" },
+  const focus = state.feed.focus;
+  const focused = focus && focus.seq === m.seq && Date.now() < focus.until;
+  return h("article", { class: "msg" + (focused ? " focused" : ""), "data-seq": m.seq },
     h("div", { class: "msg-meta" },
       h("span", { class: "msg-sender" + (m.sender === "@server" ? " server" : ""),
                   title: m.sender }, workerName(m.sender)),
@@ -2801,6 +2902,7 @@ function messageRow(m, replies) {
         "aria-label": "Send this again, to a worker or a chat", onclick: () => sendAgain(m),
       }, "\u2192")),
     messageBody(m.body),
+    leadActions(m, replies),
     replies && replies.length
       ? h("div", { class: "replies" }, replies.map((r) => replyRow(r, m)))
       : false);

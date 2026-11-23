@@ -394,6 +394,17 @@ worker a **LinkedIn handler** gives it the next turn in each of its channels.
 Keep a queue's channel unlimited (`keep` 0), or a backlog longer than the
 channel keeps is dropped before anyone takes it.
 
+**A lead already fetched is skipped.** A LinkedIn handler is never handed a
+lead that any message answers with `reply_to` - another handler's mark, or one
+made by hand - nor the marks themselves. That holds with or without a queue,
+and a lead held by a taker and then marked is not handed back to it. Sending
+one again by hand from the console still delivers it.
+
+In the console, a lead card has **Copy LinkedIn URL** and **Mark fetched**,
+which replies `fetched manually` with `reply_to` set to that lead.
+**Last fetched**, in the channel panel, loads back as far as it needs to and
+shows the lead the newest mark names (`GET /{ws}/api/channels/{name}/last-fetched`).
+
 ## Being told about itself
 
 A poll answers with what is waiting in the worker's channels, and with anything

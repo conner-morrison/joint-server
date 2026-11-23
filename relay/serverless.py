@@ -845,6 +845,12 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         head = await scoped.head()
         return await scoped.messages_before(name, before if before is not None else head + 1, limit=limit)
 
+    @app.get("/{ws}/api/channels/{name}/last-fetched")
+    async def last_fetched(name: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.channel_exists(name):
+            raise HTTPException(404, f"no channel {name!r}")
+        return {"last": await scoped.last_fetched(name)}
+
     @app.post("/{ws}/api/channels/{name}/messages", status_code=201)
     async def post_as_server(name: str, body: PostIn,
                              scoped: WorkspaceStore = Depends(admin)) -> Any:

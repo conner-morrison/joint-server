@@ -297,6 +297,10 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_channel_seq ON messages(workspace, channel, seq);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
+-- What answers a message, found from the message: a handler is never handed a
+-- lead something has already marked.
+CREATE INDEX IF NOT EXISTS messages_reply_to
+    ON messages(workspace, channel, (body->>'reply_to')) WHERE body ? 'reply_to';
 -- One message per id in a channel, whoever published it, is made by
 -- PgStore._dedupe_per_channel rather than here: an older database has a
 -- different rule under a different name, and replacing it can fail on history.
@@ -336,7 +340,21 @@ QUEUE_LEASE = float(os.environ.get("RELAY_QUEUE_LEASE", "300"))
 # someone who is not a taker there - a taker's own word is about the work, not
 # more of it - held by nobody, and not routed away from it. Parameters:
 # workspace, channel, queue_from, taker, taker.
+def settled(g: str) -> str:
+    """SQL true for a message that is itself an answer to another, or that an
+    answer names with `reply_to`, whoever wrote it. Either way not a lead
+    still to fetch."""
+    return f"""({g}.body ? 'reply_to'
+            OR EXISTS (SELECT 1 FROM messages r
+                        WHERE r.workspace = {g}.workspace AND r.channel = {g}.channel
+                          AND r.body ? 'reply_to' AND r.body->>'reply_to' = {g}.seq::text))"""
+
+
+# The kinds that are never handed what is already settled.
+SKIPS_FETCHED = [kind for kind, rules in KINDS.items() if rules.get("skips_fetched")]
+
 QUEUED = """g.workspace = %s AND g.channel = %s AND g.seq > %s AND g.sender <> %s
+       AND NOT """ + settled("g") + """
        AND NOT EXISTS (SELECT 1 FROM members s
                         WHERE s.workspace = g.workspace AND s.channel = g.channel
                           AND s.worker_id = g.sender AND s.priority IS NOT NULL)
@@ -1363,6 +1381,13 @@ class WorkspaceStore:
                     "DELETE FROM claims WHERE workspace = %s AND channel = %s "
                     "   AND acked_at IS NULL AND handed_at < %s",
                     (self.slug, channel, now - QUEUE_LEASE))
+                # Held, and fetched meanwhile by hand or by someone else: no
+                # longer anybody's to do.
+                await conn.execute(f"""
+                    DELETE FROM claims k USING messages g
+                     WHERE k.workspace = %s AND k.channel = %s AND k.acked_at IS NULL
+                       AND g.workspace = k.workspace AND g.channel = k.channel
+                       AND g.seq = k.seq AND {settled("g")}""", (self.slug, channel))
                 held = await (await conn.execute(
                     "SELECT seq FROM claims WHERE workspace = %s AND channel = %s "
                     "   AND worker_id = %s AND acked_at IS NULL ORDER BY seq",
@@ -2002,6 +2027,19 @@ class WorkspaceStore:
              ORDER BY m.seq DESC LIMIT %s""", (self.slug, channel, before, limit))
         return [_message(r) for r in reversed(rows)]
 
+    async def last_fetched(self, channel: str) -> dict[str, Any] | None:
+        """The newest answer here that names what it answers with `reply_to`,
+        whoever wrote it, and the message it names."""
+        row = await self.store._one("""
+            SELECT seq, sender, ts, body->>'reply_to' AS reply_to FROM messages
+             WHERE workspace = %s AND channel = %s
+               AND body ? 'reply_to' AND body->>'reply_to' ~ '^[0-9]+$'
+             ORDER BY seq DESC LIMIT 1""", (self.slug, channel))
+        if row is None:
+            return None
+        return {"seq": int(row["reply_to"]), "mark": row["seq"], "by": row["sender"],
+                "ts": row["ts"]}
+
     async def set_route(self, channel: str, sender: str, recipient: str, on: bool) -> bool:
         """Whether what `sender` posts in this channel reaches `recipient`.
 
@@ -2038,7 +2076,7 @@ class WorkspaceStore:
         A taker in a queue is the exception: from that channel it is handed
         only its share of the queue, never the room's copy of everything."""
         taken = await self._take(worker_id, limit)
-        rows = await self.store._all("""
+        rows = await self.store._all(f"""
             SELECT m.seq, m.channel, m.sender, m.body, m.ts, m.thread_key,
                    c.reads_jobs, c.carries_thread
               FROM messages m
@@ -2066,7 +2104,16 @@ class WorkspaceStore:
                     OR EXISTS (SELECT 1 FROM redeliveries r
                                 WHERE r.workspace = m.workspace AND r.channel = m.channel
                                   AND r.worker_id = mem.worker_id AND r.seq = m.seq))
-             ORDER BY m.seq LIMIT %s""", (self.slug, worker_id, worker_id, limit))
+               -- A handler is not handed a lead already fetched, by anyone,
+               -- nor the marks themselves. Asked for again by hand, it is.
+               AND (NOT EXISTS (SELECT 1 FROM workers w
+                                 WHERE w.workspace = m.workspace AND w.worker_id = mem.worker_id
+                                   AND w.kind = ANY(%s))
+                    OR NOT {settled("m")}
+                    OR EXISTS (SELECT 1 FROM redeliveries r
+                                WHERE r.workspace = m.workspace AND r.channel = m.channel
+                                  AND r.worker_id = mem.worker_id AND r.seq = m.seq))
+             ORDER BY m.seq LIMIT %s""", (self.slug, worker_id, worker_id, SKIPS_FETCHED, limit))
         if taken:
             have = {int(r["seq"]) for r in rows}
             rows = sorted(rows + await self.store._all("""

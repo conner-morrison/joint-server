@@ -1091,6 +1091,75 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         _, channels = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
         self.assertEqual({m["priority"] for m in channels[0]["members"]}, {1, 2})
 
+    async def mark(self, ws: str, seq: int, channel: str = "leads") -> int:
+        """Marked fetched by hand, as the console does it."""
+        status, said = await self.call(
+            "POST", f"/{ws}/api/channels/{channel}/messages",
+            {"body": {"status": "fetched manually", "reply_to": seq, "by": "console"},
+             "id": f"fetched-manually-{channel}-{seq}"}, token="hunter2")
+        self.assertEqual(status, 201)
+        return int(said["seq"])
+
+    async def test_a_handler_skips_a_lead_already_fetched_by_anyone(self) -> None:
+        """No queue: every handler reads the channel from its cursor. A lead
+        marked by hand, or by another handler, is not handed to it, and nor is
+        the mark - which still reaches everyone who is not a handler."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "leads"}, token="hunter2")
+        ids = {"harvester": await self.enrol(ws, "harvester"),
+               "h1": await self.enrol(ws, "handler-1"), "h2": await self.enrol(ws, "handler-2"),
+               "reader": await self.enrol(ws, "reader")}
+        for who, worker in ids.items():
+            await self.call("PUT", f"/{ws}/api/channels/leads/members/{worker}", {}, token="hunter2")
+            await self.call("GET", f"/{ws}/messages", token=worker)
+            if who.startswith("h") and who != "harvester":
+                await self.call("POST", f"/{ws}/api/workers/{worker}/kind",
+                                {"kind": "linkedin-handler"}, token="hunter2")
+        seqs = [await self.lead(ws, ids, n) for n in range(4)]
+        await self.mark(ws, seqs[1])
+        # Another handler's own mark counts as much as one made by hand.
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "leads", "body": {"status": "fetched", "reply_to": seqs[2]}},
+                        token=ids["h2"])
+        self.assertEqual(await self.taken(ws, ids["h1"]), ["https://li/0", "https://li/3"])
+        _, said = await self.call("GET", f"/{ws}/messages", token=ids["reader"])
+        self.assertEqual(len(said["messages"]), 6, "someone who is not a handler lost a message")
+
+        # Asked for by hand, a fetched lead is still handed over.
+        status, _ = await self.call(
+            "POST", f"/{ws}/api/channels/leads/send/{ids['h1']}?seq={seqs[1]}", token="hunter2")
+        self.assertIn(status, (200, 201))
+        self.assertIn("https://li/1", await self.taken(ws, ids["h1"]))
+
+    async def test_a_queue_does_not_hand_out_a_lead_marked_fetched(self) -> None:
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        seqs = [await self.lead(ws, ids, n) for n in range(3)]
+        await self.mark(ws, seqs[0])
+        self.assertEqual(await self.taken(ws, ids["h1"]), ["https://li/1", "https://li/2"])
+        # Held and then marked by hand: it is not handed back to the one holding it.
+        await self.mark(ws, seqs[2])
+        self.assertEqual(await self.taken(ws, ids["h1"]), ["https://li/1"])
+        _, rows = await self.call("GET", f"/{ws}/api/channels/leads/delivery", token="hunter2")
+        by = {r["worker_id"]: r for r in rows}
+        self.assertEqual((by[ids["h1"]]["holding"], by[ids["h2"]]["waiting"]), (1, 0))
+
+    async def test_the_console_finds_the_lead_fetched_last(self) -> None:
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        _, said = await self.call("GET", f"/{ws}/api/channels/leads/last-fetched", token="hunter2")
+        self.assertIsNone(said["last"])
+        seqs = [await self.lead(ws, ids, n) for n in range(3)]
+        await self.call("POST", f"/{ws}/publish",
+                        {"channel": "leads", "body": {"status": "fetched", "reply_to": seqs[1]}},
+                        token=ids["h1"])
+        _, said = await self.call("GET", f"/{ws}/api/channels/leads/last-fetched", token="hunter2")
+        self.assertEqual((said["last"]["seq"], said["last"]["by"]), (seqs[1], ids["h1"]))
+        mark = await self.mark(ws, seqs[0])
+        _, said = await self.call("GET", f"/{ws}/api/channels/leads/last-fetched", token="hunter2")
+        self.assertEqual((said["last"]["seq"], said["last"]["mark"], said["last"]["by"]),
+                         (seqs[0], mark, "@server"))
+
     async def test_a_channel_is_a_room_until_something_is_said(self) -> None:
         """Nothing changes for a channel nobody has routed: everything posted
         reaches every member but the one that posted it."""

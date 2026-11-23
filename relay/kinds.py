@@ -29,6 +29,9 @@ from typing import Any
 # `takes_turns` given a turn among the takers of each channel it is in, after
 #               those already there, unless it has one. Matters only where
 #               the channel hands each message to one taker.
+# `skips_fetched` never handed a message something has already answered with
+#               `reply_to` - by any worker, or by hand from the console - nor
+#               an answer itself: a mark is about a lead, not another lead.
 KINDS: dict[str, dict[str, Any]] = {
     "gmail-alert": {
         "label": "Gmail alert",
@@ -73,6 +76,8 @@ KINDS: dict[str, dict[str, Any]] = {
         "repeats": False, "chats_hear": False, "sends_to": [],
         # Where a channel hands each lead to one taker, this is one of them.
         "takes_turns": True,
+        # A lead fetched by another handler, or marked fetched by hand, is done.
+        "skips_fetched": True,
     },
 }
 
