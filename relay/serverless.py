@@ -845,6 +845,16 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         head = await scoped.head()
         return await scoped.messages_before(name, before if before is not None else head + 1, limit=limit)
 
+    @app.delete("/{ws}/api/channels/{name}/messages/{seq}")
+    async def delete_message(name: str, seq: int,
+                             scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        if not await scoped.channel_exists(name):
+            raise HTTPException(404, f"no channel {name!r}")
+        gone = await scoped.delete_message(name, seq)
+        if not gone:
+            raise HTTPException(404, f"no message #{seq} in {name!r}")
+        return {"deleted": gone}
+
     @app.get("/{ws}/api/channels/{name}/last-fetched")
     async def last_fetched(name: str, scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
         if not await scoped.channel_exists(name):

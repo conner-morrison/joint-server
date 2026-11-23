@@ -2007,6 +2007,32 @@ class WorkspaceStore:
             "DELETE FROM claims WHERE workspace = %s AND channel = %s AND seq <= %s",
             (self.slug, channel, cutoff["seq"]))
 
+    async def delete_message(self, channel: str, seq: int) -> list[int]:
+        """Take one message out of the channel, with the answers that name it
+        with `reply_to`: a mark about a lead that is gone is about nothing.
+
+        Whoever had not been handed it yet never will be, and nobody can be
+        sent it again. Returns what went, empty if it was not there.
+        """
+        await self.store.ready()
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                rows = await (await conn.execute("""
+                    DELETE FROM messages
+                     WHERE workspace = %s AND channel = %s
+                       AND (seq = %s OR (body ? 'reply_to' AND body->>'reply_to' = %s::text))
+                       AND EXISTS (SELECT 1 FROM messages t WHERE t.workspace = %s
+                                     AND t.channel = %s AND t.seq = %s)
+                    RETURNING seq""",
+                    (self.slug, channel, seq, seq, self.slug, channel, seq))).fetchall()
+                gone = sorted(int(r["seq"]) for r in rows)
+                if gone:
+                    for table in ("redeliveries", "claims"):
+                        await conn.execute(
+                            f"DELETE FROM {table} WHERE workspace = %s AND channel = %s "
+                            f"   AND seq = ANY(%s)", (self.slug, channel, gone))
+                return gone
+
     async def messages_after(self, channel: str, after: int, *, limit: int = 200,
                              exclude_sender: str | None = None) -> list[dict[str, Any]]:
         rows = await self.store._all("""

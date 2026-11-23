@@ -405,6 +405,10 @@ which replies `fetched manually` with `reply_to` set to that lead.
 **Last fetched**, in the channel panel, loads back as far as it needs to and
 shows the lead the newest mark names (`GET /{ws}/api/channels/{name}/last-fetched`).
 
+Every card also has a delete button (✕). It removes the item for good, with the
+replies that name it with `reply_to`; a worker that had not received it never
+will (`DELETE /{ws}/api/channels/{name}/messages/{seq}`).
+
 ## Being told about itself
 
 A poll answers with what is waiting in the worker's channels, and with anything

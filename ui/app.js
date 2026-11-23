@@ -2850,6 +2850,25 @@ function leadActions(m, replies) {
   return h("div", { class: "job-actions lead-actions" }, copyButton(url, "Copy LinkedIn URL"), mark);
 }
 
+// Gone from the channel for good, with the answers that name it: a worker that
+// has not been handed it yet never will be.
+async function deleteMessage(m, replies) {
+  const marks = (replies || []).filter((r) => replyToOf(r.body) === m.seq).length;
+  if (!confirm(`Delete #${m.seq}?\n\nIt is removed from the channel for good`
+      + (marks ? `, with the ${marks} repl${marks === 1 ? "y" : "ies"} attached to it` : "")
+      + ". A worker that has not received it yet never will.")) return;
+  try {
+    const { deleted } = await api("DELETE", `/api/channels/${enc(m.channel)}/messages/${m.seq}`);
+    const gone = new Set(deleted);
+    if (state.feed.channel === m.channel) {
+      state.feed.messages = state.feed.messages.filter((x) => !gone.has(x.seq));
+      state.feed.earlier?.delete(m.seq);
+      renderFeed(false);
+    }
+    toast(`#${m.seq} deleted`);
+  } catch (err) { handleError(err); }
+}
+
 // The lead most recently fetched here, by a handler or by hand, brought into
 // view. Older pages are loaded until it is there, because a handler working a
 // backlog fetches leads from long before anything on screen.
@@ -2900,7 +2919,11 @@ function messageRow(m, replies) {
       h("button", {
         class: "btn icon send-again", title: "Send this again, to a worker or a chat",
         "aria-label": "Send this again, to a worker or a chat", onclick: () => sendAgain(m),
-      }, "\u2192")),
+      }, "\u2192"),
+      h("button", {
+        class: "btn icon delete-msg", title: "Delete this item",
+        "aria-label": `Delete #${m.seq}`, onclick: () => deleteMessage(m, replies),
+      }, "\u2715")),
     messageBody(m.body),
     leadActions(m, replies),
     replies && replies.length

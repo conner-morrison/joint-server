@@ -1144,6 +1144,33 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         by = {r["worker_id"]: r for r in rows}
         self.assertEqual((by[ids["h1"]]["holding"], by[ids["h2"]]["waiting"]), (1, 0))
 
+    async def test_the_console_deletes_an_item_with_its_marks(self) -> None:
+        """Gone for good: never handed out, its marks with it, and nothing else
+        touched."""
+        ws = await self.workspace()
+        ids = await self.queue(ws)
+        seqs = [await self.lead(ws, ids, n) for n in range(3)]
+        self.assertEqual(len(await self.taken(ws, ids["h1"])), 3)    # h1 holds all three
+        mark = await self.mark(ws, seqs[1])
+        status, said = await self.call("DELETE", f"/{ws}/api/channels/leads/messages/{seqs[1]}",
+                                       token="hunter2")
+        self.assertEqual((status, said["deleted"]), (200, [seqs[1], mark]))
+        status, said = await self.call("DELETE", f"/{ws}/api/channels/leads/messages/{seqs[2]}",
+                                       token="hunter2")
+        self.assertEqual((status, said["deleted"]), (200, [seqs[2]]))
+        _, left = await self.call("GET", f"/{ws}/api/channels/leads/messages", token="hunter2")
+        self.assertEqual([m["seq"] for m in left], [seqs[0]])
+        # What h1 held of them is no longer held.
+        self.assertEqual(await self.taken(ws, ids["h1"]), ["https://li/0"])
+        # The harvester had not polled: it is not handed what was deleted.
+        self.assertEqual(await self.taken(ws, ids["harvester"]), [])
+        status, _ = await self.call("DELETE", f"/{ws}/api/channels/leads/messages/{seqs[2]}",
+                                    token="hunter2")
+        self.assertEqual(status, 404)
+        status, _ = await self.call("DELETE", f"/{ws}/api/channels/leads/messages/{seqs[0]}",
+                                    token=ids["h1"])
+        self.assertIn(status, (401, 403))
+
     async def test_the_console_finds_the_lead_fetched_last(self) -> None:
         ws = await self.workspace()
         ids = await self.queue(ws)
