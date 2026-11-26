@@ -469,6 +469,7 @@ Saying what a worker **is** sets all of them:
 | GitHub editor | no | no | the proposal writer |
 | LinkedIn harvester | no | yes | everyone |
 | LinkedIn handler | no | no | everyone |
+| Upwork handler | no | no | everyone |
 
 ```
 GET  /api/kinds

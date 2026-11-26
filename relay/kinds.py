@@ -79,6 +79,12 @@ KINDS: dict[str, dict[str, Any]] = {
         # A lead fetched by another handler, or marked fetched by hand, is done.
         "skips_fetched": True,
     },
+    "upwork-handler": {
+        "label": "Upwork handler",
+        "about": "Takes Upwork jobs and works them, and reports what became of each.",
+        # Whoever posted the job already buzzed a phone for it.
+        "repeats": False, "chats_hear": False, "sends_to": [],
+    },
 }
 
 
