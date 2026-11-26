@@ -1175,6 +1175,48 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next(k for k in kinds if k["kind"] == "upwork-handler")["people"],
                          ["Zachary", "Connor"])
 
+    async def test_a_proposal_handed_to_an_upwork_handler_is_marked_fetched(self) -> None:
+        """Taken is fetched: the server answers the proposal with a mark from
+        the handler, and no other handler is handed it after that. The mark is
+        for the console - no worker is handed it, and none counts it."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "bids"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("writer", "first", "second")}
+        for who, worker in ids.items():
+            await self.call("PUT", f"/{ws}/api/channels/bids/members/{worker}", {}, token="hunter2")
+            await self.call("GET", f"/{ws}/messages", token=worker)
+            if who != "writer":
+                await self.call("POST", f"/{ws}/api/workers/{worker}/kind",
+                                {"kind": "upwork-handler"}, token="hunter2")
+                await self.call("PUT", f"/{ws}/api/channels/bids/members/{worker}/person",
+                                {"person": "Zachary"}, token="hunter2")
+        _, said = await self.call("POST", f"/{ws}/publish", {"channel": "bids", "body": {
+            "job": "j1", "url": "https://www.upwork.com/jobs/~01", "person": "Zachary",
+            "proposal": "Hi"}}, token=ids["writer"])
+        proposal = int(said["seq"])
+
+        _, said = await self.call("GET", f"/{ws}/messages", token=ids["first"])
+        self.assertEqual([m["seq"] for m in said["messages"]], [proposal])
+        _, rows = await self.call("GET", f"/{ws}/api/channels/bids/messages?after=0&limit=10",
+                                  token="hunter2")
+        marks = [m for m in rows if m["body"].get("reply_to") == proposal]
+        self.assertEqual(len(marks), 1)
+        self.assertEqual((marks[0]["sender"], marks[0]["body"]["status"], marks[0]["body"]["by"]),
+                         (ids["first"], "fetched", "first"))
+
+        _, said = await self.call("GET", f"/{ws}/messages", token=ids["second"])
+        self.assertEqual(said["messages"], [], "a fetched proposal went to another handler")
+        _, said = await self.call("GET", f"/{ws}/messages", token=ids["writer"])
+        self.assertEqual(said["messages"], [], "a worker was handed the mark")
+        _, rows = await self.call("GET", f"/{ws}/api/channels/bids/delivery", token="hunter2")
+        self.assertEqual({r["worker_id"]: r["waiting"] for r in rows}[ids["writer"]], 0)
+
+        # Handed again, it is not marked twice.
+        await self.call("GET", f"/{ws}/messages", token=ids["first"])
+        _, rows = await self.call("GET", f"/{ws}/api/channels/bids/messages?after=0&limit=10",
+                                  token="hunter2")
+        self.assertEqual(len([m for m in rows if m["body"].get("reply_to") == proposal]), 1)
+
     async def test_a_queue_does_not_hand_out_a_lead_marked_fetched(self) -> None:
         ws = await self.workspace()
         ids = await self.queue(ws)

@@ -395,6 +395,12 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
                 if found or notices or left <= 0:
                     await scoped.redelivered(worker_id, [int(m["seq"]) for m in found])
                     await scoped.notices_taken([int(n["id"]) for n in notices])
+                    # Taken is fetched, for a worker whose kind says so.
+                    if await scoped.mark_taken(worker_id, found):
+                        if sender is not None:
+                            sender.nudge()
+                        if hooks is not None:
+                            hooks.nudge()
                     return {"messages": found, "notices": notices, "worker_id": worker_id}
                 # Woken by the publish itself. The timeout is a safety net for a
                 # notification that never arrives, not the thing doing the work,

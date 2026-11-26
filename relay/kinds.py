@@ -35,6 +35,9 @@ from typing import Any
 # `people`      it works for one person, set per channel from this list, and
 #               is handed only what names that person in its `person` field.
 #               With no person set it is handed none of it.
+# `marks_taken` handed a message, it has fetched it: the server answers the
+#               message for it with a `fetched` mark naming it in `reply_to`.
+#               The mark is for the console; no worker is handed it.
 KINDS: dict[str, dict[str, Any]] = {
     "gmail-alert": {
         "label": "Gmail alert",
@@ -90,6 +93,9 @@ KINDS: dict[str, dict[str, Any]] = {
         # Each proposal is written for one person's account, and goes to the
         # handler working that account.
         "people": ["Zachary", "Connor"],
+        # Handed a proposal is fetched: the server marks it, and no handler is
+        # handed one already fetched.
+        "marks_taken": True, "skips_fetched": True,
     },
 }
 

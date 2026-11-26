@@ -419,6 +419,11 @@ With no person set it is handed none of them, since a proposal sent from the
 wrong account is worse than one held back. Everyone else in the channel still
 hears every proposal, and sending one to a handler by hand always works.
 
+**Taken is fetched.** The moment a proposal is handed to an Upwork handler, the
+server answers it for the handler with `{"status": "fetched", "reply_to": <seq>,
+"by": <handler>}`, which the console shows under the card. From then on no
+Upwork handler is handed it. The mark is only a signal: no worker is handed it.
+
 ```
 PUT /{ws}/api/channels/{name}/members/{worker_id}/person   {"person": "Zachary"}
 ```

@@ -356,6 +356,20 @@ def settled(g: str) -> str:
 # The kinds that are never handed what is already settled.
 SKIPS_FETCHED = [kind for kind, rules in KINDS.items() if rules.get("skips_fetched")]
 
+# The kinds whose taking a message is itself the mark that it is fetched.
+MARKS_TAKEN = [kind for kind, rules in KINDS.items() if rules.get("marks_taken")]
+
+
+def taken_mark(g: str) -> str:
+    """SQL true for a mark the server made when it handed a message over. It
+    is for the console to show, not work for anyone. Takes one parameter,
+    MARKS_TAKEN."""
+    return f"""({g}.body ? 'reply_to' AND {g}.body->>'status' = 'fetched'
+            AND EXISTS (SELECT 1 FROM workers tw
+                         WHERE tw.workspace = {g}.workspace AND tw.worker_id = {g}.sender
+                           AND tw.kind = ANY(%s)))"""
+
+
 # The kinds that work for one person, and are handed only what names them.
 FOR_PERSON = [kind for kind, rules in KINDS.items() if rules.get("people")]
 
@@ -1666,11 +1680,12 @@ class WorkspaceStore:
                                         WHERE t.workspace = g.workspace
                                           AND t.channel = g.channel AND t.sender = g.sender
                                           AND t.recipient = m.worker_id))
-                       AND {for_person("g", "m")}) AS waiting
+                       AND {for_person("g", "m")}
+                       AND NOT {taken_mark("g")}) AS waiting
               FROM members m LEFT JOIN workers w
                 ON w.workspace = m.workspace AND w.worker_id = m.worker_id
              WHERE m.workspace = %s AND m.channel = %s
-             ORDER BY w.name, m.worker_id""", (FOR_PERSON, self.slug, channel))
+             ORDER BY w.name, m.worker_id""", (FOR_PERSON, MARKS_TAKEN, self.slug, channel))
         # A taker in a queue is not behind by what is above its cursor: it is
         # owed nothing in particular. What it could take, and what it holds.
         queue = await self.store._one(
@@ -2121,6 +2136,36 @@ class WorkspaceStore:
             found.setdefault(row["sender"], []).append(row["recipient"])
         return found
 
+    async def mark_taken(self, worker_id: str, handed: list[dict[str, Any]]) -> list[int]:
+        """Marked fetched by the server the moment a worker whose kind says so
+        is handed them, as a handler's own mark would be: an answer from it
+        naming each with `reply_to`. One already answered is left as it is.
+        Returns the seqs of the marks made."""
+        if not handed or not MARKS_TAKEN:
+            return []
+        me = await self.store._one(
+            "SELECT COALESCE(NULLIF(name, ''), worker_id) AS name, kind FROM workers "
+            " WHERE workspace = %s AND worker_id = %s", (self.slug, worker_id))
+        if me is None or me["kind"] not in MARKS_TAKEN:
+            return []
+        open_ = {(r["channel"], int(r["seq"])) for r in await self.store._all(f"""
+            SELECT m.channel, m.seq FROM messages m
+             WHERE m.workspace = %s AND m.seq = ANY(%s) AND NOT {settled("m")}""",
+            (self.slug, [int(m["seq"]) for m in handed]))}
+        made = []
+        for m in handed:
+            if (m["channel"], int(m["seq"])) not in open_:
+                continue
+            body: dict[str, Any] = {"status": "fetched", "reply_to": int(m["seq"]), "by": me["name"]}
+            person = m["body"].get("person") if isinstance(m["body"], dict) else None
+            if person:
+                body["person"] = person
+            seq, duplicate = await self.append(m["channel"], worker_id, body,
+                                               f"fetched-{m['channel']}-{m['seq']}")
+            if not duplicate:
+                made.append(seq)
+        return made
+
     async def waiting_for(self, worker_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         """Everything above this worker's cursors, across all its channels,
         oldest first, plus anything asked for again by hand. One query,
@@ -2171,8 +2216,9 @@ class WorkspaceStore:
                     OR EXISTS (SELECT 1 FROM redeliveries r
                                 WHERE r.workspace = m.workspace AND r.channel = m.channel
                                   AND r.worker_id = mem.worker_id AND r.seq = m.seq))
+               AND NOT {taken_mark("m")}
              ORDER BY m.seq LIMIT %s""",
-            (self.slug, worker_id, worker_id, SKIPS_FETCHED, FOR_PERSON, limit))
+            (self.slug, worker_id, worker_id, SKIPS_FETCHED, FOR_PERSON, MARKS_TAKEN, limit))
         if taken:
             have = {int(r["seq"]) for r in rows}
             rows = sorted(rows + await self.store._all("""
