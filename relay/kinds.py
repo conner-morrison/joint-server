@@ -32,6 +32,9 @@ from typing import Any
 # `skips_fetched` never handed a message something has already answered with
 #               `reply_to` - by any worker, or by hand from the console - nor
 #               an answer itself: a mark is about a lead, not another lead.
+# `people`      it works for one person, set per channel from this list, and
+#               is handed only what names that person in its `person` field.
+#               With no person set it is handed none of it.
 KINDS: dict[str, dict[str, Any]] = {
     "gmail-alert": {
         "label": "Gmail alert",
@@ -84,6 +87,9 @@ KINDS: dict[str, dict[str, Any]] = {
         "about": "Takes Upwork jobs and works them, and reports what became of each.",
         # Whoever posted the job already buzzed a phone for it.
         "repeats": False, "chats_hear": False, "sends_to": [],
+        # Each proposal is written for one person's account, and goes to the
+        # handler working that account.
+        "people": ["Zachary", "Connor"],
     },
 }
 

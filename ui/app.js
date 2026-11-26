@@ -1706,6 +1706,9 @@ function renderMemberList() {
       return h("li", {},
         dot(state.online.has(id)),
         h("span", { class: "truncate", title: id }, shown),
+        peopleOf(id) && (m.person
+          ? h("span", { class: "muted small nowrap", title: "Handed only the jobs for this person" }, m.person)
+          : h("span", { class: "muted small nowrap", title: "No person set: it is handed no jobs here" }, "no person")),
         waiting
           ? h("button", {
             class: "behind", title: `${waiting} waiting. Click to skip them and start from now.`,
@@ -1725,6 +1728,13 @@ function renderMemberList() {
         }, "\u2699"));
     }))
     : h("p", { class: "muted small" }, "No members yet. Only members can post here and receive what is posted."));
+}
+
+// The people a worker can work for, where its kind works for one.
+function peopleOf(workerId) {
+  const kind = state.workers.find((w) => w.worker_id === workerId)?.kind;
+  const people = (state.kinds.find((k) => k.kind === kind) || {}).people;
+  return Array.isArray(people) && people.length ? people : null;
 }
 
 async function addMember(channel, workerId, fromStart) {
@@ -1758,14 +1768,25 @@ function openMemberSettings(channel, workerId, shown) {
   const turnWas = member.priority == null ? "" : String(member.priority);
   const turn = h("input", { type: "number", min: "1", step: "1", value: turnWas,
                             placeholder: "Not a taker", "aria-label": "Turn" });
+  // A worker that works for one person is told whose work is its, not a turn.
+  const people = peopleOf(workerId);
+  const personWas = member.person || "";
+  const person = people && h("select", { "aria-label": "Person" },
+    h("option", { value: "", ...(personWas === "" ? { selected: true } : {}) }, "No one (receives nothing)"),
+    [...new Set([...people, ...(personWas ? [personWas] : [])])].map((p) =>
+      h("option", { value: p, ...(p === personWas ? { selected: true } : {}) }, p)));
   const err = h("p", { class: "error", hidden: true });
 
   const dlg = openDialog(`${shown} in #${channel}`, [
     h("p", { class: "muted small mono truncate", title: workerId }, workerId),
-    field("Turn", turn,
-      "Where this channel hands each message to one taker, this worker's place in line: 1 is "
-      + "asked first, and the next is asked when everyone ahead is busy or away. Empty, it is "
-      + "not a taker and hears everything posted here."),
+    people
+      ? field("Person", person,
+        "Whose proposals this worker handles here. It is handed only the jobs whose person is "
+        + "this one; set to no one, it is handed none of them.")
+      : field("Turn", turn,
+        "Where this channel hands each message to one taker, this worker's place in line: 1 is "
+        + "asked first, and the next is asked when everyone ahead is busy or away. Empty, it is "
+        + "not a taker and hears everything posted here."),
     field("Posting a job already here", repeats,
       "Refused, a job this channel already has is turned away however it is written, so two "
       + "workers watching the same board post it once between them. Allowed, this worker posts "
@@ -1800,7 +1821,11 @@ function openMemberSettings(channel, workerId, shown) {
           await api("POST", `/api/channels/${enc(channel)}/members/${enc(workerId)}/repeats`,
             { allowed: repeats.value === "" ? null : repeats.value === "true" });
         }
-        if (turn.value.trim() !== turnWas) {
+        if (people && person.value !== personWas) {
+          await api("PUT", `/api/channels/${enc(channel)}/members/${enc(workerId)}/person`,
+            { person: person.value || null });
+        }
+        if (!people && turn.value.trim() !== turnWas) {
           await api("PUT", `/api/channels/${enc(channel)}/members/${enc(workerId)}/priority`,
             { priority: turn.value.trim() === "" ? null : Number(turn.value) });
         }

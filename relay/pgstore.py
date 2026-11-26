@@ -133,6 +133,9 @@ CREATE TABLE IF NOT EXISTS members (
     -- Its turn among the takers of a queue: 1 is asked first. NULL means it is
     -- not a taker, and is handed everything as in any room.
     priority    INTEGER,
+    -- Whose work it does here, for a kind that works for one person: it is
+    -- handed only what names that person. NULL is no one, and so nothing.
+    person      TEXT,
     -- Until when it is holding a poll open, which is what makes it idle and
     -- therefore first in line. A worker that is busy is not asking.
     polling_until DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -352,6 +355,21 @@ def settled(g: str) -> str:
 
 # The kinds that are never handed what is already settled.
 SKIPS_FETCHED = [kind for kind, rules in KINDS.items() if rules.get("skips_fetched")]
+
+# The kinds that work for one person, and are handed only what names them.
+FOR_PERSON = [kind for kind, rules in KINDS.items() if rules.get("people")]
+
+
+def for_person(g: str, mem: str) -> str:
+    """SQL true for a message member `mem` is handed by person: any message,
+    unless its worker works for one person, and then only one whose `person`
+    is that person. A member with no person set is handed none of them: a
+    proposal sent to the wrong person's account is worse than one held back.
+    Takes one parameter, FOR_PERSON."""
+    return f"""(NOT EXISTS (SELECT 1 FROM workers pw
+                             WHERE pw.workspace = {mem}.workspace AND pw.worker_id = {mem}.worker_id
+                               AND pw.kind = ANY(%s))
+            OR lower(btrim({g}.body->>'person')) = lower(btrim({mem}.person)))"""
 
 QUEUED = """g.workspace = %s AND g.channel = %s AND g.seq > %s AND g.sender <> %s
        AND NOT """ + settled("g") + """
@@ -617,6 +635,7 @@ class PgStore:
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS keep INTEGER")
                 await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS queue_from BIGINT")
                 await conn.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS priority INTEGER")
+                await conn.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS person TEXT")
                 await conn.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS "
                                    "polling_until DOUBLE PRECISION NOT NULL DEFAULT 0")
                 await conn.execute("ALTER TABLE workers ADD COLUMN IF NOT EXISTS kind TEXT")
@@ -1331,6 +1350,12 @@ class WorkspaceStore:
             await self._release(channel, worker_id)
         return changed
 
+    async def set_person(self, channel: str, worker_id: str, person: str | None) -> bool:
+        """Whose work a member does in this channel. None is no one's."""
+        return await self.store._run(
+            "UPDATE members SET person = %s WHERE workspace = %s AND channel = %s AND worker_id = %s",
+            (person, self.slug, channel, worker_id)) > 0
+
     async def _release(self, channel: str, worker_id: str) -> None:
         await self.store._run(
             "DELETE FROM claims WHERE workspace = %s AND channel = %s AND worker_id = %s "
@@ -1450,13 +1475,14 @@ class WorkspaceStore:
         members: dict[str, list[dict[str, Any]]] = {}
         for m in await self.store._all("""
                 SELECT m.channel, m.worker_id, COALESCE(NULLIF(w.name, ''), m.worker_id) AS name,
-                       m.may_repeat, m.priority
+                       m.may_repeat, m.priority, m.person
                   FROM members m LEFT JOIN workers w
                     ON w.workspace = m.workspace AND w.worker_id = m.worker_id
                  WHERE m.workspace = %s ORDER BY name, m.worker_id""", (self.slug,)):
             members.setdefault(m["channel"], []).append(
                 {"worker_id": m["worker_id"], "name": m["name"],
-                 "may_repeat": m["may_repeat"], "priority": m["priority"]})
+                 "may_repeat": m["may_repeat"], "priority": m["priority"],
+                 "person": m["person"]})
         return [{**r, "members": members.get(r["name"], [])} for r in rows]
 
     # --- membership ------------------------------------------------------
@@ -1622,7 +1648,7 @@ class WorkspaceStore:
         nothing, and one that is offline is indistinguishable from one that is
         up to date. A count of what is still waiting separates them.
         """
-        workers = await self.store._all("""
+        workers = await self.store._all(f"""
             SELECT m.worker_id, COALESCE(NULLIF(w.name, ''), m.worker_id) AS name,
                    m.cursor,
                    (SELECT COUNT(*) FROM messages g
@@ -1639,11 +1665,12 @@ class WorkspaceStore:
                             OR EXISTS (SELECT 1 FROM routes t
                                         WHERE t.workspace = g.workspace
                                           AND t.channel = g.channel AND t.sender = g.sender
-                                          AND t.recipient = m.worker_id))) AS waiting
+                                          AND t.recipient = m.worker_id))
+                       AND {for_person("g", "m")}) AS waiting
               FROM members m LEFT JOIN workers w
                 ON w.workspace = m.workspace AND w.worker_id = m.worker_id
              WHERE m.workspace = %s AND m.channel = %s
-             ORDER BY w.name, m.worker_id""", (self.slug, channel))
+             ORDER BY w.name, m.worker_id""", (FOR_PERSON, self.slug, channel))
         # A taker in a queue is not behind by what is above its cursor: it is
         # owed nothing in particular. What it could take, and what it holds.
         queue = await self.store._one(
@@ -2139,7 +2166,13 @@ class WorkspaceStore:
                     OR EXISTS (SELECT 1 FROM redeliveries r
                                 WHERE r.workspace = m.workspace AND r.channel = m.channel
                                   AND r.worker_id = mem.worker_id AND r.seq = m.seq))
-             ORDER BY m.seq LIMIT %s""", (self.slug, worker_id, worker_id, SKIPS_FETCHED, limit))
+               -- One that works for a person is handed only that person's work.
+               AND ({for_person("m", "mem")}
+                    OR EXISTS (SELECT 1 FROM redeliveries r
+                                WHERE r.workspace = m.workspace AND r.channel = m.channel
+                                  AND r.worker_id = mem.worker_id AND r.seq = m.seq))
+             ORDER BY m.seq LIMIT %s""",
+            (self.slug, worker_id, worker_id, SKIPS_FETCHED, FOR_PERSON, limit))
         if taken:
             have = {int(r["seq"]) for r in rows}
             rows = sorted(rows + await self.store._all("""

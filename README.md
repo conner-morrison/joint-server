@@ -409,6 +409,23 @@ Every card also has a delete button (✕). It removes the item for good, with th
 replies that name it with `reply_to`; a worker that had not received it never
 will (`DELETE /{ws}/api/channels/{name}/messages/{seq}`).
 
+## A proposal goes to its person's handler
+
+A proposal is written for one person's account and says so in `person`
+(`"Zachary"`, `"Connor"`). An **Upwork handler** works one account: in each
+channel it has a person instead of a turn, set in its settings (⚙), and it is
+handed only the messages whose `person` is that person (case and spaces aside).
+With no person set it is handed none of them, since a proposal sent from the
+wrong account is worse than one held back. Everyone else in the channel still
+hears every proposal, and sending one to a handler by hand always works.
+
+```
+PUT /{ws}/api/channels/{name}/members/{worker_id}/person   {"person": "Zachary"}
+```
+
+The people a handler can work for are listed with its kind (`people` in
+`GET /api/kinds`).
+
 ## Being told about itself
 
 A poll answers with what is waiting in the worker's channels, and with anything

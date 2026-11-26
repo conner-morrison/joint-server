@@ -1131,6 +1131,50 @@ class ServerlessTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(status, (200, 201))
         self.assertIn("https://li/1", await self.taken(ws, ids["h1"]))
 
+    async def test_a_proposal_goes_to_the_handler_of_its_person(self) -> None:
+        """An Upwork handler works one person's account. It is handed only the
+        proposals naming that person, and none at all while it has no person;
+        everyone else in the channel still hears every proposal."""
+        ws = await self.workspace()
+        await self.call("POST", f"/{ws}/api/channels", {"name": "bids"}, token="hunter2")
+        ids = {who: await self.enrol(ws, who) for who in ("writer", "zachary", "connor", "nobody", "reader")}
+        for who, worker in ids.items():
+            await self.call("PUT", f"/{ws}/api/channels/bids/members/{worker}", {}, token="hunter2")
+            await self.call("GET", f"/{ws}/messages", token=worker)
+            if who in ("zachary", "connor", "nobody"):
+                await self.call("POST", f"/{ws}/api/workers/{worker}/kind",
+                                {"kind": "upwork-handler"}, token="hunter2")
+        for who, person in (("zachary", "Zachary"), ("connor", " connor ")):
+            status, said = await self.call(
+                "PUT", f"/{ws}/api/channels/bids/members/{ids[who]}/person",
+                {"person": person}, token="hunter2")
+            self.assertEqual((status, said["person"]), (200, person.strip()))
+        for n, person in enumerate(("Zachary", "Connor", "Zachary", None)):
+            body = {"job": f"j{n}", "title": f"Job {n}", "proposal": "Hi"}
+            if person:
+                body["person"] = person
+            await self.call("POST", f"/{ws}/publish", {"channel": "bids", "body": body},
+                            token=ids["writer"])
+
+        async def jobs(who: str) -> list[str]:
+            _, said = await self.call("GET", f"/{ws}/messages", token=ids[who])
+            return [m["body"]["job"] for m in said["messages"]]
+
+        _, rows = await self.call("GET", f"/{ws}/api/channels/bids/delivery", token="hunter2")
+        waiting = {r["worker_id"]: r["waiting"] for r in rows}
+        self.assertEqual([waiting[ids[w]] for w in ("zachary", "connor", "nobody", "reader")],
+                         [2, 1, 0, 4])
+        self.assertEqual(await jobs("zachary"), ["j0", "j2"])
+        self.assertEqual(await jobs("connor"), ["j1"])
+        self.assertEqual(await jobs("nobody"), [])
+        self.assertEqual(await jobs("reader"), ["j0", "j1", "j2", "j3"])
+        _, channels = await self.call("GET", f"/{ws}/api/channels", token="hunter2")
+        people = {m["worker_id"]: m["person"] for m in channels[0]["members"]}
+        self.assertEqual((people[ids["zachary"]], people[ids["nobody"]]), ("Zachary", None))
+        _, kinds = await self.call("GET", "/api/kinds")
+        self.assertEqual(next(k for k in kinds if k["kind"] == "upwork-handler")["people"],
+                         ["Zachary", "Connor"])
+
     async def test_a_queue_does_not_hand_out_a_lead_marked_fetched(self) -> None:
         ws = await self.workspace()
         ids = await self.queue(ws)

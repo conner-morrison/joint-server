@@ -127,6 +127,11 @@ class PriorityIn(BaseModel):
     priority: int | None = Field(default=None, ge=1)
 
 
+class PersonIn(BaseModel):
+    """Whose work a member does in a channel. None, or empty, is no one's."""
+    person: str | None = Field(default=None, max_length=100)
+
+
 class MemberRepeatsIn(BaseModel):
     """None puts the question back to the worker's own setting, which is not
     the same as answering no."""
@@ -640,6 +645,14 @@ def create_app(store: PgStore | None, notifier: Notifier | None = None,
         if not await scoped.set_priority(name, worker_id, body.priority):
             raise HTTPException(404, f"{worker_id!r} is not in channel {name!r}")
         return {"channel": name, "worker_id": worker_id, "priority": body.priority}
+
+    @app.put("/{ws}/api/channels/{name}/members/{worker_id}/person")
+    async def set_person(name: str, worker_id: str, body: PersonIn,
+                         scoped: WorkspaceStore = Depends(admin)) -> dict[str, Any]:
+        person = (body.person or "").strip() or None
+        if not await scoped.set_person(name, worker_id, person):
+            raise HTTPException(404, f"{worker_id!r} is not in channel {name!r}")
+        return {"channel": name, "worker_id": worker_id, "person": person}
 
     @app.put("/{ws}/api/channels/{name}/members/{worker_id}")
     async def add_member(name: str, worker_id: str, body: JoinIn | None = None,
